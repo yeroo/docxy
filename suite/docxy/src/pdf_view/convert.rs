@@ -83,9 +83,10 @@ impl Limits {
     }
 }
 
-/// The most blocks that get a code colour: every 24-bit colour but black.
-/// Blocks past it keep their colour and no font.
+/// The most blocks that can get a code colour: every 24-bit colour but
+/// black; more than [`MAX_LAYOUT_BLOCKS`] never come this far.
 const MAX_CODES: usize = (1 << 24) - 1;
+const _: () = assert!(MAX_LAYOUT_BLOCKS <= MAX_CODES);
 
 /// A block's source facts the export has no field for.
 #[derive(Clone, Debug, PartialEq)]
@@ -193,9 +194,6 @@ pub(crate) fn layout_within(bytes: &[u8], limits: Limits) -> Result<Option<Conve
     let mut table: Vec<Coded> = Vec::new();
     for v in &mut virt {
         for (b, s) in v.page.blocks.iter_mut().zip(&v.sources) {
-            if table.len() >= MAX_CODES {
-                break;
-            }
             table.push(Coded {
                 font: fonts::family(&s.base_font),
                 color: hex(s.color),
@@ -570,10 +568,12 @@ fn sections(
                     setup.start = SectionStart::Continuous;
                 }
                 // The real page and PdfCraft's margins for it.
-                let (w, h) = (twips(v.real[0]).max(144), twips(v.real[1]).max(144));
-                setup.page.w = w;
-                setup.page.h = h;
-                let (mx, my) = ((w / 8).min(1440), (h / 8).min(1440));
+                setup.page.w = twips(v.real[0]).max(144);
+                setup.page.h = twips(v.real[1]).max(144);
+                let (mx, my) = (
+                    twips(columns::margin(v.real[0])),
+                    twips(columns::margin(v.real[1])),
+                );
                 setup.margins.left = mx;
                 setup.margins.right = mx;
                 setup.margins.top = my;
@@ -623,23 +623,12 @@ fn add_running(
     looks: &HashMap<(usize, usize), running::RunLook>,
     first_width: f64,
 ) {
-    let w = twips(first_width).max(144);
-    let text_width = w - 2 * (w / 8).min(1440);
-    let look = |p: &running::Piece| match looks.get(&(p.page, p.block)) {
-        Some(l) => running::RunLook {
-            font: l.font.clone(),
-            size: l.size,
-            bold: l.bold,
-            italic: l.italic,
-            color: l.color.clone(),
-        },
-        None => running::RunLook {
-            font: None,
-            size: 11.0,
-            bold: false,
-            italic: false,
-            color: None,
-        },
+    let text_width = twips(first_width - 2.0 * columns::margin(first_width));
+    let look = |p: &running::Piece| {
+        looks
+            .get(&(p.page, p.block))
+            .cloned()
+            .unwrap_or_else(running::RunLook::plain)
     };
     pkg.ensure_styles(&[crate::hf::style_id(true), crate::hf::style_id(false)]);
     let mut refs = Vec::new();

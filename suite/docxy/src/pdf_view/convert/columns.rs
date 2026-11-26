@@ -106,14 +106,8 @@ pub(crate) fn split(page: Page, sources: Vec<Source>, from: usize) -> Vec<Virtua
         .map(|w| w[1][0] - w[0][1])
         .sum::<f64>()
         / (n - 1) as f64;
-    // PdfCraft's margin is min(width / 8, 1 in): the width whose text area
-    // is one column.
-    let width = if colw + 144.0 >= 576.0 {
-        colw + 144.0
-    } else {
-        colw * 4.0 / 3.0
-    };
-    let margin = (width / 8.0).min(72.0);
+    let width = width_for_text(colw);
+    let margin = margin(width);
     let extent = |blocks: &[(Block, Source)], images: &[Image]| {
         let rects = blocks
             .iter()
@@ -392,6 +386,23 @@ fn lift_heads(layout: &mut Layout, blocks: &[Block], images: &[Image], beside: O
         .fold(f64::NEG_INFINITY, f64::max);
     if region_top.is_finite() {
         layout.top = region_top;
+    }
+}
+
+/// PdfCraft's page margin for a page side of `side` points
+/// (`pdfcraft_export`'s `as_word::section`, not public): an eighth of the
+/// side, at most an inch.
+pub(crate) fn margin(side: f64) -> f64 {
+    (side / 8.0).min(72.0)
+}
+
+/// The page width whose text area under [`margin`] is `text` points wide:
+/// [`margin`]'s inverse.
+pub(crate) fn width_for_text(text: f64) -> f64 {
+    if text + 144.0 >= 576.0 {
+        text + 144.0
+    } else {
+        text * 4.0 / 3.0
     }
 }
 

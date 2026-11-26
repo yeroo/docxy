@@ -318,15 +318,30 @@ enum Digits {
 
 /// What digit run `j` of group `g` is; `None` when it differs from page to
 /// page and counts nothing (a date, an amount, a Bates number, a count that
-/// does not start at 1).
+/// does not start at 1). The page count is NUMPAGES only beside a page
+/// number or after "of" or "/" ("Page 1 of 2", "1/2", "of 2"): elsewhere a
+/// number that happens to be the count ("Rev 2" in a 2-page file) is text.
 fn digits_of(g: &[usize], cands: &[Cand], n: usize, j: usize) -> Option<Digits> {
-    let digits = |k: usize| cands[k].digits.get(j);
-    let value = |k: usize| digits(k).and_then(|d| d.parse::<usize>().ok());
-    if g.iter().all(|&k| value(k) == Some(cands[k].page + 1)) {
+    let digits = |j: usize, k: usize| cands[k].digits.get(j);
+    let value = |j: usize, k: usize| digits(j, k).and_then(|d| d.parse::<usize>().ok());
+    let page = |j: usize| g.iter().all(|&k| value(j, k) == Some(cands[k].page + 1));
+    let counted = || {
+        let before = cands[g[0]]
+            .key
+            .split('#')
+            .nth(j)
+            .unwrap_or("")
+            .trim_end()
+            .to_lowercase();
+        before.ends_with("of")
+            || before.ends_with('/')
+            || (0..cands[g[0]].digits.len()).any(|i| i != j && page(i))
+    };
+    if page(j) {
         Some(Digits::Page)
-    } else if g.iter().all(|&k| value(k) == Some(n)) {
+    } else if g.iter().all(|&k| value(j, k) == Some(n)) && counted() {
         Some(Digits::NumPages)
-    } else if g.iter().all(|&k| digits(k) == digits(g[0])) {
+    } else if g.iter().all(|&k| digits(j, k) == digits(j, g[0])) {
         Some(Digits::Same)
     } else {
         None
@@ -391,6 +406,7 @@ fn segs(text: &str, g: &[usize], cands: &[Cand], n: usize) -> Vec<Seg> {
 }
 
 /// Formatting of a header or footer run.
+#[derive(Clone, Debug)]
 pub(crate) struct RunLook {
     pub(crate) font: Option<String>,
     pub(crate) size: f64,
@@ -398,6 +414,19 @@ pub(crate) struct RunLook {
     pub(crate) italic: bool,
     /// `RRGGBB`, `None` for black.
     pub(crate) color: Option<String>,
+}
+
+impl RunLook {
+    /// A run of no look of its own: 11 pt, the document's font, black.
+    pub(crate) fn plain() -> RunLook {
+        RunLook {
+            font: None,
+            size: 11.0,
+            bold: false,
+            italic: false,
+            color: None,
+        }
+    }
 }
 
 /// The XML of a header or footer part's paragraphs for `lines`: one
@@ -629,6 +658,40 @@ mod tests {
             .collect();
         let r = find(&pages).unwrap();
         assert_eq!(r.footer[0][0].segs, vec![Seg::Text("Rev 7 2026".into())]);
+    }
+
+    #[test]
+    fn the_page_count_is_a_field_only_where_it_counts_pages() {
+        let footer = |f: &dyn Fn(usize) -> String| -> Vec<Seg> {
+            let pages: Vec<Page> = (1..=2)
+                .map(|i| letter(vec![body(600.0), header(&f(i), 280.0, 30.0)]))
+                .collect();
+            find(&pages).unwrap().footer[0][0].segs.clone()
+        };
+        // "Rev 2" in a 2-page file is text, not the page count.
+        assert_eq!(footer(&|_| "Rev 2".into()), vec![Seg::Text("Rev 2".into())]);
+        assert_eq!(
+            footer(&|i| format!("Page {i} of 2")),
+            vec![
+                Seg::Text("Page ".into()),
+                Seg::Page("1".into()),
+                Seg::Text(" of ".into()),
+                Seg::NumPages("2".into())
+            ]
+        );
+        assert_eq!(
+            footer(&|i| format!("{i}/2")),
+            vec![
+                Seg::Page("1".into()),
+                Seg::Text("/".into()),
+                Seg::NumPages("2".into())
+            ]
+        );
+        // After "of" without a page number beside it.
+        assert_eq!(
+            footer(&|_| "One of 2".into()),
+            vec![Seg::Text("One of ".into()), Seg::NumPages("2".into())]
+        );
     }
 
     #[test]
