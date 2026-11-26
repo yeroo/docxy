@@ -397,7 +397,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   never left of the text, so a Word document's `tblInd 0` table stays.
   A table style's `tblInd` is not read; PDF export does not draw it.
   `flow.tables.N.inset` is a table's left less the text column's, in px
-  (`table-jc.uit`).
+  (`table-ind.uit`, its own script: `table-jc.uit` leaves Print Layout
+  on).
 - The harness: `doc {}`'s `flow.tables.N.place` is `left`, `center`,
   `right` or `other` across `flow.text_column` (Web Layout's column, else
   Print Layout's first page's first band, whose rect is 2 px narrower than
