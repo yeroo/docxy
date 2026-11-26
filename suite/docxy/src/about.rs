@@ -450,6 +450,18 @@ mod tests {
     }
 
     #[test]
+    fn the_dialog_shows_the_integrations_rows_after_the_manuals() {
+        let rows = [("organization", "Organization", "Org".to_string())];
+        let d = dialog(info(), &mixed(), &rows);
+        let last = d.controls.last().unwrap();
+        assert_eq!(
+            (last.name, last.label.as_str()),
+            ("organization", "Organization")
+        );
+        assert_eq!(last.value, Value::Text("Org".into()));
+    }
+
+    #[test]
     fn the_dialog_lists_every_field_with_copy_and_close() {
         let i = info();
         let d = dialog(i, &mixed(), &[]);
