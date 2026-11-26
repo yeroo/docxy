@@ -47,8 +47,14 @@ const EXIT_USAGE: i32 = 2;
 const HELLO: &str = "docxy-pdf-worker";
 /// The protocol's revision, in the hello line: 2 adds links, notes and the
 /// form to `info`, and the form's operations (#2255); 3 the password
-/// (`unlock`), a locked file's answer and the file's security (#2256).
-const PROTOCOL: u32 = 3;
+/// (`unlock`), a locked file's answer and the file's security (#2256); 4
+/// printing, a page as a PNG and pages as a PDF of their own (#2258).
+const PROTOCOL: u32 = 4;
+/// How many times [`TIMEOUT`] a whole-document job may take (#2258): a
+/// print or a page range extracted reads and writes every page it takes,
+/// so it gets a budget of its own, `JOB_FACTOR` × the child's timeout (60 s
+/// by default); its watchdog is twice that, as every request's is.
+pub(crate) const JOB_FACTOR: u32 = 3;
 /// The longest answer line read (a page's text as JSON).
 const MAX_LINE: u64 = 256 << 20;
 /// The most pixel bytes one answer may carry (8192 × 8192 BGRA).
@@ -132,16 +138,140 @@ pub(crate) enum Op {
     /// answer is `info`'s, or locked (`wrong`) when it does not open it.
     /// The [`Worker`] sends it again first to every new child.
     Unlock { password: Secret },
+    /// Print (#2258): the pages laid out on sheets as drawn (unsaved form
+    /// values too), then handed to the spooler, or written to a folder.
+    Print { job: PrintJob },
+    /// Page `page` as a PNG at `dpi` (capped as the renderer caps a page),
+    /// its bytes after the line (#2258).
+    Png { page: usize, dpi: f64 },
+    /// `pages` (0-based, in this order) as a new PDF of their own, as drawn,
+    /// its bytes after the line (#2258).
+    ExtractPages { pages: Vec<usize> },
+    /// The parent: export to `path` (#2258). The [`Worker`] asks the child
+    /// for each page's PNG, or for the pages' PDF, and writes the files;
+    /// never sent to the child.
+    ExportTo { export: Export, path: PathBuf },
 }
 
 impl Op {
-    /// The form's operations, which the view sends before any page.
+    /// The form's operations, which the view sends before any page; a print
+    /// or an export goes in the same queue (#2258), after the fills before it.
     pub(crate) fn is_form(&self) -> bool {
         matches!(
             self,
-            Op::SetField { .. } | Op::SetFields { .. } | Op::Fields | Op::SaveTo { .. }
+            Op::SetField { .. }
+                | Op::SetFields { .. }
+                | Op::Fields
+                | Op::SaveTo { .. }
+                | Op::Print { .. }
+                | Op::ExportTo { .. }
         )
     }
+
+    /// The longest this request may take, given the child's `timeout`
+    /// (#2258): a whole-document job ([`JOB_FACTOR`] times it), else `timeout`.
+    pub(crate) fn timeout(&self, timeout: Duration) -> Duration {
+        match self {
+            Op::Print { .. } | Op::ExtractPages { .. } => timeout.saturating_mul(JOB_FACTOR),
+            _ => timeout,
+        }
+    }
+}
+
+/// A print job on the wire (#2258): what `pdfcraft_print::Settings` and
+/// `spool::Job` take (theirs are not serde). The pages are 0-based, in
+/// print order, parsed by the parent from what was typed; the child checks
+/// them against its own page count again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PrintJob {
+    pub pages: Vec<usize>,
+    /// The paper's name in `pdfcraft_print::PAPERS` (`None`: a size of its
+    /// own), and its size in points, portrait.
+    pub paper_name: Option<String>,
+    pub paper: (f64, f64),
+    pub sizing: Sizing,
+    pub orientation: Orient,
+    pub content: PrintContent,
+    /// `None`: the system's default printer.
+    pub printer: Option<String>,
+    pub copies: u32,
+    pub collate: bool,
+    pub title: String,
+    pub spool: Spool,
+}
+
+/// Page sizing, as Acrobat's Print dialog names it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Sizing {
+    Fit,
+    Actual,
+    /// Shrink oversized pages.
+    Shrink,
+    /// A scale of the page's size, percent.
+    Custom {
+        percent: f64,
+    },
+}
+
+/// The sheets' orientation: Auto turns a sheet for a landscape page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Orient {
+    Auto,
+    Portrait,
+    Landscape,
+}
+
+/// Acrobat's Comments and forms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PrintContent {
+    /// The page, its form fields and every printable comment.
+    DocumentAndMarkups,
+    /// The page and its form fields.
+    Document,
+    FormFieldsOnly,
+}
+
+/// Where a print job goes (#2258): the system's spooler, or (a harness, a
+/// test) a folder that takes `job-<n>.pdf` and `job-<n>.json` instead. The
+/// parent chooses; nothing in the child's environment does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Spool {
+    System,
+    Dir { dir: PathBuf },
+}
+
+/// What a print answers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Printed {
+    /// Sheets sent (one page each).
+    pub sheets: usize,
+    /// What the spooler calls the job (CUPS's request id), or the job file
+    /// written for a [`Spool::Dir`].
+    pub job: String,
+}
+
+/// An export (#2258), as [`Op::ExportTo`] does it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Export {
+    /// One PNG per page at `dpi`: one page to the path picked, several each
+    /// to its own name beside it ([`png_names`]).
+    Png { pages: Vec<usize>, dpi: f64 },
+    /// The pages as one new PDF.
+    Pdf { pages: Vec<usize> },
+}
+
+/// What an export wrote.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Exported {
+    pub files: Vec<PathBuf>,
+    /// PNG: the resolution the pages were drawn at when the renderer drew
+    /// one at less than asked (its size caps), the lowest.
+    pub dpi_used: Option<f64>,
 }
 
 /// A form field's new value on the wire (#2255).
@@ -378,6 +508,10 @@ pub(crate) struct SecurityMeta {
     pub modify: bool,
     pub annotate: bool,
     pub fill_forms: bool,
+    /// Pages may be taken into a new file (#2258): assembly and copying,
+    /// as PdfCraft's Extract Pages asks.
+    #[serde(default)]
+    pub extract: bool,
 }
 
 impl SecurityMeta {
@@ -453,6 +587,12 @@ struct Head {
     /// The file needs a password, or the one given is wrong (#2256).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     locked: Option<Locked>,
+    /// A print's answer (#2258).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    printed: Option<Printed>,
+    /// A PNG's resolution as drawn (#2258): `bytes` PNG bytes follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dpi: Option<f64>,
     /// A raster's size; `len` pixel bytes follow the line.
     #[serde(default)]
     w: u32,
@@ -499,6 +639,15 @@ pub(crate) enum Answer {
     Locked {
         wrong: bool,
     },
+    /// A print sent (#2258).
+    Printed(Printed),
+    /// A page as a PNG, and the resolution it was drawn at (#2258).
+    Png {
+        png: Vec<u8>,
+        dpi: f64,
+    },
+    /// An export written (#2258).
+    Exported(Exported),
     /// Why it could not: the file's fault, or the child's fate.
     Failed(String),
 }
@@ -532,7 +681,7 @@ pub(crate) fn run(path: &Path, timeout: Duration, before: impl FnMut(&Op)) -> i3
     let bytes = std::fs::read(path)
         .map(Arc::new)
         .map_err(|e| format!("the file could not be read: {e}"));
-    let busy = Arc::new(Busy::default());
+    let busy = Arc::new(Busy::new(timeout));
     watchdog(busy.clone(), timeout.saturating_mul(2));
     let stdin = std::io::stdin().lock();
     let stdout = std::io::BufWriter::new(std::io::stdout().lock());
@@ -585,11 +734,15 @@ pub(crate) fn limit_memory() {
     }
 }
 
-/// When the request being answered started (ms since `base`, 0: none).
+/// When the request being answered started (ms since `base`, 0: none),
+/// and how long it may run before the watchdog ends the child: twice its
+/// own timeout ([`Op::timeout`], #2258), from the child's `timeout`.
 #[derive(Default)]
 pub(crate) struct Busy {
     since: AtomicU64,
+    limit_ms: AtomicU64,
     base: std::sync::OnceLock<Instant>,
+    timeout: Duration,
 }
 
 impl Busy {
@@ -599,8 +752,25 @@ impl Busy {
         base.elapsed().as_millis() as u64 + 1
     }
 
-    fn start(&self) {
+    pub(crate) fn new(timeout: Duration) -> Busy {
+        Busy {
+            timeout,
+            ..Busy::default()
+        }
+    }
+
+    fn start(&self, op: &Op) {
+        let limit = op.timeout(self.timeout).saturating_mul(2);
+        self.limit_ms.store(
+            u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
         self.since.store(self.now(), Ordering::SeqCst);
+    }
+
+    /// How long the request being answered may run.
+    fn limit(&self) -> Duration {
+        Duration::from_millis(self.limit_ms.load(Ordering::SeqCst))
     }
 
     fn stop(&self) {
@@ -614,14 +784,16 @@ impl Busy {
     }
 }
 
-/// End the process when one request runs past `limit`: a child spinning in
-/// a page whose parent is gone, or no longer waits, never stops otherwise.
+/// End the process when one request runs past its limit ([`Busy::start`];
+/// `limit`, an ordinary request's, sets how often it looks): a child
+/// spinning in a page whose parent is gone, or no longer waits, never
+/// stops otherwise.
 fn watchdog(busy: Arc<Busy>, limit: Duration) {
     let step = (limit / 8).clamp(Duration::from_millis(10), Duration::from_millis(500));
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(step);
-            if busy.running().is_some_and(|ran| ran > limit) {
+            if busy.running().is_some_and(|ran| ran > busy.limit()) {
                 std::process::exit(EXIT_WATCHDOG);
             }
         }
@@ -656,7 +828,7 @@ pub(crate) fn serve(
         let (head, body) = match serde_json::from_str::<Request>(line.trim()) {
             Ok(req) => {
                 if let Some(b) = busy {
-                    b.start();
+                    b.start(&req.op);
                 }
                 before(&req.op);
                 let answered = match &bytes {
@@ -910,6 +1082,9 @@ impl Worker {
         if let Op::SaveTo { path } = op {
             return self.save_to(path);
         }
+        if let Op::ExportTo { export, path } = op {
+            return self.export_to(export, path);
+        }
         let answer = match self.ask_raw(op) {
             Ok((head, body)) => decode(op, head, body),
             Err(why) => Answer::Failed(why),
@@ -1051,6 +1226,61 @@ impl Worker {
         Answer::Saved(target.to_path_buf())
     }
 
+    /// Export to `path` (#2258): the child draws each page's PNG (each its
+    /// own request and timeout) or makes the pages' PDF, and this writes
+    /// them. Nothing is written unless every file is: each goes to a
+    /// temporary name beside its own first, and they are renamed when all
+    /// are in. A PNG export of several pages refuses when a name it would
+    /// write, other than the one picked (whose replacing the dialog
+    /// confirmed), exists already.
+    fn export_to(&mut self, export: &Export, path: &Path) -> Answer {
+        let (files, dpi_used) = match export {
+            Export::Pdf { pages } => {
+                let op = Op::ExtractPages {
+                    pages: pages.clone(),
+                };
+                match self.ask(&op) {
+                    Answer::Bytes(pdf) => (vec![(path.to_path_buf(), pdf)], None),
+                    Answer::Failed(why) => return Answer::Failed(why),
+                    _ => return Answer::Failed(DIED.into()),
+                }
+            }
+            Export::Png { pages, dpi } => {
+                let names = png_names(path, pages);
+                if let Some(taken) = names.iter().find(|n| n.as_path() != path && n.exists()) {
+                    return Answer::Failed(format!(
+                        "{} already exists, so nothing was written: choose another name",
+                        taken.display()
+                    ));
+                }
+                let mut files = Vec::with_capacity(pages.len());
+                let mut used: Option<f64> = None;
+                for (&page, name) in pages.iter().zip(names) {
+                    match self.ask(&Op::Png { page, dpi: *dpi }) {
+                        Answer::Png { png, dpi: drawn } => {
+                            if drawn + 0.5 < *dpi {
+                                used = Some(used.map_or(drawn, |u| u.min(drawn)));
+                            }
+                            files.push((name, png));
+                        }
+                        Answer::Failed(why) => {
+                            return Answer::Failed(format!("page {}: {why}", page + 1));
+                        }
+                        _ => return Answer::Failed(DIED.into()),
+                    }
+                }
+                (files, used)
+            }
+        };
+        match write_all_or_none(&files) {
+            Ok(()) => Answer::Exported(Exported {
+                files: files.into_iter().map(|(p, _)| p).collect(),
+                dpi_used,
+            }),
+            Err(e) => Answer::Failed(format!("the file could not be written: {e}")),
+        }
+    }
+
     /// Send `op` to the live child and wait for its answer.
     fn exchange(&mut self, op: &Op) -> Reply {
         if self.conn.is_none() {
@@ -1058,7 +1288,7 @@ impl Worker {
         }
         self.next_id += 1;
         let id = self.next_id;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + op.timeout(self.timeout);
         let conn = self.conn.as_mut().expect("started above");
         let mut line = zeroize::Zeroizing::new(
             serde_json::to_string(&Request { id, op: op.clone() }).map_err(|e| e.to_string())?,
@@ -1170,6 +1400,59 @@ impl Drop for Worker {
     }
 }
 
+/// The files a PNG export of `pages` (0-based) to `path` writes (#2258):
+/// one page, `path` itself; several, `<stem>_Page_<n>.png` beside it, `n`
+/// the page's number zero-padded to the digits of the highest one, so the
+/// names sort in page order.
+pub(crate) fn png_names(path: &Path, pages: &[usize]) -> Vec<PathBuf> {
+    if pages.len() <= 1 {
+        return pages.iter().map(|_| path.to_path_buf()).collect();
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let width = pages.iter().max().map_or(1, |m| (m + 1).to_string().len());
+    pages
+        .iter()
+        .map(|p| path.with_file_name(format!("{stem}_Page_{:0width$}.png", p + 1)))
+        .collect()
+}
+
+/// Write every `(path, bytes)` or none (#2258): each to a temporary name
+/// beside it, then each renamed onto its own; a failure removes the
+/// temporary files, and the files already there stay as they were.
+fn write_all_or_none(files: &[(PathBuf, Vec<u8>)]) -> std::io::Result<()> {
+    let temp = |p: &Path| {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(p.file_name().unwrap_or_default());
+        name.push(format!(".{}.part", std::process::id()));
+        p.with_file_name(name)
+    };
+    let mut written = Vec::with_capacity(files.len());
+    let result = files.iter().try_for_each(|(path, bytes)| {
+        let t = temp(path);
+        std::fs::write(&t, bytes)?;
+        written.push(t);
+        Ok(())
+    });
+    if let Err(e) = result {
+        for t in &written {
+            let _ = std::fs::remove_file(t);
+        }
+        return Err(e);
+    }
+    for (path, _) in files {
+        if let Err(e) = std::fs::rename(temp(path), path) {
+            for (p, _) in files {
+                let _ = std::fs::remove_file(temp(p));
+            }
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
 fn kill(slot: &Slot) {
     if let Some(mut limited) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = limited.child.kill();
@@ -1272,8 +1555,17 @@ fn decode(op: &Op, head: Head, body: Vec<u8>) -> Answer {
         Op::Save if head.bytes > 0 => Answer::Bytes(body),
         Op::Save => Answer::Failed(DIED.into()),
         Op::Saved => Answer::Ok,
-        // Never sent: the Worker answers it.
-        Op::SaveTo { .. } => Answer::Failed(DIED.into()),
+        Op::Print { .. } => head
+            .printed
+            .map_or_else(|| Answer::Failed(DIED.into()), Answer::Printed),
+        Op::Png { .. } => match head.dpi {
+            Some(dpi) if head.bytes > 0 => Answer::Png { png: body, dpi },
+            _ => Answer::Failed(DIED.into()),
+        },
+        Op::ExtractPages { .. } if head.bytes > 0 => Answer::Bytes(body),
+        Op::ExtractPages { .. } => Answer::Failed(DIED.into()),
+        // Never sent: the Worker answers them.
+        Op::SaveTo { .. } | Op::ExportTo { .. } => Answer::Failed(DIED.into()),
     }
 }
 
@@ -1366,4 +1658,10 @@ pub(crate) mod tests;
 #[cfg(test)]
 pub(crate) fn doc_no_filling() -> &'static str {
     doc::NO_FILLING
+}
+
+/// What the child answers a print, a PNG and a PDF of pages the file's
+/// permissions refuse (#2258), for the dialogs' own refusal up front.
+pub(crate) fn doc_refusals() -> (&'static str, &'static str, &'static str) {
+    (doc::NO_PRINTING, doc::NO_COPYING, doc::NO_EXTRACTING)
 }

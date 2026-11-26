@@ -1660,6 +1660,63 @@ dialogs! {
         accept_closes: true,
         unreachable: None,
     }
+    // ---- A PDF view's Print and exports (#2258) ------------------------------
+    // A harness's printers are made up and its jobs go to a folder, so OK
+    // prints nothing; an export's Save… waits for the harness's save-as.
+    PDF_PRINT = "pdf-print" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-text.pdf",
+        open: &[r#"call pdf-read {"until_drawn":[1]}"#, "key ctrl+p"],
+        fields: &[
+            dropdown("printer"),
+            Field::number("copies", "2"),
+            radio("pages"),
+            Field::text("range").sample("1"),
+            radio("sizing"),
+            Field::number("percent", "50"),
+            radio("orientation"),
+            dropdown("paper"),
+            dropdown("content"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    PDF_EXPORT_PNG = "pdf-export-png" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-text.pdf",
+        open: &[
+            r#"call pdf-read {"until_drawn":[1]}"#,
+            r#"call backstage {"action":"open"}"#,
+            r#"call pointer-click {"region":"bs-rail:pdf-export"}"#,
+            r#"call pointer-click {"region":"pdf-export-png"}"#,
+        ],
+        fields: &[
+            radio("pages"),
+            Field::text("range").sample("1"),
+            dropdown("dpi"),
+        ],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
+    PDF_EXPORT_PDF = "pdf-export-pdf" {
+        surface: Surface::Doc,
+        file: "doc-app",
+        fixture: "copy:../fixtures/pdf-view-text.pdf",
+        open: &[
+            r#"call pdf-read {"until_drawn":[1]}"#,
+            r#"call backstage {"action":"open"}"#,
+            r#"call pointer-click {"region":"bs-rail:pdf-export"}"#,
+            r#"call pointer-click {"region":"pdf-export-pdf"}"#,
+        ],
+        fields: &[radio("pages"), Field::text("range").sample("1")],
+        reopen: &[],
+        accept_closes: true,
+        unreachable: None,
+    }
     // ---- Project -----------------------------------------------------------
     TASK_INFORMATION = "task-information" {
         surface: Surface::Project,

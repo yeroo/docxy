@@ -573,11 +573,12 @@ mod tests {
 
     #[test]
     fn backstage_rail_info_only_for_documents() {
-        let ids = |project, doc| {
-            crate::backstage_rail_items(project, doc)
+        let ids_of = |project, doc, pdf| {
+            crate::backstage_rail_items(project, doc, pdf)
                 .map(|item| item.id)
                 .collect::<Vec<_>>()
         };
+        let ids = |project, doc| ids_of(project, doc, false);
         assert_eq!(
             ids(false, true),
             [
@@ -606,6 +607,36 @@ mod tests {
         assert!(!project.contains(&"bs-export-doc"));
         assert!(!ids(false, true).contains(&"bs-export"));
         assert!(!ids(false, false).contains(&"bs-export-doc"));
+        // A PDF tab (#2258): Print and its own Export, on no other tab.
+        assert_eq!(
+            ids_of(false, false, true),
+            [
+                "bs-back",
+                "bs-new",
+                "bs-open",
+                "bs-save",
+                "bs-saveas",
+                "bs-pdf-print",
+                "bs-pdf-export",
+                "bs-account",
+                "bs-close"
+            ]
+        );
+        for (project, doc) in [(false, false), (true, false), (false, true)] {
+            let other = ids(project, doc);
+            assert!(!other.contains(&"bs-pdf-print") && !other.contains(&"bs-pdf-export"));
+        }
+    }
+
+    /// Ctrl+P (⌘P) alone is Print on a PDF tab (#2258).
+    #[test]
+    fn print_chord_is_ctrl_or_cmd_p_alone() {
+        let k = |s: &str| gpui::Keystroke::parse(s).unwrap();
+        assert!(crate::is_print_chord(&k("ctrl-p")));
+        assert!(crate::is_print_chord(&k("cmd-p")));
+        for other in ["p", "ctrl-shift-p", "ctrl-alt-p", "ctrl-o"] {
+            assert!(!crate::is_print_chord(&k(other)), "{other}");
+        }
     }
 
     /// Review r1 m3: the Info page shows the last Remove All's result, an

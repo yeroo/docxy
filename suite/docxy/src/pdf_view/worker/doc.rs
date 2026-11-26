@@ -22,6 +22,7 @@
 
 use super::*;
 use pdfcraft_render::{DocInfo, LinkTarget, PageInfo, PageRenderer, RenderConfig};
+use std::borrow::Cow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 /// The most notes `info` lists.
@@ -82,13 +83,21 @@ impl Served {
             Op::Unlock { password } => self.unlock(id, password.clone()),
             Op::Pixels { page, scale } => self.pixels(id, *page, *scale),
             Op::Text { page } => self.text(id, *page),
-            Op::SaveTo { .. } => (
+            Op::SaveTo { .. } | Op::ExportTo { .. } => (
                 failed(
                     id,
                     "a save's path is the parent's, never the reader's".into(),
                 ),
                 vec![],
             ),
+            // Printing and exporting change nothing of the working copy: a
+            // panic in them answers why, and the child goes on (#2258).
+            Op::Print { .. } | Op::Png { .. } | Op::ExtractPages { .. } => {
+                match catch_unwind(AssertUnwindSafe(|| self.output(id, op))) {
+                    Ok(answered) => answered,
+                    Err(_) => (failed(id, DIED.into()), vec![]),
+                }
+            }
             op => {
                 let op = op.clone();
                 match catch_unwind(AssertUnwindSafe(|| self.form_op(id, &op))) {
@@ -242,6 +251,23 @@ impl Served {
     }
 
     fn build_display(&mut self) -> Option<Arc<Vec<u8>>> {
+        let shown = self.shown()?;
+        // Nothing to add and nothing changed: the bytes as they are.
+        if matches!(shown, Cow::Borrowed(cos) if !cos.is_modified()) {
+            return None;
+        }
+        pdfcraft_cos::write_incremental(&shown, &pdfcraft_cos::SaveOptions::default())
+            .ok()
+            .map(Arc::new)
+    }
+
+    /// The document pages are drawn from (#2258): the working copy with the
+    /// appearances PdfCraft gives comments that have none and form fields
+    /// drawn from their values, filled or not; the working copy itself when
+    /// neither adds anything. What the display copy's bytes are written
+    /// from, and what a print or an export takes, so they show the page as
+    /// the view draws it. `None` when the working copy does not open.
+    fn shown(&mut self) -> Option<Cow<'_, pdfcraft_cos::Document>> {
         self.cos();
         let Served {
             cos,
@@ -255,15 +281,10 @@ impl Served {
             with_comments.as_ref().unwrap_or(cos),
             appearances,
         );
-        let shown = match (&with_fields, &with_comments) {
-            (Some(d), _) | (None, Some(d)) => d,
-            (None, None) if cos.is_modified() => cos,
-            // Nothing to add and nothing changed: the bytes as they are.
-            (None, None) => return None,
-        };
-        pdfcraft_cos::write_incremental(shown, &pdfcraft_cos::SaveOptions::default())
-            .ok()
-            .map(Arc::new)
+        Some(match (with_fields, with_comments) {
+            (Some(d), _) | (None, Some(d)) => Cow::Owned(d),
+            (None, None) => Cow::Borrowed(cos),
+        })
     }
 
     fn render(&mut self, req: pdfcraft_render::RenderRequest) -> pdfcraft_render::RenderedPage {
@@ -326,6 +347,150 @@ impl Served {
                 vec![],
             ),
             (None, None) => (failed(id, "the page has no text layer".into()), vec![]),
+        }
+    }
+
+    // ---- printing and exporting (#2258) ---------------------------------------
+
+    /// A print, a page's PNG or the pages' PDF: refused when the password
+    /// the file was opened with does not allow it, as PdfCraft's engine
+    /// refuses (printing: `print`; a picture of a page: `copy`, its "Save
+    /// Image As, exporting"; pages into a new file: `extract_pages`).
+    fn output(&mut self, id: u64, op: &Op) -> Answered {
+        let count = self.pages().len();
+        let pages: &[usize] = match op {
+            Op::Print { job } => &job.pages,
+            Op::Png { page, .. } => std::slice::from_ref(page),
+            Op::ExtractPages { pages } => pages,
+            _ => return (failed(id, "not a print or an export".into()), vec![]),
+        };
+        if pages.is_empty() {
+            return (failed(id, "there are no pages to print".into()), vec![]);
+        }
+        if let Some(p) = pages.iter().find(|p| **p >= count) {
+            return (
+                failed(id, format!("page {} is out of range (1–{count})", p + 1)),
+                vec![],
+            );
+        }
+        let (allowed, refusal): (fn(&pdfcraft_cos::Permissions) -> bool, &str) = match op {
+            Op::Print { .. } => (|p| p.print(), NO_PRINTING),
+            Op::Png { .. } => (|p| p.copy(), NO_COPYING),
+            _ => (|p| p.extract_pages(), NO_EXTRACTING),
+        };
+        match self.cos() {
+            // A file only the renderer reads has no permissions PdfCraft can
+            // check, and no document to print or take pages from: refused,
+            // never the raw bytes (PdfCraft's engine treats unknown
+            // permissions as none).
+            None => return (failed(id, NOT_READ.into()), vec![]),
+            Some(cos) if !cos.permissions().is_none_or(|p| allowed(&p)) => {
+                return (failed(id, refusal.into()), vec![]);
+            }
+            Some(_) => {}
+        }
+        match op {
+            Op::Print { job } => self.print(id, job),
+            Op::Png { page, dpi } => self.png(id, *page, *dpi),
+            Op::ExtractPages { pages } => self.extract(id, pages),
+            _ => unreachable!("matched above"),
+        }
+    }
+
+    fn print(&mut self, id: u64, job: &PrintJob) -> Answered {
+        let settings = print_settings(job);
+        let job_spec = spool_job(job);
+        let result = (|| {
+            let shown = self.shown().ok_or(NOT_READ)?;
+            let pdf = pdfcraft_print::impose(&shown, &settings).map_err(|e| e.to_string())?;
+            // CUPS is told which way the sheets run, as PdfCraft's own Print
+            // does: it would shrink a landscape sheet into portrait paper.
+            let sizes: Vec<(f64, f64)> = pdfcraft_model::pages(&shown)
+                .iter()
+                .map(|p| p.display_size(&shown))
+                .collect();
+            let sheets = pdfcraft_print::layout(&sizes, &settings).map_err(|e| e.to_string())?;
+            let mut spec = job_spec;
+            pdfcraft_print::add_cups_orientation(&mut spec.options, &sheets);
+            let sent = match &job.spool {
+                Spool::System => {
+                    pdfcraft_print::spool::submit(&pdf, &spec).map_err(|e| e.to_string())?
+                }
+                Spool::Dir { dir } => spool_to_dir(dir, &pdf, &spec, job, sheets.len())?,
+            };
+            Ok::<_, String>(Printed {
+                sheets: sheets.len(),
+                job: sent,
+            })
+        })();
+        match result {
+            Ok(printed) => (
+                Head {
+                    id,
+                    printed: Some(printed),
+                    ..Head::default()
+                },
+                vec![],
+            ),
+            Err(why) => (failed(id, why), vec![]),
+        }
+    }
+
+    /// Page `page` as a PNG at `dpi` (18–1200, as PdfCraft's exporter
+    /// clamps it), at most what the renderer draws a page at
+    /// (`effective_scale`): the answer says the resolution drawn.
+    fn png(&mut self, id: u64, page: usize, dpi: f64) -> Answered {
+        let dpi = if dpi.is_finite() { dpi } else { 150. }.clamp(18., 1200.);
+        let size = self
+            .pages()
+            .get(page)
+            .map(|p| (p.width, p.height))
+            .unwrap_or((1., 1.));
+        let scale = pdfcraft_render::effective_scale(size.0, size.1, (dpi / 72.) as f32);
+        let r = self.render(pdfcraft_render::RenderRequest {
+            page,
+            scale,
+            ..Default::default()
+        });
+        if let Some(e) = r.error {
+            return (failed(id, e), vec![]);
+        }
+        match encode_png(r.width, r.height, &r.rgba) {
+            Ok(png) if png.len() <= MAX_SAVE_BYTES => (
+                Head {
+                    id,
+                    bytes: png.len(),
+                    dpi: Some(f64::from(scale) * 72.),
+                    ..Head::default()
+                },
+                png,
+            ),
+            Ok(_) => (failed(id, "the picture is too large".into()), vec![]),
+            Err(why) => (failed(id, why), vec![]),
+        }
+    }
+
+    /// `pages` as a new PDF (PdfCraft's Extract Pages): copies of the pages
+    /// as drawn, unsaved form values in, with their bookmarks, labels and
+    /// the document's information; never encrypted.
+    fn extract(&mut self, id: u64, pages: &[usize]) -> Answered {
+        let result = (|| {
+            let shown = self.shown().ok_or(NOT_READ)?;
+            let out = pdfcraft_organize::extract_pages(&shown, pages).map_err(|e| e.to_string())?;
+            pdfcraft_cos::write_full(&out, &pdfcraft_cos::SaveOptions::default())
+                .map_err(|e| e.to_string())
+        })();
+        match result {
+            Ok(pdf) if pdf.len() <= MAX_SAVE_BYTES => (
+                Head {
+                    id,
+                    bytes: pdf.len(),
+                    ..Head::default()
+                },
+                pdf,
+            ),
+            Ok(_) => (failed(id, "the PDF is too large to save".into()), vec![]),
+            Err(why) => (failed(id, why), vec![]),
         }
     }
 
@@ -506,6 +671,133 @@ impl Served {
 
 /// What a fill of a form the file does not let be filled answers (#2256).
 pub(crate) const NO_FILLING: &str = "this PDF's permissions do not allow filling in its form";
+/// What a print of a file that does not allow printing answers (#2258).
+pub(crate) const NO_PRINTING: &str = "this PDF's permissions do not allow printing";
+/// What a PNG export of a file that does not allow copying answers.
+pub(crate) const NO_COPYING: &str = "this PDF's permissions do not allow copying its content, so its pages cannot be saved as pictures";
+/// What a PDF export of a file that does not allow taking its pages answers.
+pub(crate) const NO_EXTRACTING: &str =
+    "this PDF's permissions do not allow its pages to be saved into another file";
+/// A print or an export of a file PdfCraft's working copy does not read.
+pub(crate) const NOT_READ: &str = "the PDF could not be read for printing or exporting";
+
+/// The job's `pdfcraft_print::Settings`: one page per sheet, sized.
+fn print_settings(job: &PrintJob) -> pdfcraft_print::Settings {
+    use pdfcraft_print::{Content, Layout, Orientation, SizeMode};
+    pdfcraft_print::Settings {
+        pages: job.pages.clone(),
+        paper: job.paper,
+        orientation: match job.orientation {
+            Orient::Auto => Orientation::Auto,
+            Orient::Portrait => Orientation::Portrait,
+            Orient::Landscape => Orientation::Landscape,
+        },
+        layout: Layout::Size(match job.sizing {
+            Sizing::Fit => SizeMode::Fit,
+            Sizing::Actual => SizeMode::Actual,
+            Sizing::Shrink => SizeMode::Shrink,
+            Sizing::Custom { percent } => SizeMode::Custom(percent),
+        }),
+        content: match job.content {
+            PrintContent::DocumentAndMarkups => Content::DocumentAndMarkups,
+            PrintContent::Document => Content::Document,
+            PrintContent::FormFieldsOnly => Content::FormFieldsOnly,
+        },
+        ..Default::default()
+    }
+}
+
+/// The job as the spooler takes it, as PdfCraft's Print dialog builds it:
+/// the sheets are laid out already (`Exact`), on the paper the job names
+/// (its CUPS `media`); two-sided printing is left to the printer.
+fn spool_job(job: &PrintJob) -> pdfcraft_print::spool::Job {
+    pdfcraft_print::spool::Job {
+        printer: job.printer.clone(),
+        copies: job.copies.clamp(1, 999),
+        collate: job.collate,
+        duplex: None,
+        scaling: pdfcraft_print::spool::Scaling::Exact,
+        grayscale: false,
+        grey_pages: false,
+        title: job.title.clone(),
+        options: vec![pdfcraft_print::paper_media_option(
+            job.paper_name.as_deref(),
+            job.paper,
+        )],
+        driver_settings: None,
+    }
+}
+
+/// A job for a folder (a harness, a test, #2258): `job-<n>.pdf` (the
+/// sheets as the spooler would take them) and `job-<n>.json` (the job, and
+/// the `lp` command CUPS would run for it), `n` the first number free.
+fn spool_to_dir(
+    dir: &Path,
+    pdf: &[u8],
+    spec: &pdfcraft_print::spool::Job,
+    job: &PrintJob,
+    sheets: usize,
+) -> Result<String, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("the print folder: {e}"))?;
+    let n = (1..)
+        .find(|n| !dir.join(format!("job-{n}.json")).exists())
+        .unwrap_or(1);
+    let pdf_path = dir.join(format!("job-{n}.pdf"));
+    std::fs::write(&pdf_path, pdf).map_err(|e| format!("the print folder: {e}"))?;
+    let options: Vec<serde_json::Value> = spec
+        .options
+        .iter()
+        .map(|(k, v)| serde_json::json!([k, v]))
+        .collect();
+    let meta = serde_json::json!({
+        "printer": spec.printer,
+        "copies": spec.copies,
+        "collate": spec.collate,
+        "title": spec.title,
+        "scaling": "exact",
+        "options": options,
+        "lp_args": pdfcraft_print::spool::lp_args(spec),
+        "pages": job.pages.iter().map(|p| p + 1).collect::<Vec<_>>(),
+        "sheets": sheets,
+        "paper": job.paper_name,
+        "paper_size": [job.paper.0, job.paper.1],
+        "pdf": pdf_path.file_name().map(|n| n.to_string_lossy().into_owned()),
+    });
+    let json_path = dir.join(format!("job-{n}.json"));
+    std::fs::write(
+        &json_path,
+        serde_json::to_vec_pretty(&meta).unwrap_or_default(),
+    )
+    .map_err(|e| format!("the print folder: {e}"))?;
+    Ok(format!("job-{n}"))
+}
+
+/// The renderer's premultiplied RGBA as a PNG (straight RGBA, as a file
+/// takes it).
+fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
+    if w == 0 || h == 0 || rgba.len() != w as usize * h as usize * 4 {
+        return Err("the page drew nothing".into());
+    }
+    let mut straight = Vec::with_capacity(rgba.len());
+    for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
+        let un = |c: u8| match a {
+            255 => c,
+            0 => 0,
+            a => ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8,
+        };
+        straight.extend_from_slice(&[un(r), un(g), un(b), a]);
+    }
+    let mut out = Vec::new();
+    image::ImageEncoder::write_image(
+        image::codecs::png::PngEncoder::new(&mut out),
+        &straight,
+        w,
+        h,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|e| format!("the picture could not be written: {e}"))?;
+    Ok(out)
+}
 
 fn locked(id: u64, why: Locked) -> Head {
     Head {
@@ -568,6 +860,7 @@ fn security(cos: &pdfcraft_cos::Document) -> Option<SecurityMeta> {
         modify: p.modify(),
         annotate: p.annotate(),
         fill_forms: p.fill_forms(),
+        extract: p.extract_pages(),
     })
 }
 

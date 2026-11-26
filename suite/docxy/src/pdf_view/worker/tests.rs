@@ -23,7 +23,9 @@ const CHILD_ENV: &str = "DOCXY_PDF_WORKER_TEST_CHILD";
 /// asked for page 1's pixels, `check-secret` aborts when the password
 /// an `unlock` gives is in its command line or environment, `limits`
 /// aborts on `info` unless its data limit is `MEMORY_LIMIT` and its core
-/// limit 0, and `abort-on-unlock` aborts on any `unlock`.
+/// limit 0, and `abort-on-unlock` aborts on any `unlock`; `slow-print`
+/// (#2258) takes 1.5 × the child's timeout over a print, and `hang-print`
+/// never answers one.
 const MODE_ENV: &str = "DOCXY_PDF_WORKER_TEST_MODE";
 
 /// The child half of the tests below: the same `run` the suite's child
@@ -76,6 +78,14 @@ fn child_entry() {
                     std::process::abort();
                 }
             }
+            ("slow-print", Op::Print { .. }) => {
+                std::thread::sleep(Duration::from_millis(
+                    ms.parse::<u64>().expect("ms") * 3 / 2,
+                ));
+            }
+            ("hang-print", Op::Print { .. }) => loop {
+                std::thread::sleep(Duration::from_secs(1));
+            },
             ("hang-pixels", Op::Pixels { .. }) => loop {
                 std::thread::sleep(Duration::from_secs(1));
             },
@@ -424,6 +434,11 @@ fn mutate(bytes: &[u8], k: usize, rng: &mut Rng) -> Vec<u8> {
 
 /// Mutated copies of each corpus file.
 const MUTATIONS: usize = 21;
+/// How many of each file's mutations are also printed and exported
+/// (#2258): a third, and every original and structural mutation. Measured
+/// on this machine (22 cores, debug build, 6 threads): the test takes 4.9 s
+/// with none, 7.0 s with 7 and 12.7 s with all 21.
+const OUTPUT_MUTATIONS: usize = 7;
 /// The child's and the parent's timeout for the mutated files.
 const FUZZ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -542,30 +557,32 @@ fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
         let src = corpus_path(name);
         let bytes = std::fs::read(&src).unwrap();
         let pw = user_password(name);
-        files.push((src, pw));
+        files.push((src, pw, true));
         let mut rng = Rng(0x2245_0000 + n as u64 * 7919 + 1);
         for k in 0..MUTATIONS {
             let p = dir.path(&format!("{name}-{k}.pdf"));
             std::fs::write(&p, mutate(&bytes, k, &mut rng)).unwrap();
-            files.push((p, pw));
+            files.push((p, pw, k < OUTPUT_MUTATIONS));
         }
         for (what, b) in structural(&bytes) {
             let p = dir.path(&format!("{name}-{what}.pdf"));
             std::fs::write(&p, b).unwrap();
-            files.push((p, pw));
+            files.push((p, pw, true));
         }
     }
-    // Saves go here, never next to a corpus file.
+    // Saves go here, never next to a corpus file; and print jobs (#2258).
     let saves = dir.path("saved");
     std::fs::create_dir_all(&saves).unwrap();
+    let jobs = dir.path("jobs");
     let files = Arc::new(Mutex::new(files));
     let tally = Arc::new(Mutex::new((0usize, 0usize, Vec::<String>::new())));
     let threads: Vec<_> = (0..6)
         .map(|_| {
-            let (files, tally, saves) = (files.clone(), tally.clone(), saves.clone());
+            let (files, tally, saves, jobs) =
+                (files.clone(), tally.clone(), saves.clone(), jobs.clone());
             std::thread::spawn(move || {
                 loop {
-                    let Some((path, pw)) = files.lock().unwrap().pop() else {
+                    let Some((path, pw, outputs)) = files.lock().unwrap().pop() else {
                         return;
                     };
                     let mut w =
@@ -578,7 +595,7 @@ fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
                         };
                         let took = t0.elapsed();
                         let mut t = tally.lock().unwrap();
-                        if took > FUZZ_TIMEOUT + Duration::from_secs(5) {
+                        if took > op.timeout(FUZZ_TIMEOUT) + Duration::from_secs(5) {
                             t.2.push(format!("{}: {op:?} took {took:?}", path.display()));
                         }
                         match &a {
@@ -616,6 +633,20 @@ fn no_corpus_file_or_mutation_crashes_or_hangs_the_parent() {
                     for page in 0..m.pages.len().min(3) {
                         ask(Op::Pixels { page, scale: 0.5 });
                         ask(Op::Text { page });
+                    }
+                    // Printed (to a folder) and exported, its first page
+                    // as a PNG and as a PDF (#2258): the originals and the
+                    // first `OUTPUT_MUTATIONS` mutations of each.
+                    if outputs {
+                        ask(Op::Print {
+                            job: crate::pdf_view::print::tests::job(
+                                vec![0],
+                                Sizing::Fit,
+                                Spool::Dir { dir: jobs.clone() },
+                            ),
+                        });
+                        ask(Op::Png { page: 0, dpi: 72. });
+                        ask(Op::ExtractPages { pages: vec![0] });
                     }
                     // A form's mutations are filled and saved too (#2255),
                     // to a file of their own in the scratch folder: the
@@ -1061,4 +1092,47 @@ fn a_flate_bomb_answers_in_time() {
             }
         }
     }
+}
+
+// ---- print and export (#2258) -------------------------------------------------
+
+/// Criterion 7: a print gets its own budget through a real child: one that
+/// takes longer than a page may (1.5 × the child's timeout) is answered,
+/// not killed, while one that never answers is given up on at its own
+/// deadline, and the next question starts a new child that answers.
+#[test]
+fn a_print_past_a_pages_timeout_is_answered_and_a_hung_one_given_up() {
+    let dir = Scratch::new();
+    let spool = Spool::Dir {
+        dir: dir.path("jobs"),
+    };
+    let t = Duration::from_millis(1500);
+    let mut w = child_worker("text", Some("slow-print"), t, t);
+    let job = crate::pdf_view::print::tests::job(vec![0], Sizing::Fit, spool.clone());
+    let t0 = Instant::now();
+    match w.ask(&Op::Print { job: job.clone() }) {
+        Answer::Printed(p) => assert_eq!(p.sheets, 1),
+        other => panic!("{other:?}"),
+    }
+    assert!(t0.elapsed() > t, "it ran past a page's timeout");
+    assert_eq!(w.started, 1, "not killed");
+    let mut w = child_worker("text", Some("hang-print"), t, t);
+    let t0 = Instant::now();
+    match w.ask(&Op::Print { job }) {
+        Answer::Failed(why) => assert_eq!(why, TOO_LONG),
+        other => panic!("{other:?}"),
+    }
+    let took = t0.elapsed();
+    assert!(
+        took >= t * 3 && took < t * 3 + Duration::from_secs(5),
+        "{took:?}"
+    );
+    assert!(matches!(
+        w.ask(&Op::Pixels {
+            page: 0,
+            scale: 0.5
+        }),
+        Answer::Pixels(_)
+    ));
+    assert_eq!(w.started, 2);
 }

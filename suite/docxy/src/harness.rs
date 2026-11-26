@@ -2015,9 +2015,44 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
                 && !v.copy_waits()
                 && v.pending_save.is_none()
                 && (v.find.field.text.is_empty() && !v.want_all_text || v.unread_pages() == 0)));
-    let mut done = Done::ok(v.read_json())?;
+    let mut json = v.read_json();
+    if let Json::Obj(pairs) = &mut json {
+        // The last print job this harness instance wrote (#2258), and an
+        // export waiting for its save-as.
+        pairs.push(("printed".into(), last_print_job()));
+        let waiting = match &v.export_waiting {
+            Some(crate::pdf_view::worker::Export::Png { .. }) => Json::Str("png".into()),
+            Some(crate::pdf_view::worker::Export::Pdf { .. }) => Json::Str("pdf".into()),
+            None => Json::Null,
+        };
+        pairs.push(("export_waiting".into(), waiting));
+    }
+    let mut done = Done::ok(json)?;
     done.retry = (!settled).then(|| std::time::Duration::from_millis(within as u64));
     Ok(done)
+}
+
+/// The last job a harness instance printed (#2258): its `job-<n>.json`, as
+/// the worker wrote it, with `jobs`, how many there are; `null` before the
+/// first.
+fn last_print_job() -> Json {
+    let dir = crate::pdf_view::print::harness_spool(&crate::config_root());
+    let jobs = (1..)
+        .take_while(|n| dir.join(format!("job-{n}.json")).exists())
+        .count();
+    if jobs == 0 {
+        return Json::Null;
+    }
+    let read = std::fs::read_to_string(dir.join(format!("job-{jobs}.json")))
+        .ok()
+        .and_then(|t| Json::parse(&t).ok());
+    match read {
+        Some(Json::Obj(mut pairs)) => {
+            pairs.push(("jobs".into(), Json::Num(jobs as f64)));
+            Json::Obj(pairs)
+        }
+        _ => Json::Null,
+    }
 }
 
 /// The test extension's view on the active tab (#1873): refused unless the
@@ -8047,10 +8082,13 @@ fn dispatch_verb(
                 }
                 "account" => app.open_account(cx),
                 "export" => {
-                    if !app.active_is_doc() {
-                        return Err("the Export page is for a document tab".into());
+                    if app.active_kind_is_pdf() {
+                        app.backstage_rail_action(crate::BackstageRailAction::PdfExport, window, cx)
+                    } else if !app.active_is_doc() {
+                        return Err("the Export page is for a document or PDF tab".into());
+                    } else {
+                        app.backstage_rail_action(crate::BackstageRailAction::ExportDoc, window, cx)
                     }
-                    app.backstage_rail_action(crate::BackstageRailAction::ExportDoc, window, cx)
                 }
                 "open" => app.show_backstage_open_page(),
                 // The rail's Close item (#806: with no tab it does nothing).
@@ -8277,6 +8315,33 @@ fn dispatch_verb(
                         return Err("this tab has never been saved, so a relative 'path' has no folder: give an absolute path".into());
                     }
                 };
+                // An export waiting for its file (#2258): this names it, as
+                // the Save dialog would.
+                if let Some(export) = app.active_pdf_mut().and_then(|v| v.export_waiting.take()) {
+                    let target = crate::pdf_view::print::export_target(target, &export)?;
+                    if target.exists() && !overwrite {
+                        if let Some(v) = app.active_pdf_mut() {
+                            v.export_waiting = Some(export);
+                        }
+                        return Err(format!(
+                            "{} already exists; pass \"overwrite\": true to replace it",
+                            target.display()
+                        ));
+                    }
+                    let kind = match export {
+                        crate::pdf_view::worker::Export::Png { .. } => "png",
+                        crate::pdf_view::worker::Export::Pdf { .. } => "pdf",
+                    };
+                    let target = app.pdf_export_to(export, target)?;
+                    cx.notify();
+                    let tab = &app.tabs[app.active];
+                    return Done::ok(Json::obj(vec![
+                        ("path", Json::Str(target.display().to_string())),
+                        ("queued", Json::Bool(true)),
+                        ("export", Json::Str(kind.into())),
+                        ("status", Json::Str(tab.status.to_string())),
+                    ]));
+                }
                 let target = crate::pdf_view::host::pdf_save_as_target(target)?;
                 if target.exists() && !overwrite {
                     return Err(format!(

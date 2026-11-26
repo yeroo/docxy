@@ -658,6 +658,10 @@ enum BackstageRailAction {
     Export,
     /// A document's Export page, Change File Type (#635).
     ExportDoc,
+    /// A PDF view's Print (#2258).
+    PdfPrint,
+    /// A PDF view's Export page: pages as PNG pictures or as a PDF (#2258).
+    PdfExport,
     /// Build info and the About dialog (#1023); on every tab kind.
     Account,
     Close,
@@ -670,6 +674,8 @@ struct BackstageRailItem {
     project_only: bool,
     /// Shown only for a document tab (Word's Info page, #627).
     doc_only: bool,
+    /// Shown only for a PDF tab, open or not (#2258).
+    pdf_only: bool,
 }
 
 const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
@@ -679,6 +685,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Back,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-info",
@@ -686,6 +693,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Info,
         project_only: false,
         doc_only: true,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-new",
@@ -693,6 +701,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::New,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-open",
@@ -700,6 +709,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Open,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-save",
@@ -707,6 +717,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Save,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-saveas",
@@ -714,6 +725,23 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::SaveAs,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-pdf-print",
+        display: "Print",
+        action: BackstageRailAction::PdfPrint,
+        project_only: false,
+        doc_only: false,
+        pdf_only: true,
+    },
+    BackstageRailItem {
+        id: "bs-pdf-export",
+        display: "Export",
+        action: BackstageRailAction::PdfExport,
+        project_only: false,
+        doc_only: false,
+        pdf_only: true,
     },
     BackstageRailItem {
         id: "bs-export",
@@ -721,6 +749,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Export,
         project_only: true,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-export-doc",
@@ -728,6 +757,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::ExportDoc,
         project_only: false,
         doc_only: true,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-account",
@@ -735,6 +765,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Account,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-close",
@@ -742,18 +773,20 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Close,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
 ];
 
-/// The rail for the active tab: `project` and `doc` say whether it is a
-/// project or a document tab.
+/// The rail for the active tab: `project`, `doc` and `pdf` say whether it
+/// is a project, a document or a PDF tab (open, failed or not opened yet).
 fn backstage_rail_items(
     project: bool,
     doc: bool,
+    pdf: bool,
 ) -> impl Iterator<Item = &'static BackstageRailItem> {
-    BACKSTAGE_RAIL
-        .iter()
-        .filter(move |item| (!item.project_only || project) && (!item.doc_only || doc))
+    BACKSTAGE_RAIL.iter().filter(move |item| {
+        (!item.project_only || project) && (!item.doc_only || doc) && (!item.pdf_only || pdf)
+    })
 }
 
 /// An extension page's rail entry (#1923), as [`backstage_rail`] takes it:
@@ -800,7 +833,7 @@ impl RailEntry {
 /// Account, the `Bottom` entries, then Close. An entry with an empty id, or
 /// an id an earlier entry used, is left out. With no entries it is exactly
 /// [`backstage_rail_items`].
-fn backstage_rail(project: bool, doc: bool, ext: &[ExtRailEntry]) -> Vec<RailEntry> {
+fn backstage_rail(project: bool, doc: bool, pdf: bool, ext: &[ExtRailEntry]) -> Vec<RailEntry> {
     let mut seen = std::collections::HashSet::new();
     let ext: Vec<&ExtRailEntry> = ext
         .iter()
@@ -812,7 +845,7 @@ fn backstage_rail(project: bool, doc: bool, ext: &[ExtRailEntry]) -> Vec<RailEnt
             .map(|e| RailEntry::Ext((*e).clone()))
     };
     let mut rail = Vec::new();
-    for item in backstage_rail_items(project, doc) {
+    for item in backstage_rail_items(project, doc, pdf) {
         match item.action {
             BackstageRailAction::Account => {
                 rail.push(RailEntry::Suite(item));
@@ -850,10 +883,16 @@ mod backstage_rail_tests {
     fn with_no_extension_pages_the_rail_is_the_suites_own() {
         for project in [false, true] {
             for doc in [false, true] {
-                let suite: Vec<RailEntry> = backstage_rail_items(project, doc)
-                    .map(RailEntry::Suite)
-                    .collect();
-                assert_eq!(backstage_rail(project, doc, &[]), suite, "{project} {doc}");
+                for pdf in [false, true] {
+                    let suite: Vec<RailEntry> = backstage_rail_items(project, doc, pdf)
+                        .map(RailEntry::Suite)
+                        .collect();
+                    assert_eq!(
+                        backstage_rail(project, doc, pdf, &[]),
+                        suite,
+                        "{project} {doc} {pdf}"
+                    );
+                }
             }
         }
     }
@@ -868,7 +907,7 @@ mod backstage_rail_tests {
             entry("p", Bottom),
         ];
         assert_eq!(
-            labels(&backstage_rail(false, false, &ext)),
+            labels(&backstage_rail(false, false, false, &ext)),
             [
                 "← Back",
                 "L a",
@@ -884,7 +923,7 @@ mod backstage_rail_tests {
             ]
         );
         // A document's own Info comes after the extension's top pages.
-        let doc = backstage_rail(false, true, &ext);
+        let doc = backstage_rail(false, true, false, &ext);
         let doc = labels(&doc);
         assert_eq!(doc[..4], ["← Back", "L a", "L b", "Info"]);
         assert_eq!(doc[doc.len() - 4..], ["Account", "L o", "L p", "Close"]);
@@ -902,7 +941,7 @@ mod backstage_rail_tests {
             entry("b", Bottom),
         ];
         assert_eq!(
-            labels(&backstage_rail(false, false, &ext)),
+            labels(&backstage_rail(false, false, false, &ext)),
             [
                 "← Back",
                 "First",
@@ -6765,6 +6804,12 @@ fn probe(cell: &std::rc::Rc<std::cell::RefCell<Probes>>, name: impl Into<String>
 /// harness's `ext-ribbon-cmd:<id>` region.
 fn ext_cmd_probe(id: &str) -> String {
     format!("ext-ribbon-cmd:{id}")
+}
+
+/// Ctrl+P, or ⌘P: Print (#2258).
+fn is_print_chord(k: &gpui::Keystroke) -> bool {
+    let m = k.modifiers;
+    (m.control || m.platform) && !m.alt && !m.shift && k.key == "p"
 }
 
 /// The probe a suite File rail item draws (#2195), the harness's
@@ -19585,7 +19630,12 @@ impl Docxy {
                 group: p.group,
             })
             .collect();
-        backstage_rail(self.active_is_project(), self.active_is_doc(), &ext)
+        backstage_rail(
+            self.active_is_project(),
+            self.active_is_doc(),
+            self.active_kind_is_pdf(),
+            &ext,
+        )
     }
 
     /// The extension page File shows now (#1923): `bs_ext` while the active
@@ -19638,6 +19688,8 @@ impl Docxy {
             BackstageRailAction::SaveAs => self.save_as(window, cx),
             BackstageRailAction::Export => self.project_act(ProjectAct::ExportGantt, window, cx),
             BackstageRailAction::ExportDoc => self.open_export(cx),
+            BackstageRailAction::PdfPrint => self.pdf_print(window, cx),
+            BackstageRailAction::PdfExport => self.open_export(cx),
             BackstageRailAction::Close => self.backstage_close(window, cx),
         }
     }
@@ -32195,6 +32247,11 @@ impl Docxy {
         if self.active_is_help() {
             self.keytips = KeyTip::Off;
             return self.help_key(ev, window, cx);
+        }
+        // Ctrl+P (⌘P) prints a PDF tab (#2258), or says it is not open.
+        if self.active_kind_is_pdf() && is_print_chord(&ev.keystroke) {
+            self.keytips = KeyTip::Off;
+            return self.pdf_print(window, cx);
         }
         // Nor has a PDF view (#2245): its own keys, which edit only its
         // form's fields (#2255).
@@ -47526,6 +47583,8 @@ impl Docxy {
         } else if let Some(page) = self.account_page(bg, fg, dim, cx) {
             page
         } else if let Some(page) = self.export_page(bg, fg, dim, cx) {
+            page
+        } else if let Some(page) = self.pdf_export_page(bg, fg, dim, cx) {
             page
         } else if let Some(page) = self.info_page(bg, fg, dim, cx) {
             page

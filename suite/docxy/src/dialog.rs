@@ -289,6 +289,12 @@ pub(crate) enum DialogOwner {
     /// before a signed PDF's form values are saved (#2255); pressed in
     /// `pdf_view::host`'s `pdf_signed_save_click`.
     PdfSignedSave,
+    /// A PDF view's Print, and its two exports (#2258): pages as PNG
+    /// pictures, pages as a PDF. Pressed in `pdf_view::host`'s
+    /// `pdf_output_click`: OK prints, or asks where to save.
+    PdfPrint,
+    PdfExportPng,
+    PdfExportPdf,
     /// A dialog the model tests build; the app never applies one.
     #[cfg(test)]
     Test,
