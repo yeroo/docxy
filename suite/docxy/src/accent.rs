@@ -3,14 +3,58 @@
 //! title label names the type in one word.
 //!
 //! `Docxy::render` calls [`set`] once before it builds any chrome, and the
-//! ribbon, backstage and title bar read [`brand`], so no builder takes a
-//! colour. Windows render one at a time, each setting it first.
+//! ribbon, backstage and title bar read [`fill`], [`on_fill`], [`mark`] and
+//! [`text`], so no builder takes a colour. Windows render one at a time,
+//! each setting it first.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::{BRAND, Kind, ext_kinds};
+use docxy_integration::protocol::Rgb;
 
-static CURRENT: AtomicU32 = AtomicU32::new(BRAND);
+use crate::{BRAND, FILE_FG, Kind, brand, ext_kinds};
+
+static FILL: AtomicU32 = AtomicU32::new(BRAND);
+static ON_FILL: AtomicU32 = AtomicU32::new(FILE_FG);
+static MARK: AtomicU32 = AtomicU32::new(BRAND);
+static TEXT: AtomicU32 = AtomicU32::new(BRAND);
+
+/// The colours the chrome draws for one accent, by role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Drawn {
+    /// Fills with text on them, washes, the focus ring.
+    pub(crate) fill: u32,
+    /// The text on [`Drawn::fill`].
+    pub(crate) on_fill: u32,
+    /// Small marks: the active tab's, a selected tile's, a hover border.
+    pub(crate) mark: u32,
+    /// Accent text on the background.
+    pub(crate) text: u32,
+}
+
+/// The roles of `accent` ([`for_tab`]): `accent` in each, white text on its
+/// fill, except that the brand takes each colour the plugin gives that the
+/// suite takes ([`brand::accents`]). A type's own accent stays.
+pub(crate) fn drawn(accent: u32, plugin: &brand::Accents) -> Drawn {
+    let mut d = Drawn {
+        fill: accent,
+        on_fill: FILE_FG,
+        mark: accent,
+        text: accent,
+    };
+    if accent == BRAND {
+        if let Some(p) = plugin.primary {
+            d.fill = p.color.to_u32();
+            d.on_fill = p.text.map_or(FILE_FG, Rgb::to_u32);
+        }
+        if let Some(h) = plugin.highlight {
+            d.mark = h.to_u32();
+        }
+        if let Some(l) = plugin.link {
+            d.text = l.to_u32();
+        }
+    }
+    d
+}
 
 /// The accent for `kind` (None: no tab) on the light or dark theme. Both
 /// shades hold white File-button text at 4.5:1, except doc, whose teal is the
@@ -81,19 +125,37 @@ pub(crate) fn label(kind: Option<Kind>) -> &'static str {
 }
 
 /// Record the accent this window is about to draw.
-pub(crate) fn set(color: u32) {
-    CURRENT.store(color, Ordering::Relaxed);
+pub(crate) fn set(d: Drawn) {
+    FILL.store(d.fill, Ordering::Relaxed);
+    ON_FILL.store(d.on_fill, Ordering::Relaxed);
+    MARK.store(d.mark, Ordering::Relaxed);
+    TEXT.store(d.text, Ordering::Relaxed);
 }
 
-/// The accent the chrome draws now.
-pub(crate) fn brand() -> u32 {
-    CURRENT.load(Ordering::Relaxed)
+/// [`Drawn::fill`] now.
+pub(crate) fn fill() -> u32 {
+    FILL.load(Ordering::Relaxed)
 }
 
-/// The accent as a translucent wash of opacity `alpha` (#1534), the project
+/// [`Drawn::on_fill`] now.
+pub(crate) fn on_fill() -> u32 {
+    ON_FILL.load(Ordering::Relaxed)
+}
+
+/// [`Drawn::mark`] now.
+pub(crate) fn mark() -> u32 {
+    MARK.load(Ordering::Relaxed)
+}
+
+/// [`Drawn::text`] now.
+pub(crate) fn text() -> u32 {
+    TEXT.load(Ordering::Relaxed)
+}
+
+/// The fill as a translucent wash of opacity `alpha` (#1534), the project
 /// table's selection colours: it reads on the light and the dark theme.
 pub(crate) fn wash(alpha: f32) -> gpui::Hsla {
-    let c: gpui::Hsla = gpui::rgb(brand()).into();
+    let c: gpui::Hsla = gpui::rgb(fill()).into();
     gpui::hsla(c.h, c.s, c.l, alpha)
 }
 
@@ -110,6 +172,59 @@ mod tests {
         Some(Kind::Project),
         Some(Kind::Look),
     ];
+
+    #[test]
+    fn the_brand_takes_the_plugins_roles_and_a_types_accent_stays() {
+        use docxy_integration::accent::Accepted;
+        let none = brand::Accents::default();
+        let own = Drawn {
+            fill: BRAND,
+            on_fill: FILE_FG,
+            mark: BRAND,
+            text: BRAND,
+        };
+        assert_eq!(drawn(BRAND, &none), own);
+        let plugin = brand::Accents {
+            primary: Some(Accepted {
+                color: Rgb(0x11, 0x22, 0x33),
+                text: Some(Rgb(0, 0, 0)),
+            }),
+            link: Some(Rgb(0x44, 0x55, 0x66)),
+            highlight: Some(Rgb(0x77, 0x88, 0x99)),
+        };
+        assert_eq!(
+            drawn(BRAND, &plugin),
+            Drawn {
+                fill: 0x112233,
+                on_fill: 0x000000,
+                mark: 0x778899,
+                text: 0x445566,
+            }
+        );
+        let only_link = brand::Accents {
+            link: Some(Rgb(0x44, 0x55, 0x66)),
+            ..none
+        };
+        assert_eq!(
+            drawn(BRAND, &only_link),
+            Drawn {
+                text: 0x445566,
+                ..own
+            }
+        );
+        for dark in [false, true] {
+            let sheet = for_kind(Some(Kind::Xlsx), dark);
+            assert_eq!(
+                drawn(sheet, &plugin),
+                Drawn {
+                    fill: sheet,
+                    on_fill: FILE_FG,
+                    mark: sheet,
+                    text: sheet,
+                }
+            );
+        }
+    }
 
     #[test]
     fn the_label_names_the_type() {

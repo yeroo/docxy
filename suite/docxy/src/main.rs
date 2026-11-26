@@ -19752,6 +19752,7 @@ impl Docxy {
         if self.applied != Some(desired) {
             Theme::change(desired, Some(window), cx);
             font_subst::apply_to_theme(cx);
+            brand::apply_accents_to_theme(cx);
             self.applied = Some(desired);
             let dark = desired.is_dark();
             for t in &self.tabs {
@@ -19836,7 +19837,7 @@ impl Docxy {
                 .px_2()
                 .rounded(px(3.))
                 .border_1()
-                .border_color(hsla_u(accent::brand()))
+                .border_color(hsla_u(accent::mark()))
                 .text_color(fg)
                 .child(text)
         };
@@ -19862,7 +19863,7 @@ impl Docxy {
             .child(
                 div()
                     .text_size(px(13.))
-                    .text_color(rgb(accent::brand()))
+                    .text_color(rgb(accent::text()))
                     .mt_4()
                     .child("Sheet editing"),
             )
@@ -42717,15 +42718,15 @@ impl Docxy {
                     .text_size(px(12.))
                     .when(!is_file, |d| d.hover(|d| d.bg(Hsla { a: 0.10, ..fg })))
                     .when(is_file, |d| {
-                        d.bg(rgb(accent::brand()))
-                            .text_color(rgb(FILE_FG))
+                        d.bg(rgb(accent::fill()))
+                            .text_color(rgb(accent::on_fill()))
                             .font_weight(FontWeight::BOLD)
                             .rounded_t_sm()
                     })
                     .when(active, |d| {
-                        d.text_color(rgb(accent::brand()))
+                        d.text_color(rgb(accent::text()))
                             .border_b_2()
-                            .border_color(rgb(accent::brand()))
+                            .border_color(rgb(accent::mark()))
                     })
                     .when(!active && !is_file, |d| d.text_color(fg))
                     .child(name)
@@ -43358,7 +43359,7 @@ impl Docxy {
                     .when(e.checked, |d| {
                         d.bg(Hsla {
                             a: 0.20,
-                            ..hsla_u(accent::brand())
+                            ..hsla_u(accent::fill())
                         })
                     })
                     .child(face)
@@ -43744,7 +43745,7 @@ impl Docxy {
                 .when(self.act_active(act), |d| {
                     d.bg(Hsla {
                         a: 0.20,
-                        ..hsla_u(accent::brand())
+                        ..hsla_u(accent::fill())
                     })
                 })
                 .hover(|d| d.bg(pal.hover))
@@ -44641,7 +44642,7 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(accent::brand())
+                    ..hsla_u(accent::fill())
                 })
             })
             .hover(|d| d.bg(pal.hover))
@@ -44707,7 +44708,7 @@ impl Docxy {
             .when(pressed, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(accent::brand())
+                    ..hsla_u(accent::fill())
                 })
             })
             .flex()
@@ -44854,7 +44855,7 @@ impl Docxy {
             .bg(pal.panel)
             .when(which.is_some(), |d| d.cursor_text())
             .when(which.is_none(), |d| d.cursor_pointer())
-            .hover(|d| d.border_color(hsla_u(accent::brand())))
+            .hover(|d| d.border_color(hsla_u(accent::mark())))
             .child(match edit {
                 // Focused: the text split at the caret, a whole-field
                 // selection tinted, as the Name Box draws.
@@ -44913,7 +44914,7 @@ impl Docxy {
             .border_color(pal.border)
             .bg(pal.panel)
             .cursor_pointer()
-            .hover(|d| d.border_color(hsla_u(accent::brand())))
+            .hover(|d| d.border_color(hsla_u(accent::mark())))
             .child(
                 div()
                     .text_size(px(11.))
@@ -44992,7 +44993,7 @@ impl Docxy {
                     .border_1()
                     .border_color(pal.border)
                     .bg(hsla_u(0xffffff))
-                    .hover(|d| d.border_color(hsla_u(accent::brand())))
+                    .hover(|d| d.border_color(hsla_u(accent::mark())))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -45073,7 +45074,7 @@ impl Docxy {
                     .border_color(if c == 0xFFFFFF { pal.fg } else { pal.border })
                     .bg(hsla_u(c))
                     .cursor_pointer()
-                    .hover(|d| d.border_color(hsla_u(accent::brand())))
+                    .hover(|d| d.border_color(hsla_u(accent::mark())))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.sheet_apply_color(pick, Some(rgb), cx)
                     })),
@@ -46159,7 +46160,7 @@ impl Docxy {
                 .border(px(g.border))
                 .overflow_hidden()
                 .border_color(if selected {
-                    hsla_u(accent::brand())
+                    hsla_u(accent::mark())
                 } else {
                     pal.border
                 })
@@ -46294,7 +46295,7 @@ impl Docxy {
         let dark = self.applied == Some(ThemeMode::Dark);
         let t = cx.theme();
         let fg = t.foreground.to_rgb();
-        let colors = sg::tile_colors(t.background.to_rgb(), fg, rgb(accent::brand()), dark);
+        let colors = sg::tile_colors(t.background.to_rgb(), fg, rgb(accent::fill()), dark);
         let tiles: Vec<AnyElement> = gal
             .items
             .iter()
@@ -46315,7 +46316,7 @@ impl Docxy {
                     .border(px(g.border))
                     .overflow_hidden()
                     .border_color(if selected {
-                        hsla_u(accent::brand())
+                        hsla_u(accent::mark())
                     } else {
                         gpui::transparent_black()
                     })
@@ -46458,7 +46459,7 @@ impl Docxy {
             .bg(pal.panel)
             .when(which.is_some(), |d| d.cursor_text())
             .when(which.is_none(), |d| d.cursor_pointer())
-            .hover(|d| d.border_color(hsla_u(accent::brand())))
+            .hover(|d| d.border_color(hsla_u(accent::mark())))
             .child(match edit {
                 // Focused: the text split at the caret, a whole-field
                 // selection tinted, as the sheet's box draws.
@@ -46533,7 +46534,7 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(accent::brand())
+                    ..hsla_u(accent::fill())
                 })
             })
             .hover(|d| d.bg(pal.hover))
@@ -46800,10 +46801,10 @@ impl Docxy {
             .when(on, |d| {
                 d.bg(Hsla {
                     a: 0.20,
-                    ..hsla_u(accent::brand())
+                    ..hsla_u(accent::fill())
                 })
                 .border_1()
-                .border_color(hsla_u(accent::brand()))
+                .border_color(hsla_u(accent::mark()))
             })
             .when(!on, |d| {
                 d.border_1().border_color(gpui::transparent_black())
@@ -46897,7 +46898,7 @@ impl Docxy {
                             .border_color(dim)
                             .text_color(fg)
                             .cursor_pointer()
-                            .hover(|d| d.border_color(rgb(accent::brand())))
+                            .hover(|d| d.border_color(rgb(accent::mark())))
                             .child(brand::about_label())
                             .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
                     ),
@@ -47042,7 +47043,7 @@ impl Docxy {
                                 .border_color(dim)
                                 .text_color(fg)
                                 .cursor_pointer()
-                                .hover(|d| d.border_color(rgb(accent::brand())))
+                                .hover(|d| d.border_color(rgb(accent::mark())))
                                 .child("Remove All")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     // A typed Info property applies first, so the
@@ -47143,7 +47144,7 @@ impl Docxy {
                             .border_color(dim)
                             .text_color(fg)
                             .cursor_pointer()
-                            .hover(|d| d.border_color(rgb(accent::brand())))
+                            .hover(|d| d.border_color(rgb(accent::mark())))
                             .child("Convert")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let _ = this.convert_active();
@@ -47213,12 +47214,12 @@ impl Docxy {
                     .cursor_pointer()
                     .rounded_sm()
                     .text_color(if matches!(action, BackstageRailAction::Back) {
-                        hsla_u(accent::brand())
+                        hsla_u(accent::text())
                     } else {
                         fg
                     })
                     .when(!matches!(action, BackstageRailAction::Back), |d| {
-                        d.hover(|d| d.bg(rgb(accent::brand())).text_color(rgb(FILE_FG)))
+                        d.hover(|d| d.bg(rgb(accent::fill())).text_color(rgb(accent::on_fill())))
                     })
                     .child(item.display)
                     // The harness's `bs-rail:<name>` (#2195).
@@ -47259,7 +47260,7 @@ impl Docxy {
                     .border_1()
                     .border_color(dim)
                     .cursor_pointer()
-                    .hover(|d| d.border_color(rgb(accent::brand())))
+                    .hover(|d| d.border_color(rgb(accent::mark())))
                     .child(div().text_size(px(40.)).child(glyph))
                     .child(
                         div()
@@ -47394,9 +47395,9 @@ impl Docxy {
                     .size(px(16.))
                     .rounded(px(3.))
                     .border_1()
-                    .border_color(if on { hsla_u(accent::brand()) } else { dim })
+                    .border_color(if on { hsla_u(accent::fill()) } else { dim })
                     .bg(if on {
-                        hsla_u(accent::brand())
+                        hsla_u(accent::fill())
                     } else {
                         Hsla { a: 0., ..fg }
                     })
@@ -47407,7 +47408,7 @@ impl Docxy {
                         d.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(FILE_FG))
+                                .text_color(rgb(accent::on_fill()))
                                 .child("\u{2713}"),
                         )
                     })
@@ -47443,7 +47444,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(accent::brand()))
+                        .text_color(rgb(accent::text()))
                         .mt_4()
                         .child("Open"),
                 )
@@ -47481,7 +47482,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(accent::brand()))
+                        .text_color(rgb(accent::text()))
                         .mt_4()
                         .child("Recent"),
                 )
@@ -47504,7 +47505,7 @@ impl Docxy {
                     d.child(
                         div()
                             .text_size(px(13.))
-                            .text_color(rgb(accent::brand()))
+                            .text_color(rgb(accent::text()))
                             .mt_4()
                             .child("Recover Unsaved Workbooks"),
                     )
@@ -47524,7 +47525,7 @@ impl Docxy {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(rgb(accent::brand()))
+                        .text_color(rgb(accent::text()))
                         .mt_4()
                         .child("Settings"),
                 )
@@ -47594,7 +47595,7 @@ impl Docxy {
                                 .px_2()
                                 .rounded(px(3.))
                                 .border_1()
-                                .border_color(hsla_u(accent::brand()))
+                                .border_color(hsla_u(accent::mark()))
                                 .text_color(fg)
                                 .child(recover::choice_label(self.autorecover_minutes)),
                         )
@@ -47697,7 +47698,7 @@ impl Docxy {
                                 .px_2()
                                 .rounded(px(3.))
                                 .border_1()
-                                .border_color(hsla_u(accent::brand()))
+                                .border_color(hsla_u(accent::mark()))
                                 .text_color(fg)
                                 .child("Clear"),
                         )
@@ -47777,7 +47778,7 @@ impl Docxy {
             .rounded_sm()
             .group("bs-ext")
             .text_color(fg)
-            .hover(|d| d.bg(rgb(accent::brand())).text_color(rgb(FILE_FG)))
+            .hover(|d| d.bg(rgb(accent::fill())).text_color(rgb(accent::on_fill())))
             .child(probe(&self.probes, backstage_ext_probe(&e.id)))
             .child(
                 h_flex()
@@ -47787,7 +47788,7 @@ impl Docxy {
                     .when_some(e.icon, |d, icon| {
                         d.child(
                             icon_svg(icon, 16., fg)
-                                .group_hover("bs-ext", |s| s.text_color(rgb(FILE_FG))),
+                                .group_hover("bs-ext", |s| s.text_color(rgb(accent::on_fill()))),
                         )
                     })
                     .child(e.label),
@@ -48033,7 +48034,8 @@ impl Render for Docxy {
         // The ribbon, backstage and title bar draw the selected tab's accent
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now(cx);
-        accent::set(self.drawn_accent);
+        let dark = self.theme_pref.resolve(self.os_appearance) == ThemeMode::Dark;
+        accent::set(accent::drawn(self.drawn_accent, &brand::accents(dark)));
         self.drawn_galleries.borrow_mut().clear();
         // Pictures a package change replaced leave gpui's asset cache (#1639).
         self.release_pictures(None, window, cx);
@@ -48397,7 +48399,7 @@ impl Render for Docxy {
                         .child(
                             div()
                                 .font_weight(FontWeight::BOLD)
-                                .text_color(rgb(accent::brand()))
+                                .text_color(rgb(accent::text()))
                                 .flex_none()
                                 .max_w(px(label_cap))
                                 .overflow_hidden()
@@ -54891,6 +54893,7 @@ pub fn run(extensions: ext::Extensions) {
         // embed (#1900).
         font_subst::init(cx);
         font_subst::apply_to_theme(cx);
+        brand::apply_accents_to_theme(cx);
         doc_view::set_harness(want_harness);
         if let Some(mut extensions) = extensions.take() {
             // A harness case that asks for the test extension (#1873) gets it

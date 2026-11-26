@@ -194,5 +194,12 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   failed, the first window's status line (`brand::startup_notice`). About adds the integration's
   rows (`brand::about_rows`) only when a plugin is configured. `app-info` carries `integration`.
 - Each window gets the plugin's icon in `open_docxy_window` (`brand::set_window_icon`, Windows).
+- Accents: the brand's colour (doc, mail, no tab) has four roles in `accent.rs`: `fill` (the File
+  button, washes, a checked box, the focus ring), `on_fill` (its text), `mark` (the active tab's
+  underline, a selected tile's and a hover border) and `text` (accent text). `accent::drawn` gives
+  them the plugin's `primary`, its text, `highlight` and `link` that `brand::accents` takes for the
+  theme (`docxy_integration::accent::check`); sheet's and project's own accents stay.
+  `brand::apply_accents_to_theme`, after every `Theme::change`, sets gpui-component's `primary`,
+  `ring`, `selection` and `link` tokens. A refusal goes to stderr once per theme.
 - Left as they are: the title-bar label per tab type, `--version`, the crash log's name, and the
   default author.

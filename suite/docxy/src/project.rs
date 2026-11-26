@@ -1448,7 +1448,7 @@ fn heading_cells(
                         .cursor_pointer()
                         .text_size(px(9.))
                         .text_color(if filtered {
-                            hsla_u(crate::accent::brand())
+                            hsla_u(crate::accent::text())
                         } else {
                             pal.dim
                         })

@@ -2,8 +2,9 @@
 //! plugin's (`docs/integration-plugins.md`), when it gives them, else the
 //! suite's own.
 
+use docxy_integration::accent::{self as rule, Role};
 use docxy_integration::host::Status;
-use docxy_integration::protocol::{App, Branding, Context};
+use docxy_integration::protocol::{AccentSet, App, Branding, Context, Rgb};
 use std::sync::OnceLock;
 
 /// The suite's own name in About.
@@ -167,6 +168,88 @@ pub(crate) fn set_window_icon(window: &gpui::Window) {
     let _ = window;
 }
 
+/// The plugin's accent colours the suite draws on one theme: each that
+/// passes [`rule::check`] for its role, `None` where the suite keeps its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Accents {
+    pub(crate) primary: Option<rule::Accepted>,
+    pub(crate) link: Option<Rgb>,
+    pub(crate) highlight: Option<Rgb>,
+}
+
+/// [`Accents`] of `set` on a theme whose background is `background`, and
+/// why each colour it gives and the suite does not take was refused.
+pub(crate) fn accents_of(set: Option<AccentSet>, background: Rgb) -> (Accents, Vec<String>) {
+    let set = set.unwrap_or_default();
+    let mut refused = Vec::new();
+    let mut take = |role, color: Option<Rgb>| {
+        rule::check(role, color?, background)
+            .map_err(|why| refused.push(why))
+            .ok()
+    };
+    let accents = Accents {
+        primary: take(Role::Primary, set.primary),
+        link: take(Role::Link, set.link).map(|a| a.color),
+        highlight: take(Role::Highlight, set.highlight).map(|a| a.color),
+    };
+    (accents, refused)
+}
+
+/// [`accents_of`] the plugin's set for the dark theme when `dark`, else the
+/// light one, on that theme's background, worked out once per theme. Each
+/// refusal goes to stderr then.
+pub(crate) fn accents(dark: bool) -> Accents {
+    static THEMES: [OnceLock<Accents>; 2] = [OnceLock::new(), OnceLock::new()];
+    *THEMES[usize::from(dark)].get_or_init(|| {
+        let set = branding()
+            .and_then(|b| b.accents)
+            .and_then(|a| a.for_theme(dark));
+        let background = if dark {
+            gpui_component::theme::ThemeColor::dark().background
+        } else {
+            gpui_component::theme::ThemeColor::light().background
+        };
+        let (accents, refused) = accents_of(set, Rgb::from_u32(crate::rgb_u(background)));
+        let theme = if dark { "dark" } else { "light" };
+        for why in refused {
+            eprintln!(
+                "docxy: the integration plugin's {theme} theme: {why}; the suite keeps its own"
+            );
+        }
+        accents
+    })
+}
+
+/// The plugin's [`accents`] on the global theme's tokens, run after every
+/// `Theme::change`: the primary on `primary`, its hover and active shades and
+/// `ring`, its text on `primary_foreground`, and on `selection` at the
+/// theme's own opacity; the link on `link` and its hover and active shades.
+pub(crate) fn apply_accents_to_theme(cx: &mut gpui::App) {
+    let dark = gpui_component::Theme::global(cx).mode.is_dark();
+    let accents = accents(dark);
+    let theme = gpui_component::Theme::global_mut(cx);
+    if let Some(primary) = accents.primary {
+        let c = crate::hsla_u(primary.color.to_u32());
+        theme.primary = c;
+        theme.primary_hover = c;
+        theme.primary_active = c;
+        theme.ring = c;
+        theme.selection = gpui::Hsla {
+            a: theme.selection.a,
+            ..c
+        };
+        if let Some(text) = primary.text {
+            theme.primary_foreground = crate::hsla_u(text.to_u32());
+        }
+    }
+    if let Some(link) = accents.link {
+        let c = crate::hsla_u(link.to_u32());
+        theme.link = c;
+        theme.link_hover = c;
+        theme.link_active = c;
+    }
+}
+
 /// The plugin's refusal or stop said at start, kept for the first window's
 /// status line.
 static STARTUP_NOTICE: OnceLock<Option<String>> = OnceLock::new();
@@ -229,6 +312,46 @@ mod tests {
         let short_only = branding(None, Some("Product"));
         assert_eq!(product_of(Some(&short_only)), "docxy suite");
         assert_eq!(short_of(Some(&short_only)), "Product");
+    }
+
+    #[test]
+    fn the_plugins_accents_are_each_held_to_their_role_on_the_themes_background() {
+        let grey = |v| Rgb(v, v, v);
+        let (white, black) = (Rgb(0xFF, 0xFF, 0xFF), Rgb(0, 0, 0));
+        assert_eq!(accents_of(None, white), (Accents::default(), vec![]));
+        let set = AccentSet {
+            primary: Some(Rgb(0x10, 0x20, 0x80)),
+            link: Some(grey(0x77)),
+            highlight: Some(grey(0x76)),
+        };
+        let (on_white, refused) = accents_of(Some(set), white);
+        assert_eq!(
+            on_white,
+            Accents {
+                primary: Some(rule::Accepted {
+                    color: Rgb(0x10, 0x20, 0x80),
+                    text: Some(white),
+                }),
+                link: None,
+                highlight: Some(grey(0x76)),
+            }
+        );
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("link accent #777777"), "{refused:?}");
+        let (on_black, refused) = accents_of(Some(set), black);
+        assert_eq!(
+            (on_black.link, on_black.highlight),
+            (Some(grey(0x77)), Some(grey(0x76)))
+        );
+        assert!(refused.is_empty(), "{refused:?}");
+        let (only_highlight, _) = accents_of(
+            Some(AccentSet {
+                highlight: Some(grey(0x40)),
+                ..AccentSet::default()
+            }),
+            black,
+        );
+        assert_eq!(only_highlight, Accents::default());
     }
 
     #[test]
