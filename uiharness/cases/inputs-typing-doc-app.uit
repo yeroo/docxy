@@ -1467,6 +1467,8 @@ test doc pdf-print/copies: OK applies
   call real-type {"text":"2"}
   call real-key {"key":"enter"}
   assert dialog is not pdf-print
+  call pdf-read {"until_idle":true}
+  assert reply.printed.copies is 2
 
 test doc pdf-print/copies: Escape cancels
   open copy:../fixtures/pdf-view-text.pdf
@@ -1537,9 +1539,9 @@ test doc pdf-print/range: types
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"range"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"2"}
   call field-read {"dialog-field":"range"}
-  assert reply.value is 1
+  assert reply.value is 2
   assert reply.caret is 1
   call real-key {"key":"escape"}
 
@@ -1628,9 +1630,12 @@ test doc pdf-print/range: OK applies
   call dialog-catalog-check {}
   call pointer-click {"dialog-field":"range"}
   call real-key {"key":"ctrl+a"}
-  call real-type {"text":"1"}
+  call real-type {"text":"2"}
   call real-key {"key":"enter"}
   assert dialog is not pdf-print
+  call pdf-read {"until_idle":true}
+  assert reply.printed.pages.0 is 2
+  assert reply.printed.sheets is 1
 
 test doc pdf-print/range: Escape cancels
   open copy:../fixtures/pdf-view-text.pdf
@@ -1781,6 +1786,9 @@ test doc pdf-print/percent: OK applies
   call real-type {"text":"50"}
   call real-key {"key":"enter"}
   assert dialog is not pdf-print
+  call pdf-read {"until_idle":true}
+  assert reply.printed.sizing is custom
+  assert reply.printed.percent is 50
 
 test doc pdf-print/percent: Escape cancels
   open copy:../fixtures/pdf-view-text.pdf
@@ -2043,6 +2051,8 @@ test doc pdf-export-png/range: OK applies
   call real-type {"text":"1"}
   call real-key {"key":"enter"}
   assert dialog is not pdf-export-png
+  call pdf-read {}
+  assert reply.export_waiting is png
 
 test doc pdf-export-png/range: Escape cancels
   open copy:../fixtures/pdf-view-text.pdf
@@ -2257,6 +2267,8 @@ test doc pdf-export-pdf/range: OK applies
   call real-type {"text":"1"}
   call real-key {"key":"enter"}
   assert dialog is not pdf-export-pdf
+  call pdf-read {}
+  assert reply.export_waiting is pdf
 
 test doc pdf-export-pdf/range: Escape cancels
   open copy:../fixtures/pdf-view-text.pdf

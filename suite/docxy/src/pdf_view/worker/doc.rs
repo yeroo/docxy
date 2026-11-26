@@ -759,6 +759,26 @@ fn spool_to_dir(
         "lp_args": pdfcraft_print::spool::lp_args(spec),
         "pages": job.pages.iter().map(|p| p + 1).collect::<Vec<_>>(),
         "sheets": sheets,
+        "sizing": match job.sizing {
+            Sizing::Fit => "fit",
+            Sizing::Actual => "actual",
+            Sizing::Shrink => "shrink",
+            Sizing::Custom { .. } => "custom",
+        },
+        "percent": match job.sizing {
+            Sizing::Custom { percent } => Some(percent),
+            _ => None,
+        },
+        "orientation": match job.orientation {
+            Orient::Auto => "auto",
+            Orient::Portrait => "portrait",
+            Orient::Landscape => "landscape",
+        },
+        "content": match job.content {
+            PrintContent::DocumentAndMarkups => "document-and-markups",
+            PrintContent::Document => "document",
+            PrintContent::FormFieldsOnly => "form-fields-only",
+        },
         "paper": job.paper_name,
         "paper_size": [job.paper.0, job.paper.1],
         "pdf": pdf_path.file_name().map(|n| n.to_string_lossy().into_owned()),
