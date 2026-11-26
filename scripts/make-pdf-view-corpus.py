@@ -1184,6 +1184,150 @@ SLICE3 = {
 }
 
 
+# ---- slice 4 (#2257): a document for Convert to editable document ----
+#
+# Three Letter pages in the base-14 fonts (not embedded), each with the same
+# running header and a "Page N of 3" footer: page 1 a title, two paragraphs
+# (one red word) around a picture and a ruled 3 x 3 table; page 2 a heading
+# across the page over two columns; page 3 a paragraph and Courier lines.
+# Checked by what it converts to (pdf_view/convert/tests.rs), not by pixels.
+
+CONVERT_FONTS = {"F1": "Times-Roman", "F2": "Helvetica", "F3": "Helvetica-Bold", "F4": "Courier"}
+
+CONVERT_LEFT = [
+    "The north meadow held the most birds this",
+    "year, most of them early in the morning",
+    "when the grass was still wet with dew and",
+    "the light came low across the field from",
+    "the east. Swallows came first, then larks,",
+    "and by noon the hedges were full of finches.",
+    "We counted from the gate every hour and",
+    "wrote down each kind we saw or heard. The",
+    "counts rose through May and fell slowly",
+    "after the hay was cut in the second week",
+    "of June, when the meadow lay open and the",
+    "birds moved on to the hedges and the wood.",
+]
+
+CONVERT_RIGHT = [
+    "The south marsh was quieter but held the",
+    "rarer kinds: two bitterns, a water rail",
+    "and, for one week only, a pair of spoonbills",
+    "that fed in the shallows by the old sluice.",
+    "Water stood high until the end of April,",
+    "then dropped a hand's width each week. The",
+    "reed beds grew thick along the eastern bank",
+    "and the warblers sang there from dawn. We",
+    "kept to the boardwalk, counting from the",
+    "hide at each hour as on the meadow, and",
+    "noted the water level on the post by the",
+    "sluice gate before we left every evening.",
+]
+
+
+def convert_text(font, size, x, y, s, rgb=None):
+    colour = f"{rgb[0]:g} {rgb[1]:g} {rgb[2]:g} rg" if rgb else "0 g"
+    return f"BT {colour} /{font} {size:g} Tf 1 0 0 1 {x:g} {y:g} Tm {pdf_text(s)} Tj ET"
+
+
+def convert_running(n):
+    """The header and footer every page has, centred (Helvetica's widths are
+    estimated; every page uses the same, so they line up)."""
+    header, footer = "Annual Field Notes", f"Page {n} of 3"
+    return [
+        convert_text("F2", 10, 306 - len(header) * 2.6, 756, header),
+        convert_text("F2", 10, 306 - len(footer) * 2.6, 36, footer),
+    ]
+
+
+def make_convert(path):
+    import zlib
+
+    pdf = RawPdf()
+    catalog, pages = pdf.reserve(), pdf.reserve()
+    fonts = {
+        name: pdf.add(f"<< /Type /Font /Subtype /Type1 /BaseFont /{base} /Encoding /WinAnsiEncoding >>")
+        for name, base in CONVERT_FONTS.items()
+    }
+    font_res = " ".join(f"/{name} {ref} 0 R" for name, ref in fonts.items())
+    w, h = 60, 40
+    pixels = bytearray()
+    for yy in range(h):
+        for xx in range(w):
+            pixels += bytes([40 + xx * 3, 90 + yy * 3, 200 - xx * 2])
+    packed = zlib.compress(bytes(pixels), 9)
+    picture = pdf.stream(
+        packed,
+        f"/Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB"
+        " /BitsPerComponent 8 /Filter /FlateDecode",
+    )
+
+    def convert_page(ops, xobjects=""):
+        c = pdf.stream("\n".join(ops))
+        xo = f" /XObject << {xobjects} >>" if xobjects else ""
+        return pdf.add(
+            f"<< /Type /Page /Parent {pages} 0 R /MediaBox [0 0 {LETTER[0]:g} {LETTER[1]:g}]"
+            f" /Resources << /Font << {font_res} >>{xo} >> /Contents {c} 0 R >>"
+        )
+
+    # Page 1: title, paragraph, picture, paragraph, ruled table.
+    ops = convert_running(1)
+    ops.append(convert_text("F3", 20, 72, 690, "Field Notes for the Year"))
+    ops += [
+        convert_text("F1", 11, 72, 655, "The survey began in the first week of spring and ran"),
+        "BT 0 g /F1 11 Tf 1 0 0 1 72 641 Tm (until the autumn rains, when the ) Tj"
+        " 1 0 0 rg (heron) Tj 0 g ( returned to the lake.) Tj ET",
+        convert_text("F1", 11, 72, 627, "Each visit followed the same path along the water."),
+    ]
+    ops.append("q 180 0 0 120 72 480 cm /Im1 Do Q")
+    ops += [
+        convert_text("F1", 11, 72, 455, "The table below gives the counts for the three sites"),
+        convert_text("F1", 11, 72, 441, "we visited most often over the whole of the season."),
+    ]
+    # A 3 x 3 table: its grid stroked, a cell's text inset in it.
+    xs, ys = [72, 222, 372, 522], [410, 380, 350, 320]
+    grid = ["0 G 0.75 w"]
+    grid += [f"{x} {ys[0]} m {x} {ys[-1]} l S" for x in xs]
+    grid += [f"{xs[0]} {y} m {xs[-1]} {y} l S" for y in ys]
+    ops += grid
+    cells = [["Site", "Visits", "Kinds"], ["Meadow", "42", "31"], ["Marsh", "38", "27"]]
+    for r, row in enumerate(cells):
+        for c, text in enumerate(row):
+            ops.append(convert_text("F2", 10, xs[c] + 8, ys[r] - 19, text))
+    p1 = convert_page(ops, f"/Im1 {picture} 0 R")
+
+    # Page 2: a heading across the page, then two columns.
+    ops = convert_running(2)
+    ops.append(convert_text("F3", 16, 72, 690, "Observations by Site across the Whole Valley"))
+    for i, (a, b) in enumerate(zip(CONVERT_LEFT, CONVERT_RIGHT)):
+        y = 655 - i * 13
+        ops.append(convert_text("F1", 10, 72, y, a))
+        ops.append(convert_text("F1", 10, 324, y, b))
+    p2 = convert_page(ops)
+
+    # Page 3: a paragraph and three Courier lines.
+    ops = convert_running(3)
+    ops += [
+        convert_text("F1", 11, 72, 690, "The counts were kept in a plain text file, one line for"),
+        convert_text("F1", 11, 72, 676, "each hour, as the three lines below show for one day."),
+        convert_text("F4", 10, 72, 640, "06:00 meadow larks=4 swallows=9"),
+        convert_text("F4", 10, 72, 626, "07:00 meadow larks=6 swallows=12"),
+        convert_text("F4", 10, 72, 612, "08:00 marsh bitterns=1 rails=1"),
+    ]
+    p3 = convert_page(ops)
+
+    pdf.set(pages, f"<< /Type /Pages /Kids [{p1} 0 R {p2} 0 R {p3} 0 R] /Count 3 >>")
+    pdf.set(catalog, f"<< /Type /Catalog /Pages {pages} 0 R >>")
+    info = pdf.add("<< /Title (Annual Field Notes) /Producer (make-pdf-view-corpus.py) >>")
+    pdf.write(path, catalog, info, file_id="2257" * 8)
+    text = text_by_poppler(path) or ""
+    for want in ("Annual Field Notes", "Page 3 of 3", "heron", "Meadow", "spoonbills", "rails=1"):
+        assert want in text, want
+
+
+SLICE4 = {"convert": make_convert}
+
+
 def gs(ps, path):
     src = path + ".ps"
     with open(src, "w") as f:
@@ -1231,7 +1375,7 @@ def main():
         if not shutil.which(tool):
             sys.exit(f"{tool} is needed")
     only = set(sys.argv[1:])
-    unknown = only - {"text", "columns", "scanned", "slides", "vector", "rotated", "source", *SLICE2, *SLICE3}
+    unknown = only - {"text", "columns", "scanned", "slides", "vector", "rotated", "source", *SLICE2, *SLICE3, *SLICE4}
     if unknown:
         sys.exit(f"no such corpus file: {', '.join(sorted(unknown))}")
     want = lambda name: not only or name in only
@@ -1255,7 +1399,7 @@ def main():
     # A damaged file's maker hands back the file as it was before the
     # damage: its reference is drawn from that.
     intacts = {}
-    for name, make in {**SLICE2, **SLICE3}.items():
+    for name, make in {**SLICE2, **SLICE3, **SLICE4}.items():
         if want(name):
             intact = make(os.path.join(OUT, f"{name}.pdf"))
             if name in SLICE3 and intact:
