@@ -3218,6 +3218,15 @@ struct Html<'a> {
     /// with no `Elem` (opened past `MAX_DEPTH`) was open in them (#1927
     /// r2): each ends when that table's own close brings the depth back.
     orphan_cards: Vec<usize>,
+    /// A card's flow is ending ([`Self::end_cards`], #2151): its last
+    /// paragraph's quirky bottom is not applied but kept here, as
+    /// whether it applies depends on what follows the card.
+    card_ending: Option<Option<i32>>,
+    /// Padding-less cards that ended their enclosing flow's blocks so far
+    /// (#2151): that flow's `table_depth`, its length with the card's
+    /// table last, and the `after` its last paragraph takes if the card is
+    /// still that flow's last block when the flow ends.
+    card_bottoms: Vec<(usize, usize, i32)>,
     /// The page is in quirks mode ([`quirks_mode`], #1979): a block's
     /// user-agent margins at its body's or cell's edge are dropped.
     quirks: bool,
@@ -3282,6 +3291,8 @@ impl<'a> Html<'a> {
             images: None,
             after_block_object: false,
             orphan_cards: Vec::new(),
+            card_ending: None,
+            card_bottoms: Vec::new(),
             quirks: quirks_mode(s),
             break_pending: false,
             root_kids: Kids::default(),
@@ -4551,10 +4562,15 @@ impl<'a> Html<'a> {
                 self.table_closed();
             }
             if self.table_depth == depth {
+                self.card_ending = Some(None);
                 let props = self.flow_end_props();
+                let kept = self.card_ending.take().flatten();
                 self.out.end_card(props);
                 self.reset_para();
                 self.table_closed();
+                if let Some(after) = kept {
+                    self.keep_card_bottom(j, after);
+                }
             }
         }
     }
@@ -4566,7 +4582,10 @@ impl<'a> Html<'a> {
         self.table_depth = self.table_depth.saturating_sub(1);
         while self.orphan_cards.last() == Some(&self.table_depth) && self.table_depth > 0 {
             self.orphan_cards.pop();
+            // Its quirky bottom is not passed on (#2151).
+            self.card_ending = Some(None);
             let props = self.flow_end_props();
+            self.card_ending = None;
             self.out.end_card(props);
             self.reset_para();
             self.table_depth -= 1;
@@ -5075,7 +5094,9 @@ impl<'a> Html<'a> {
         }
         for e in self.elems[..i].iter().rev() {
             if matches!(e.card, CardMode::Yes(_)) {
-                return false;
+                // A padding-less card may pass the quirk on (#2151): known
+                // only once its enclosing flow ends ([`Self::card_bottoms`]).
+                return Self::card_open_below(e);
             }
             if e.kind.table() {
                 return matches!(e.key.tag.as_str(), "td" | "th");
@@ -5087,6 +5108,55 @@ impl<'a> Html<'a> {
             }
         }
         !in_table
+    }
+
+    /// Whether the innermost of the open tables and cards is a card (#2151).
+    fn in_card_flow(&self) -> bool {
+        self.elems
+            .iter()
+            .rev()
+            .find(|e| e.kind.table() || matches!(e.card, CardMode::Yes(_)))
+            .is_some_and(|e| matches!(e.card, CardMode::Yes(_)))
+    }
+
+    /// Whether card `e` has no bottom padding or line (#2151).
+    fn card_open_below(e: &Elem) -> bool {
+        e.look.own_padding[2].is_none_or(|p| p == 0) && !e.look.border_after
+    }
+
+    /// The card `elems[i]`, whose own flow has just ended with a quirky
+    /// bottom `after` kept for its last paragraph (#2151), is pushed onto
+    /// its enclosing flow: when no block between it and that flow's
+    /// `td`/`th` (or the body) has bottom padding or a line, that bottom
+    /// waits for the enclosing flow's end ([`Self::card_bottoms`]).
+    fn keep_card_bottom(&mut self, i: usize, after: i32) {
+        let Some((depth, _)) = self.elems[i].flow_at else {
+            return;
+        };
+        // The walk reaches the body, else stops at a cell (or another
+        // table part, or a card: not passed on).
+        let mut open = depth == 0;
+        for o in self.elems[..i].iter().rev() {
+            if matches!(o.card, CardMode::Yes(_)) {
+                return;
+            }
+            if o.kind.table() {
+                open = matches!(o.key.tag.as_str(), "td" | "th");
+                break;
+            }
+            if matches!(o.kind, Kind::Block | Kind::List)
+                && (o.look.pad_after != 0 || o.look.border_after)
+            {
+                return;
+            }
+        }
+        let in_table = depth > 0;
+        if open && self.table_depth == depth {
+            if let Some(len) = self.out.card_end(in_table) {
+                self.card_bottoms.retain(|&(d, _, _)| d != depth);
+                self.card_bottoms.push((depth, len, after));
+            }
+        }
     }
 
     /// The top line of a paragraph ended now that shows anything (#1883
@@ -5159,6 +5229,49 @@ impl<'a> Html<'a> {
         })
     }
 
+    /// Whether the card `elems[i]` starts at the top of a quirky container
+    /// (#2151, measured in Chrome: `<td><div style=background:#eee><p>x`
+    /// draws x flush with the box and the cell): it has no top padding or
+    /// line, nothing has ended in its enclosing flow, and every block or
+    /// list between it and that flow's `td`/`th` (or the body) is fresh
+    /// there with no top padding or line either; a card among them passes
+    /// it on the same way.
+    fn card_at_quirky_top(&self, i: usize) -> bool {
+        let mut i = i;
+        loop {
+            let e = &self.elems[i];
+            let padded = e.look.own_padding[0].is_some_and(|p| p != 0) || e.look.border_before;
+            let Some((depth, 0)) = e.flow_at else {
+                return false;
+            };
+            if padded || self.out.flow_len_at(depth) != Some(0) {
+                return false;
+            }
+            let mut next = None;
+            for (j, o) in self.elems[..i].iter().enumerate().rev() {
+                if matches!(o.card, CardMode::Yes(_)) {
+                    next = Some(j);
+                    break;
+                }
+                if o.kind.table() {
+                    return matches!(o.key.tag.as_str(), "td" | "th");
+                }
+                if matches!(o.kind, Kind::Block | Kind::List)
+                    && (o.flow_at != Some((depth, 0))
+                        || o.look.pad_before != 0
+                        || o.look.border_before)
+                {
+                    return false;
+                }
+            }
+            match next {
+                Some(j) => i = j,
+                // The body's own flow.
+                None => return depth == 0,
+            }
+        }
+    }
+
     /// The top spacing of a paragraph ended now (#1979, #2114). Every block
     /// and list still fresh, from the innermost table, cell or card out
     /// (inline elements, containers and the rest are see-through), gives
@@ -5185,7 +5298,9 @@ impl<'a> Html<'a> {
             quirky_container = Some(!in_table);
             for (i, e) in self.elems.iter().enumerate().rev() {
                 if matches!(e.card, CardMode::Yes(_)) {
-                    quirky_container = Some(false);
+                    // A padding-less card at its cell's or the body's top
+                    // passes the quirk on (#2151).
+                    quirky_container = Some(self.quirks && self.card_at_quirky_top(i));
                     break;
                 }
                 if e.kind.table() {
@@ -5731,17 +5846,41 @@ impl<'a> Html<'a> {
         }
         if let Some(tail) = self.out.tail(in_table) {
             if let Some((after, open)) = tail.bare {
-                if let Some(p) = self.out.flow_last_mut(in_table) {
+                if let Some(kept) = self.card_ending.as_mut() {
+                    // A card's flow (#2151): whether its quirky bottom
+                    // applies depends on what follows the card.
+                    *kept = Some(after);
+                } else if !self.in_card_flow() {
+                    if let Some(p) = self.out.flow_last_mut(in_table) {
+                        p.spacing.after = Some(after.max(0));
+                    }
+                    self.out.set_tail(
+                        in_table,
+                        FlowTail {
+                            after,
+                            open,
+                            bare: None,
+                        },
+                    );
+                }
+            }
+        }
+        // A padding-less card this flow ends with gives its last paragraph
+        // the quirky bottom it kept (#2151).
+        let depth = self.table_depth;
+        if self.card_bottoms.iter().any(|&(d, _, _)| d == depth) {
+            let len = self.out.flow_len(in_table);
+            let mut kept = None;
+            self.card_bottoms.retain(|&(d, n, after)| {
+                if d == depth && Some(n) == len {
+                    kept = Some(after);
+                }
+                d != depth
+            });
+            if let Some(after) = kept {
+                if let Some(p) = self.out.card_last_para_mut(in_table) {
                     p.spacing.after = Some(after.max(0));
                 }
-                self.out.set_tail(
-                    in_table,
-                    FlowTail {
-                        after,
-                        open,
-                        bare: None,
-                    },
-                );
             }
         }
         let mut props = self.par_props();
@@ -11770,9 +11909,10 @@ mod batch_2114_tests {
         // A list around the `p` keeps its own 1em below.
         let d = doc("<table><tr><td><ul><li><p>x</p></li></ul></td></tr></table>");
         assert_eq!(gaps(&d, "x").1, Some(240));
-        // A card is no quirky container.
+        // A padding-less card at the cell's edges passes the quirk on
+        // (#2151): Chrome draws x flush with the box and the cell.
         let d = doc("<table><tr><td><div style='background:#eee'><p>x</p></div></td></tr></table>");
-        assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
+        assert_eq!(gaps(&d, "x"), (Some(0), Some(0)));
         // Between paragraphs they stay.
         let d = doc("<div>a</div><ul><li>x</li></ul><div>b</div>");
         assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));

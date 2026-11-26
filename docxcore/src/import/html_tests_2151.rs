@@ -323,3 +323,63 @@ fn a_bottom_line_keeps_the_margins_apart() {
     let d = standards("<div style='margin-bottom:30px'><p>x</p></div><div>b</div>");
     assert_eq!(gaps(&d, "x").1, Some(450));
 }
+
+// Item 5: a padding-less card at a quirky cell edge.
+
+/// `html` in a table's one cell, quirks mode (no doctype).
+fn in_cell(html: &str) -> Document {
+    doc(&format!("<table><tr><td>{html}</td></tr></table>"))
+}
+
+const CARD: &str = "<div style='background:#eee'>";
+
+/// Measured in Chrome (quirks): a padding-less card at its cell's edges is
+/// a quirky edge too, so its `p` is flush with the box and the cell.
+#[test]
+fn a_padding_less_card_at_a_cell_s_edges_passes_the_quirk_on() {
+    let d = in_cell(&format!("{CARD}<p>x</p></div>"));
+    assert_eq!(gaps(&d, "x"), (Some(0), Some(0)));
+    // Through a plain `div` around it, and around its `p` too.
+    let d = in_cell(&format!("<div>{CARD}<div><p>x</p></div></div></div>"));
+    assert_eq!(gaps(&d, "x"), (Some(0), Some(0)));
+    // A body card at the page's edges, as the body is a quirky container.
+    let d = doc("<div style='width:300px;background:#eee'><p>x</p></div>");
+    assert_eq!(gaps(&d, "x"), (Some(0), Some(0)));
+    // Two paragraphs: only the edges are quirky.
+    let d = in_cell(&format!("{CARD}<p>x</p><p>y</p></div>"));
+    assert_eq!(
+        (gaps(&d, "x"), gaps(&d, "y")),
+        ((Some(0), Some(240)), (Some(0), Some(0)))
+    );
+}
+
+/// A card with padding keeps its paragraph's margins inside it (4px +
+/// 16px, as now); one that does not start or end its cell keeps the
+/// margin at that side; standards mode has no quirk.
+#[test]
+fn a_card_away_from_a_quirky_edge_keeps_its_margins() {
+    let d = in_cell("<div style='background:#eee;padding:4px'><p>x</p></div>");
+    assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
+    // After a line in the cell: its top stays; it still ends the cell.
+    let d = in_cell(&format!("a{CARD}<p>x</p></div>"));
+    assert_eq!(gaps(&d, "x"), (Some(240), Some(0)));
+    // A line after it: its bottom stays.
+    let d = in_cell(&format!("{CARD}<p>x</p></div>b"));
+    assert_eq!(gaps(&d, "x"), (Some(0), Some(240)));
+    // A padded block around it, top or bottom.
+    let d = in_cell(&format!(
+        "<div style='padding-top:1px'>{CARD}<p>x</p></div></div>"
+    ));
+    assert_eq!(gaps(&d, "x").0, Some(240));
+    let d = in_cell(&format!(
+        "<div style='padding-bottom:1px'>{CARD}<p>x</p></div></div>"
+    ));
+    assert_eq!(gaps(&d, "x").1, Some(240));
+    // The card's own padding on one side only.
+    let d = in_cell("<div style='background:#eee;padding-bottom:4px'><p>x</p></div>");
+    assert_eq!(gaps(&d, "x"), (Some(0), Some(240)));
+    let d = standards(&format!(
+        "<table><tr><td>{CARD}<p>x</p></div></td></tr></table>"
+    ));
+    assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
+}

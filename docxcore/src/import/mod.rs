@@ -1206,6 +1206,15 @@ impl<'b> Builder<'b> {
         }
     }
 
+    /// How many blocks the flow `depth` tables down holds (#2151): the body's
+    /// at 0, else that open table's cell's.
+    pub(crate) fn flow_len_at(&self, depth: usize) -> Option<usize> {
+        match depth {
+            0 => Some(self.body.len()),
+            d => self.tables.get(d - 1).map(|t| t.blocks.len()),
+        }
+    }
+
     /// The box waiting for the flow's next paragraph (#2151), while nothing
     /// has been added to the flow since it was said.
     pub(crate) fn pending(&self, in_table: bool) -> Option<FlowTail> {
@@ -1234,6 +1243,40 @@ impl<'b> Builder<'b> {
                 matches!(blocks.last(), Some(b) if matches!(b, Block::Table(_)) || html_table::is_placeholder(b))
                     && card_at != Some(blocks.len())
             })
+    }
+
+    /// The flow's length when its last block is a card's table (#2151).
+    pub(crate) fn card_end(&self, in_table: bool) -> Option<usize> {
+        let (blocks, _, card_at) = self.flow_parts(in_table)?;
+        card_at.filter(|&n| n == blocks.len())
+    }
+
+    /// The last paragraph's properties of the card whose table is the
+    /// flow's last block (#2151): laid out in the body, or waiting as a
+    /// nested table in a cell. `None` when its last cell ends otherwise.
+    pub(crate) fn card_last_para_mut(&mut self, in_table: bool) -> Option<&mut ParProps> {
+        fn last(blocks: &mut [Block]) -> Option<&mut ParProps> {
+            match blocks.last_mut() {
+                Some(Block::Paragraph(p)) => Some(&mut p.props),
+                _ => None,
+            }
+        }
+        self.card_end(in_table)?;
+        match self.tables.last_mut() {
+            Some(t) if in_table => {
+                let at = t.blocks.len().checked_sub(1)?;
+                let (i, raw) = t.html.as_mut()?.nested.last_mut()?;
+                if *i != at {
+                    return None;
+                }
+                last(&mut raw.rows.last_mut()?.last_mut()?.blocks)
+            }
+            None if !in_table => match self.body.last_mut()? {
+                Block::Table(t) => last(&mut t.rows.last_mut()?.cells.last_mut()?.blocks),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// The flow's last block's properties, if it is a paragraph.
