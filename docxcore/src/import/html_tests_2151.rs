@@ -4,7 +4,7 @@
 //! content box, and a padding-less card at a quirky cell edge.
 
 use super::*;
-use crate::model::{Block as DocBlock, Table};
+use crate::model::{Block as DocBlock, Paragraph, Table};
 
 fn doc(html: &str) -> Document {
     import_html(html.as_bytes()).unwrap()
@@ -13,6 +13,39 @@ fn doc(html: &str) -> Document {
 /// The same page in standards mode.
 fn standards(html: &str) -> Document {
     doc(&format!("<!DOCTYPE html>{html}"))
+}
+
+fn all_paras(d: &Document) -> Vec<Paragraph> {
+    fn walk(blocks: &[DocBlock], out: &mut Vec<Paragraph>) {
+        for b in blocks {
+            match b {
+                DocBlock::Paragraph(p) => out.push(p.clone()),
+                DocBlock::Table(t) => {
+                    for c in t.rows.iter().flat_map(|r| &r.cells) {
+                        walk(&c.blocks, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&d.body, &mut out);
+    out
+}
+
+fn para_of(d: &Document, text: &str) -> Paragraph {
+    let all = all_paras(d);
+    let texts: Vec<String> = all.iter().map(|p| p.plain_text()).collect();
+    all.into_iter()
+        .find(|p| p.plain_text() == text)
+        .unwrap_or_else(|| panic!("no paragraph is {text:?} in {texts:?}"))
+}
+
+/// Before and after spacing.
+fn gaps(d: &Document, text: &str) -> (Option<i32>, Option<i32>) {
+    let p = para_of(d, text);
+    (p.props.spacing.before, p.props.spacing.after)
 }
 
 /// The body's top-level tables.
@@ -135,4 +168,82 @@ fn an_indented_table_adds_its_first_cell_s_own_left_padding() {
     let t = tables(&d)[0];
     assert!(tblpr(t).contains("<w:tblInd w:w=\"660\""), "{}", tblpr(t));
     assert_eq!(crate::table::left_edge(t, None), 600);
+}
+
+// Item 2: a block's box next to its first or last child table.
+
+const CELL: &str = "<table><tr><td>t</td></tr></table>";
+
+/// A block whose last child is a table: its bottom margin waits for the
+/// next paragraph, collapsing with that one's own top (20px with p's 16px).
+#[test]
+fn a_block_ending_in_a_table_gives_its_bottom_to_the_next_paragraph() {
+    let d = standards(&format!(
+        "<div style='margin-bottom:20px'>a{CELL}</div><p>b</p>"
+    ));
+    assert_eq!(gaps(&d, "b"), (Some(300), Some(240)));
+    // Nested blocks ending in the table collapse into one margin first.
+    let d = standards(&format!(
+        "<div style='margin-bottom:20px'><div style='margin-bottom:30px'>{CELL}</div></div><p>b</p>"
+    ));
+    assert_eq!(gaps(&d, "b"), (Some(450), Some(240)));
+    // Its padding is paid below the table, then the margins collapse:
+    // 10px + max(20px, 16px).
+    let d = standards(&format!(
+        "<div style='padding-bottom:10px;margin-bottom:20px'>a{CELL}</div><p>b</p>"
+    ));
+    assert_eq!(gaps(&d, "b"), (Some(150 + 300), Some(240)));
+    // In a cell too.
+    let d = standards(&format!(
+        "<table><tr><td><div style='margin-bottom:20px'>a{CELL}</div><p>b</p></td></tr></table>"
+    ));
+    assert_eq!(gaps(&d, "b"), (Some(300), Some(240)));
+}
+
+/// A block whose first child is a table: its top margin goes on the
+/// paragraph above, collapsing with that one's bottom (16px with 30px).
+#[test]
+fn a_block_starting_with_a_table_gives_its_top_to_the_paragraph_above() {
+    let d = standards(&format!(
+        "<p>a</p><div style='margin-top:30px'>{CELL}</div>"
+    ));
+    assert_eq!(gaps(&d, "a"), (Some(240), Some(450)));
+    // Its padding is inside the margin: the margins collapse, then it is
+    // paid.
+    let d = standards(&format!(
+        "<p>a</p><div style='margin-top:30px;padding-top:10px'>{CELL}</div>"
+    ));
+    assert_eq!(gaps(&d, "a"), (Some(240), Some(450 + 150)));
+    // The block is stale past the table: the paragraph after it has no top
+    // from it.
+    let d = standards(&format!(
+        "<p>a</p><div style='margin-top:30px'>{CELL}c</div>"
+    ));
+    assert_eq!(gaps(&d, "c").0, Some(0));
+    // A paragraph in the block before the table takes the top as before.
+    let d = standards(&format!(
+        "<p>a</p><div style='margin-top:30px'>x{CELL}</div>"
+    ));
+    assert_eq!((gaps(&d, "a").1, gaps(&d, "x").0), (Some(240), Some(210)));
+}
+
+/// With no paragraph to carry it, the box is dropped as before, and a
+/// card (a shaded `div`) keeps its own limit: neither hook reaches it.
+#[test]
+fn a_box_with_nothing_to_carry_it_or_a_card_s_is_unchanged() {
+    let d = standards(&format!("<div style='margin-bottom:20px'>a{CELL}</div>"));
+    assert_eq!(gaps(&d, "a"), (Some(0), Some(0)));
+    let d = standards(&format!(
+        "<div style='margin-top:30px'>{CELL}</div><p>b</p>"
+    ));
+    assert_eq!(gaps(&d, "b"), (Some(240), Some(240)));
+    let card = "<div style='width:300px;background:#eee;margin-bottom:20px'>x</div>";
+    for page in [
+        format!("{card}<p>b</p>"),
+        format!("<div style='margin-bottom:20px'>{card}</div><p>b</p>"),
+    ] {
+        let d = standards(&page);
+        assert_eq!(tables(&d).len(), 1, "{page}");
+        assert_eq!(gaps(&d, "b"), (Some(240), Some(240)), "{page}");
+    }
 }

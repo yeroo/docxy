@@ -3828,6 +3828,11 @@ impl<'a> Html<'a> {
             "dl" => self.end_para_if_any(),
             "table" => {
                 self.end_para_if_any();
+                // Only a table the builder keeps (one past the nesting
+                // limit is its cell's text, which takes the top itself).
+                if self.table_depth < MAX_TABLE_NESTING {
+                    self.table_top_box();
+                }
                 self.table_depth += 1;
                 // A break after the block before it would land in the
                 // table's first cell, where Word ignores it (#1883).
@@ -5197,9 +5202,20 @@ impl<'a> Html<'a> {
         }
         let mut dropping =
             self.quirks && quirky_container == Some(true) && self.out.flow_is_empty(in_table);
-        let above = self.out.tail(in_table).map_or(0, |t| t.open.max(0));
+        // A box waiting with no paragraph above to carry it (#2151): a
+        // block that ended in a table, or an empty block. It is owed here,
+        // and its open group is what this one's margins collapse with.
+        let pending = self
+            .out
+            .pending(in_table)
+            .filter(|_| self.out.tail(in_table).is_none());
+        let above = match (self.out.tail(in_table), pending) {
+            (Some(t), _) => t.open.max(0),
+            (None, Some(p)) => p.open.max(0),
+            (None, None) => 0,
+        };
         let (mut group, mut paid) = (i64::from(above), i64::from(above));
-        let mut before = 0i64;
+        let mut before = pending.map_or(0, |p| i64::from(p.after));
         for &i in chain.iter().rev() {
             let look = &self.elems[i].look;
             let mut margin = i64::from(look.margin_before);
@@ -5223,6 +5239,35 @@ impl<'a> Html<'a> {
         }
         before += group - paid;
         clamp_twips(before).max(0)
+    }
+
+    /// A table opens (#2151): the blocks and lists still fresh around it,
+    /// whose first child it is, give their top boxes to the paragraph above
+    /// in its flow, as they would to a paragraph ended here
+    /// ([`Self::top_spacing`]), since none ends in them before the table.
+    /// With no paragraph above (the flow's start, or after another table)
+    /// they are dropped, as before. The table makes them stale.
+    fn table_top_box(&mut self) {
+        let in_table = self.table_depth > 0;
+        let Some(tail) = self.out.tail(in_table) else {
+            return;
+        };
+        let before = self.top_spacing(in_table);
+        if before == 0 {
+            return;
+        }
+        let after = clamp_twips(i64::from(tail.after) + i64::from(before));
+        if let Some(p) = self.out.flow_last_mut(in_table) {
+            p.spacing.after = Some(after.max(0));
+        }
+        self.out.set_tail(
+            in_table,
+            FlowTail {
+                after,
+                open: 0,
+                bare: None,
+            },
+        );
     }
 
     /// `elems[j]`, a block or list closing or its flow ending, gives its
@@ -5256,12 +5301,28 @@ impl<'a> Html<'a> {
             }
         }
         let e = &self.elems[j];
-        let Some(tail) = self.out.tail(in_table) else {
-            return;
-        };
         let (margin, pad, ua) = (e.look.margin_after, e.look.pad_after, e.look.ua_after);
         // A bottom line separates as padding does (#1883).
         let sep = e.look.border_after;
+        let Some(tail) = self.out.tail(in_table) else {
+            // Its flow ends in a table that ended in it (#2151): its box
+            // waits for the next paragraph of the flow, folded onto what
+            // waits already (a block inside it that ended there too). Not
+            // a card's: their margins are their own limit.
+            if !e.look.own_card && self.out.ends_in_plain_table(in_table) {
+                let base = self.out.pending(in_table).unwrap_or_default();
+                let (after, open) = fold_bottom(base.after, base.open, margin, pad, sep);
+                self.out.set_pending(
+                    in_table,
+                    FlowTail {
+                        after,
+                        open,
+                        bare: None,
+                    },
+                );
+            }
+            return;
+        };
         let quirky =
             self.quirks && ua > 0 && e.kind == Kind::Block && self.bottom_unseparated(j, in_table);
         let (after, open) = fold_bottom(tail.after, tail.open, margin, pad, sep);
