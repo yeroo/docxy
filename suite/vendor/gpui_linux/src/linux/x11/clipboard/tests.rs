@@ -238,6 +238,14 @@ fn text_and_image_are_both_offered() {
         Some(&b"caption"[..])
     );
     assert_eq!(reader.fetch("image/png").as_deref(), Some(PNG));
+    // The two names `TARGETS` lists beside `UTF8_STRING` serve its text.
+    for name in ["text/plain;charset=utf-8", "text/plain;charset=UTF-8"] {
+        assert_eq!(
+            reader.fetch(name).as_deref(),
+            Some(&b"caption"[..]),
+            "{name}"
+        );
+    }
 }
 
 /// A text item serves what gpui always wrote, and so does an item with

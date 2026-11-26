@@ -184,8 +184,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   neither text nor image (an empty `UTF8_STRING`), are written as before.
   PRIMARY stays text only.
 - X11 (`x11/clipboard.rs`): `Clipboard::set_item` writes `item_data`'s list:
-  `UTF8_STRING` (`TARGETS` adds its two `text/plain;charset=` names) and the
-  images' atoms. `set_image` stores its own format, not always PNG. A
+  `UTF8_STRING` (`TARGETS` adds its two `text/plain;charset=` names, and a
+  request for either now gets its bytes, not a refusal) and the images'
+  atoms. `set_image` stores its own format, not always PNG. A
   payload past one `ChangeProperty` (`maximum_request_bytes` less 1024, as
   `rich_clip/x11.rs`) is left out of `TARGETS` and refused: sending it would
   end `serve_requests` and every later copy with it. No `INCR` sending.
@@ -193,8 +194,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   `OwnCopy`'s formats, so `send`, `mime_types`, `read_format` and
   `add_formats`' merge serve them like RTF; `own_mime_types` leaves the text
   mimes out for an item of images alone (`offers_text`), and gpui's write
-  offers that list.
+  offers that list. `send_internal` sets the reader's pipe non-blocking
+  (`set_non_blocking`) before writing: a blocking write of a big image held
+  gpui's main thread until the reader drained it.
 - Tests: X11's `x11/clipboard/tests.rs` against a reader on a private Xvfb
   (`Inner::new(Some(display))`, the `Clipboard` built on it with no third
-  owner, so its `Drop` does nothing); Wayland's `formats.rs` rules. The two
-  clients' write calls are untested: neither client builds headless.
+  owner, so its `Drop` does nothing); Wayland's `formats.rs` rules and
+  `set_non_blocking` on a real pipe. The two clients' write calls and
+  `send_internal`'s use of it are untested: neither client builds headless.

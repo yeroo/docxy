@@ -315,23 +315,24 @@ index 81ed5b7..9ddd8d6 100644
              _ => {}
 diff --git b/src/linux/wayland/clipboard/formats.rs b/src/linux/wayland/clipboard/formats.rs
 new file mode 100644
-index 0000000..b21d22f
+index 0000000..7c077c5
 --- /dev/null
 +++ b/src/linux/wayland/clipboard/formats.rs
-@@ -0,0 +1,446 @@
+@@ -0,0 +1,474 @@
 +// Added for docxy (#1966): the formats a copy offers beside gpui's text, and
 +// its images (#2282).
 +
 +//! What gpui's own latest copy is on the Wayland selection, beside its text.
 +//!
-+//! gpui's clipboard offers text only. The suite adds RTF or HTML to a copy by
-+//! setting the selection again, with a source that offers the text, those
-+//! formats and gpui's `pid/<pid>` mime ([`super::super::client::rich_clipboard`]).
-+//! This keeps, without a connection (so it is testable), which source is
-+//! gpui's live copy and which bytes each extra mime serves.
++//! gpui's clipboard offers a copy's text and its images, each image as its
++//! own mime (#2282). The suite adds RTF or HTML to a copy by setting the
++//! selection again, with a source that offers the text, those formats and
++//! gpui's `pid/<pid>` mime ([`super::super::client::rich_clipboard`]). This
++//! keeps, without a connection (so it is testable), which source is gpui's
++//! live copy and which bytes each format serves, gpui's images included.
 +
 +use std::{
-+    io::{ErrorKind, Read},
++    io::{self, ErrorKind, Read},
 +    os::fd::AsRawFd,
 +    time::Duration,
 +};
@@ -454,6 +455,24 @@ index 0000000..b21d22f
 +            .entries()
 +            .iter()
 +            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
++}
++
++/// `fd` set non-blocking (#2282): a `send`'s pipe is the reader's, and a
++/// blocking write of a big image would hold gpui's main thread until the
++/// reader drained it all.
++pub(crate) fn set_non_blocking(fd: &impl AsRawFd) -> io::Result<()> {
++    let fd = fd.as_raw_fd();
++    // SAFETY: `fcntl` on a descriptor the caller holds open; no memory is
++    // passed.
++    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
++    if flags < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    // SAFETY: as above.
++    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(())
 +}
 +
 +/// Who answers a read of the selection.
@@ -665,6 +684,15 @@ index 0000000..b21d22f
 +    }
 +
 +    #[test]
++    fn a_send_pipe_is_made_non_blocking() {
++        let pipe = filedescriptor::Pipe::new().unwrap();
++        let flags = || unsafe { libc::fcntl(pipe.write.as_raw_fd(), libc::F_GETFL) };
++        assert_eq!(flags() & libc::O_NONBLOCK, 0);
++        set_non_blocking(&pipe.write).unwrap();
++        assert_ne!(flags() & libc::O_NONBLOCK, 0);
++    }
++
++    #[test]
 +    fn a_bounded_read_stops_past_max() {
 +        let timeout = Duration::from_secs(1);
 +        assert_eq!(
@@ -766,12 +794,12 @@ index 0000000..b21d22f
 +    }
 +}
 diff --git a/src/linux/wayland/clipboard.rs b/src/linux/wayland/clipboard.rs
-index dfedf53..f6e42b5 100644
+index dfedf53..343b678 100644
 --- a/src/linux/wayland/clipboard.rs
 +++ b/src/linux/wayland/clipboard.rs
 @@ -1,3 +1,6 @@
 +// Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text,
-+// and its images (#2282).
++// and its images (#2282), written to the pipe without blocking.
 +
  use std::{
      fs::File,
@@ -788,17 +816,19 @@ index dfedf53..f6e42b5 100644
  use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
  
  use crate::linux::{
-@@ -16,6 +22,9 @@ use crate::linux::{
+@@ -16,6 +22,11 @@ use crate::linux::{
  };
  use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
  
 +mod formats;
-+pub(crate) use formats::{OwnCopy, Whose, image_formats, offers_text, same_text, whose};
++pub(crate) use formats::{
++    OwnCopy, Whose, image_formats, offers_text, same_text, set_non_blocking, whose,
++};
 +
  /// Text mime types that we'll offer to other programs.
  pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
      ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
-@@ -38,6 +47,10 @@ pub(crate) struct Clipboard {
+@@ -38,6 +49,10 @@ pub(crate) struct Clipboard {
      current_offer: Option<DataOffer<WlDataOffer>>,
      cached_primary_read: Option<ClipboardItem>,
      current_primary_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
@@ -809,7 +839,7 @@ index dfedf53..f6e42b5 100644
  }
  
  pub(crate) trait ReceiveData {
-@@ -98,6 +111,29 @@ impl<T: ReceiveData> DataOffer<T> {
+@@ -98,6 +113,29 @@ impl<T: ReceiveData> DataOffer<T> {
          }
      }
  
@@ -839,7 +869,7 @@ index dfedf53..f6e42b5 100644
      fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
          let mime_type = self.mime_types.iter().find(|&mime_type| {
              ALLOWED_TEXT_MIME_TYPES
-@@ -155,13 +191,102 @@ impl Clipboard {
+@@ -155,13 +193,102 @@ impl Clipboard {
              current_offer: None,
              cached_primary_read: None,
              current_primary_offer: None,
@@ -942,7 +972,7 @@ index dfedf53..f6e42b5 100644
      pub fn set_primary(&mut self, item: ClipboardItem) {
          self.primary_contents = Some(item);
      }
-@@ -169,6 +294,13 @@ impl Clipboard {
+@@ -169,6 +296,13 @@ impl Clipboard {
      pub fn set_offer(&mut self, data_offer: Option<DataOffer<WlDataOffer>>) {
          self.cached_read = None;
          self.current_offer = data_offer;
@@ -956,7 +986,7 @@ index dfedf53..f6e42b5 100644
      }
  
      pub fn set_primary_offer(&mut self, data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>) {
-@@ -180,9 +312,10 @@ impl Clipboard {
+@@ -180,9 +314,10 @@ impl Clipboard {
          self.self_mime.clone()
      }
  
@@ -970,7 +1000,7 @@ index dfedf53..f6e42b5 100644
          }
      }
  
-@@ -197,6 +330,13 @@ impl Clipboard {
+@@ -197,6 +332,13 @@ impl Clipboard {
      }
  
      pub fn read(&mut self) -> Option<ClipboardItem> {
@@ -984,6 +1014,18 @@ index dfedf53..f6e42b5 100644
          let offer = self.current_offer.as_ref()?;
          if let Some(cached) = self.cached_read.clone() {
              return Some(cached);
+@@ -233,6 +375,11 @@ impl Clipboard {
+     }
+ 
+     fn send_internal(&self, fd: OwnedFd, bytes: Vec<u8>) {
++        // Written as the reader takes it, never blocking the main thread
++        // (#2282): an image can be megabytes.
++        if let Err(err) = set_non_blocking(&fd) {
++            log::warn!("Wayland clipboard pipe stays blocking: {err}");
++        }
+         let mut written = 0;
+         self.loop_handle
+             .insert_source(
 diff --git a/src/linux/wayland.rs b/src/linux/wayland.rs
 index cbc962b..3c99149 100644
 --- a/src/linux/wayland.rs
@@ -1028,10 +1070,10 @@ index 0c8c9b4..c174714 100644
              )
 diff --git b/src/linux/x11/clipboard/tests.rs b/src/linux/x11/clipboard/tests.rs
 new file mode 100644
-index 0000000..c3ab57c
+index 0000000..66593d7
 --- /dev/null
 +++ b/src/linux/x11/clipboard/tests.rs
-@@ -0,0 +1,329 @@
+@@ -0,0 +1,337 @@
 +// Added for docxy (#2282): a copy's images on the X11 clipboard.
 +
 +//! gpui's X11 clipboard against another X client, each test on its own
@@ -1272,6 +1314,14 @@ index 0000000..c3ab57c
 +        Some(&b"caption"[..])
 +    );
 +    assert_eq!(reader.fetch("image/png").as_deref(), Some(PNG));
++    // The two names `TARGETS` lists beside `UTF8_STRING` serve its text.
++    for name in ["text/plain;charset=utf-8", "text/plain;charset=UTF-8"] {
++        assert_eq!(
++            reader.fetch(name).as_deref(),
++            Some(&b"caption"[..]),
++            "{name}"
++        );
++    }
 +}
 +
 +/// A text item serves what gpui always wrote, and so does an item with
@@ -1362,10 +1412,10 @@ index 0000000..c3ab57c
 +    assert!(owner.serving());
 +}
 diff --git a/src/linux/x11/clipboard.rs b/src/linux/x11/clipboard.rs
-index 706e7b0..87cf33a 100644
+index 706e7b0..1289794 100644
 --- a/src/linux/x11/clipboard.rs
 +++ b/src/linux/x11/clipboard.rs
-@@ -12,7 +12,11 @@
+@@ -12,7 +12,12 @@
   * The project to which this file belongs is licensed under either of
   * the Apache 2.0 or the MIT license at the licensee's choice. The terms
   * and conditions of the chosen license apply to this file.
@@ -1374,11 +1424,12 @@ index 706e7b0..87cf33a 100644
 +
 +// Modified for docxy (#1966): the header's closing `*/` indented one space, as
 +// rustfmt on Windows wants it (Linux rustfmt takes either). (#2282): a copy's
-+// images served as their own mime, a payload past one request refused.
++// images served as their own mime, a payload past one request refused, the
++// `text/plain;charset=` names `TARGETS` lists served.
  
  // More info about using the clipboard on X11:
  // https://tronche.com/gui/x/icccm/sec-2.html#s-2.6
-@@ -34,7 +38,7 @@ use std::{
+@@ -34,7 +39,7 @@ use std::{
  use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
  use x11rb::{
      COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, NONE,
@@ -1387,7 +1438,7 @@ index 706e7b0..87cf33a 100644
      protocol::{
          Event,
          xproto::{
-@@ -47,7 +51,7 @@ use x11rb::{
+@@ -47,7 +52,7 @@ use x11rb::{
      wrapper::ConnectionExt as _,
  };
  
@@ -1396,7 +1447,7 @@ index 706e7b0..87cf33a 100644
  use strum::IntoEnumIterator;
  
  type Result<T, E = Error> = std::result::Result<T, E>;
-@@ -104,6 +108,10 @@ thread_local! {
+@@ -104,6 +109,10 @@ thread_local! {
  const LONG_TIMEOUT_DUR: Duration = Duration::from_millis(4000);
  const SHORT_TIMEOUT_DUR: Duration = Duration::from_millis(10);
  
@@ -1407,7 +1458,7 @@ index 706e7b0..87cf33a 100644
  #[derive(Debug, PartialEq, Eq)]
  enum ManagerHandoverState {
      Idle,
-@@ -137,13 +145,20 @@ struct Inner {
+@@ -137,13 +146,20 @@ struct Inner {
      handover_cv: Condvar,
  
      serve_stopped: AtomicBool,
@@ -1430,7 +1481,7 @@ index 706e7b0..87cf33a 100644
                  Error::unknown("X11 server connection timed out because it was unreachable")
              })?;
          let screen = conn
-@@ -208,12 +223,16 @@ enum ReadSelNotifyResult {
+@@ -208,12 +224,16 @@ enum ReadSelNotifyResult {
  }
  
  impl Inner {
@@ -1449,7 +1500,7 @@ index 706e7b0..87cf33a 100644
  
          Ok(Self {
              server,
-@@ -224,9 +243,18 @@ impl Inner {
+@@ -224,9 +244,18 @@ impl Inner {
              handover_state: Mutex::new(ManagerHandoverState::Idle),
              handover_cv: Condvar::new(),
              serve_stopped: AtomicBool::new(false),
@@ -1468,7 +1519,7 @@ index 706e7b0..87cf33a 100644
      fn write(
          &self,
          data: Vec<ClipboardData>,
-@@ -297,7 +325,7 @@ impl Inner {
+@@ -297,7 +326,7 @@ impl Inner {
              }
              return Err(Error::ContentNotAvailable);
          }
@@ -1477,7 +1528,7 @@ index 706e7b0..87cf33a 100644
  
          let highest_precedence_format =
              match self.read_single(&reader, selection, self.atoms.TARGETS) {
-@@ -688,7 +716,7 @@ impl Inner {
+@@ -688,7 +717,7 @@ impl Inner {
              targets.push(self.atoms.SAVE_TARGETS);
              let data = self.selection_of(selection).data.read();
              if let Some(data_list) = &*data {
@@ -1486,10 +1537,22 @@ index 706e7b0..87cf33a 100644
                      targets.push(data.format);
                      if data.format == self.atoms.UTF8_STRING {
                          // When we are storing a UTF8 string,
-@@ -716,6 +744,13 @@ impl Inner {
+@@ -714,8 +743,24 @@ impl Inner {
+         } else {
+             log::trace!("Handling request for (probably) the clipboard contents.");
              let data = self.selection_of(selection).data.read();
++            // `TARGETS` lists the two `text/plain;charset=` names beside
++            // `UTF8_STRING`: they serve its bytes (#2282).
++            let stored = if event.target == self.atoms.UTF8_MIME_0
++                || event.target == self.atoms.UTF8_MIME_1
++            {
++                self.atoms.UTF8_STRING
++            } else {
++                event.target
++            };
              if let Some(data_list) = &*data {
-                 success = match data_list.iter().find(|d| d.format == event.target) {
+-                success = match data_list.iter().find(|d| d.format == event.target) {
++                success = match data_list.iter().find(|d| d.format == stored) {
 +                    Some(data) if !self.fits(data) => {
 +                        log::warn!(
 +                            "Refused a clipboard request for {} bytes, past one X request",
@@ -1500,7 +1563,7 @@ index 706e7b0..87cf33a 100644
                      Some(data) => {
                          self.server
                              .conn
-@@ -958,7 +993,7 @@ impl Clipboard {
+@@ -958,7 +1003,7 @@ impl Clipboard {
              });
          }
          // At this point we know that the clipboard does not exist.
@@ -1509,7 +1572,7 @@ index 706e7b0..87cf33a 100644
          let join_handle = std::thread::Builder::new()
              .name("Clipboard".to_owned())
              .spawn({
-@@ -990,18 +1025,20 @@ impl Clipboard {
+@@ -990,18 +1035,20 @@ impl Clipboard {
          self.inner.write(data, selection, wait)
      }
  
@@ -1541,7 +1604,7 @@ index 706e7b0..87cf33a 100644
      }
  
      #[allow(unused)]
-@@ -1014,7 +1051,7 @@ impl Clipboard {
+@@ -1014,7 +1061,7 @@ impl Clipboard {
          let format = self.image_format_atom(image.format);
          let data = vec![ClipboardData {
              bytes: image.bytes,
@@ -1550,7 +1613,7 @@ index 706e7b0..87cf33a 100644
          }];
          self.inner.write(data, selection, wait)
      }
-@@ -1132,6 +1169,50 @@ impl Drop for Clipboard {
+@@ -1132,6 +1179,50 @@ impl Drop for Clipboard {
      }
  }
  
@@ -1601,7 +1664,7 @@ index 706e7b0..87cf33a 100644
  fn into_unknown<E: std::fmt::Display>(error: E) -> Error {
      Error::Unknown {
          description: error.to_string(),
-@@ -1253,3 +1334,6 @@ impl Error {
+@@ -1253,3 +1344,6 @@ impl Error {
          }
      }
  }

@@ -3,14 +3,15 @@
 
 //! What gpui's own latest copy is on the Wayland selection, beside its text.
 //!
-//! gpui's clipboard offers text only. The suite adds RTF or HTML to a copy by
-//! setting the selection again, with a source that offers the text, those
-//! formats and gpui's `pid/<pid>` mime ([`super::super::client::rich_clipboard`]).
-//! This keeps, without a connection (so it is testable), which source is
-//! gpui's live copy and which bytes each extra mime serves.
+//! gpui's clipboard offers a copy's text and its images, each image as its
+//! own mime (#2282). The suite adds RTF or HTML to a copy by setting the
+//! selection again, with a source that offers the text, those formats and
+//! gpui's `pid/<pid>` mime ([`super::super::client::rich_clipboard`]). This
+//! keeps, without a connection (so it is testable), which source is gpui's
+//! live copy and which bytes each format serves, gpui's images included.
 
 use std::{
-    io::{ErrorKind, Read},
+    io::{self, ErrorKind, Read},
     os::fd::AsRawFd,
     time::Duration,
 };
@@ -133,6 +134,24 @@ pub(crate) fn offers_text(item: &ClipboardItem) -> bool {
             .entries()
             .iter()
             .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
+}
+
+/// `fd` set non-blocking (#2282): a `send`'s pipe is the reader's, and a
+/// blocking write of a big image would hold gpui's main thread until the
+/// reader drained it all.
+pub(crate) fn set_non_blocking(fd: &impl AsRawFd) -> io::Result<()> {
+    let fd = fd.as_raw_fd();
+    // SAFETY: `fcntl` on a descriptor the caller holds open; no memory is
+    // passed.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: as above.
+    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Who answers a read of the selection.
@@ -341,6 +360,15 @@ mod tests {
         pipe.write.write_all(bytes).unwrap();
         drop(pipe.write);
         pipe.read
+    }
+
+    #[test]
+    fn a_send_pipe_is_made_non_blocking() {
+        let pipe = filedescriptor::Pipe::new().unwrap();
+        let flags = || unsafe { libc::fcntl(pipe.write.as_raw_fd(), libc::F_GETFL) };
+        assert_eq!(flags() & libc::O_NONBLOCK, 0);
+        set_non_blocking(&pipe.write).unwrap();
+        assert_ne!(flags() & libc::O_NONBLOCK, 0);
     }
 
     #[test]

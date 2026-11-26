@@ -16,7 +16,8 @@
 
 // Modified for docxy (#1966): the header's closing `*/` indented one space, as
 // rustfmt on Windows wants it (Linux rustfmt takes either). (#2282): a copy's
-// images served as their own mime, a payload past one request refused.
+// images served as their own mime, a payload past one request refused, the
+// `text/plain;charset=` names `TARGETS` lists served.
 
 // More info about using the clipboard on X11:
 // https://tronche.com/gui/x/icccm/sec-2.html#s-2.6
@@ -742,8 +743,17 @@ impl Inner {
         } else {
             log::trace!("Handling request for (probably) the clipboard contents.");
             let data = self.selection_of(selection).data.read();
+            // `TARGETS` lists the two `text/plain;charset=` names beside
+            // `UTF8_STRING`: they serve its bytes (#2282).
+            let stored = if event.target == self.atoms.UTF8_MIME_0
+                || event.target == self.atoms.UTF8_MIME_1
+            {
+                self.atoms.UTF8_STRING
+            } else {
+                event.target
+            };
             if let Some(data_list) = &*data {
-                success = match data_list.iter().find(|d| d.format == event.target) {
+                success = match data_list.iter().find(|d| d.format == stored) {
                     Some(data) if !self.fits(data) => {
                         log::warn!(
                             "Refused a clipboard request for {} bytes, past one X request",

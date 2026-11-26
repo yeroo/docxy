@@ -1,5 +1,5 @@
 // Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text,
-// and its images (#2282).
+// and its images (#2282), written to the pipe without blocking.
 
 use std::{
     fs::File,
@@ -23,7 +23,9 @@ use crate::linux::{
 use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 
 mod formats;
-pub(crate) use formats::{OwnCopy, Whose, image_formats, offers_text, same_text, whose};
+pub(crate) use formats::{
+    OwnCopy, Whose, image_formats, offers_text, same_text, set_non_blocking, whose,
+};
 
 /// Text mime types that we'll offer to other programs.
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
@@ -373,6 +375,11 @@ impl Clipboard {
     }
 
     fn send_internal(&self, fd: OwnedFd, bytes: Vec<u8>) {
+        // Written as the reader takes it, never blocking the main thread
+        // (#2282): an image can be megabytes.
+        if let Err(err) = set_non_blocking(&fd) {
+            log::warn!("Wayland clipboard pipe stays blocking: {err}");
+        }
         let mut written = 0;
         self.loop_handle
             .insert_source(
