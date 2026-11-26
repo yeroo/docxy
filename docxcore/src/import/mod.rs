@@ -1411,7 +1411,11 @@ impl<'b> Builder<'b> {
         }
         let t = self.top();
         let blocks = std::mem::take(&mut t.blocks);
+        // What is said of the cell's blocks goes with them: anchored on a
+        // block count only, it would match in the next cell (#2151 r1).
         t.tail = None;
+        t.pending = None;
+        t.card_at = None;
         t.cell_has_para = false;
         if let Some(h) = t.html.as_mut() {
             let cell = html_table::RawCell {

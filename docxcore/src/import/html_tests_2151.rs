@@ -383,3 +383,28 @@ fn a_card_away_from_a_quirky_edge_keeps_its_margins() {
     ));
     assert_eq!(gaps(&d, "x"), (Some(240), Some(240)));
 }
+
+// r1 M1: a cell's pending box and card end stay in that cell.
+
+#[test]
+fn a_cell_s_pending_box_and_card_end_never_reach_the_next_cell() {
+    // An empty block's margins wait in its cell only.
+    let d = standards(
+        "<table><tr><td><div style='margin-bottom:20px'></div>x</td><td>y</td></tr></table>",
+    );
+    assert_eq!(gaps(&d, "y").0, Some(0));
+    // A block ending in a nested table: its bottom waits in its cell, not
+    // for a later cell's paragraph at the same block count.
+    let d = standards(
+        "<table><tr><td><p>x</p><div style='margin-bottom:40px'><table><tr><td>i</td></tr></table></div></td>\
+         <td><p>y</p><table><tr><td>j</td></tr></table><p>z</p></td></tr></table>",
+    );
+    assert_eq!(gaps(&d, "z").0, Some(240));
+    // A card ending one cell leaves a later cell's plain nested table a
+    // table: a block ending in it still gives its bottom.
+    let d = standards(
+        "<table><tr><td><p>x</p><div style='background:#eee'>c</div></td>\
+         <td><p>y</p><div style='margin-bottom:40px'><table><tr><td>j</td></tr></table></div><p>z</p></td></tr></table>",
+    );
+    assert_eq!(gaps(&d, "z").0, Some(600));
+}
