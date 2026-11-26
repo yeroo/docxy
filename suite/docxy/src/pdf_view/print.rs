@@ -453,6 +453,8 @@ pub(crate) fn export_of(d: &Dialog, facts: &ViewFacts) -> Result<Export, String>
     }
     let pages = chosen_pages(d, facts)?;
     Ok(if png {
+        // A page named twice is one picture (#2258 r1).
+        let pages = super::worker::distinct(&pages);
         let dpi = DPIS
             .get(choice_of(d, "dpi"))
             .copied()
@@ -482,26 +484,49 @@ pub(crate) fn export_name(file: &str, export: &Export) -> String {
     }
 }
 
-/// The path an export's Save dialog gave, with the export's extension: one
-/// without an extension gets it; any other is refused, as Save As refuses
-/// one, since the dialog confirmed replacing that name and no other.
-pub(crate) fn export_target(path: PathBuf, export: &Export) -> Result<PathBuf, String> {
-    let ext = match export {
-        Export::Png { .. } => "png",
-        Export::Pdf { .. } => "pdf",
-    };
+/// `path` with the extension `ext` (#2258): one without an extension gets
+/// it (a native dialog may not add its filter's), and says it did; one
+/// with `ext` (any case) is kept; any other is refused, `what` naming the
+/// file (`"These pages are"`, `"A PDF is"`), since the dialog confirmed
+/// replacing that name and no other. Save As of a PDF (#2255) uses it too.
+pub(crate) fn with_extension(
+    path: PathBuf,
+    ext: &str,
+    what: &str,
+) -> Result<(PathBuf, bool), String> {
     match path.extension() {
         None => {
             let mut name = path.file_name().unwrap_or_default().to_os_string();
             name.push(format!(".{ext}"));
-            Ok(path.with_file_name(name))
+            Ok((path.with_file_name(name), true))
         }
-        Some(e) if e.eq_ignore_ascii_case(ext) => Ok(path),
+        Some(e) if e.eq_ignore_ascii_case(ext) => Ok((path, false)),
         Some(e) => Err(format!(
-            "These pages are saved as a .{ext} file, not .{}: choose a name that ends in .{ext}",
+            "{what} saved as a .{ext} file, not .{}: choose a name that ends in .{ext}",
             e.to_string_lossy()
         )),
     }
+}
+
+/// The path an export's Save dialog gave, with the export's extension
+/// ([`with_extension`]), and whether it was added to the name picked.
+pub(crate) fn export_target(path: PathBuf, export: &Export) -> Result<(PathBuf, bool), String> {
+    with_extension(path, export.extension(), "These pages are")
+}
+
+/// The Save dialog's answer for an export (#2258 r1): its target, but a
+/// name the extension was added to that is a file already is refused (the
+/// dialog confirmed replacing the name typed, not that one).
+pub(crate) fn picked_export_target(path: PathBuf, export: &Export) -> Result<PathBuf, String> {
+    let (target, added) = export_target(path, export)?;
+    if added && target.exists() {
+        return Err(format!(
+            "{} already exists: type the whole name, with .{}, to replace it",
+            target.display(),
+            export.extension()
+        ));
+    }
+    Ok(target)
 }
 
 /// The status line after a print: "Sent N pages to <printer>".
@@ -539,7 +564,7 @@ pub(crate) fn exported_status(files: &[PathBuf], dpi_used: Option<f64>) -> Strin
     }
 }
 
-fn capitalised(s: &str) -> String {
+pub(crate) fn capitalised(s: &str) -> String {
     let mut c = s.chars();
     c.next()
         .map(|f| f.to_uppercase().chain(c).collect())

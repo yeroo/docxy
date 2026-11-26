@@ -398,19 +398,51 @@ fn export_names_and_targets() {
     let pdf = Export::Pdf { pages: vec![0] };
     assert_eq!(
         export_target("/d/a".into(), &png).unwrap(),
-        PathBuf::from("/d/a.png")
+        (PathBuf::from("/d/a.png"), true)
     );
     assert_eq!(
         export_target("/d/a.PNG".into(), &png).unwrap(),
-        PathBuf::from("/d/a.PNG")
+        (PathBuf::from("/d/a.PNG"), false)
     );
-    assert!(export_target("/d/a.pdf".into(), &png).is_err());
+    assert_eq!(
+        export_target("/d/a.pdf".into(), &png).unwrap_err(),
+        "These pages are saved as a .png file, not .pdf: choose a name that ends in .png"
+    );
     assert_eq!(
         export_target("/d/a".into(), &pdf).unwrap(),
-        PathBuf::from("/d/a.pdf")
+        (PathBuf::from("/d/a.pdf"), true)
+    );
+    // Save As of a PDF (#2255) through the same helper, its words kept.
+    assert_eq!(
+        crate::pdf_view::host::pdf_save_as_target("/d/a.txt".into()).unwrap_err(),
+        "A PDF is saved as a .pdf file, not .txt: choose a name that ends in .pdf"
+    );
+    // r1 m4: a name the extension was added to that is a file already is
+    // refused; the whole name typed replaces it (the dialog asked).
+    let dir = Scratch::new();
+    std::fs::write(dir.path("taken.png"), b"mine").unwrap();
+    let e = picked_export_target(dir.path("taken"), &png).unwrap_err();
+    assert!(e.contains("already exists") && e.contains(".png"), "{e}");
+    assert_eq!(
+        picked_export_target(dir.path("taken.png"), &png).unwrap(),
+        dir.path("taken.png")
+    );
+    assert_eq!(
+        picked_export_target(dir.path("new"), &png).unwrap(),
+        dir.path("new.png")
     );
     assert_eq!(export_name("report.pdf", &png), "report_Page_1.png");
     assert_eq!(export_name("report.pdf", &pdf), "report_pages.pdf");
+    // r1 M1: a page named twice is one picture, the first kept in place.
+    let mut d = png_dialog();
+    set(&mut d, "range", t("1-3, 2, 1"));
+    assert_eq!(
+        export_of(&d, &facts(3)).unwrap(),
+        Export::Png {
+            pages: vec![0, 1, 2],
+            dpi: 150.
+        }
+    );
     let mut d = png_dialog();
     set(&mut d, "range", t("1-2"));
     set(&mut d, "dpi", Value::Choice(Some(2)));
@@ -1026,4 +1058,146 @@ fn a_print_or_extract_has_a_budget_of_its_own() {
     assert_eq!(Op::ExtractPages { pages: vec![0] }.timeout(t), t * 3);
     assert_eq!(Op::Png { page: 0, dpi: 72. }.timeout(t), t);
     assert_eq!(Op::Pixels { page: 0, scale: 1. }.timeout(t), t);
+}
+
+// ---- review r1 ------------------------------------------------------------------
+
+fn files_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// r1 M1: a PNG export of a range that repeats a page writes each page
+/// once, under its own name, and nothing else.
+#[test]
+fn a_png_export_of_repeated_pages_writes_each_page_once() {
+    let mut w = worker_on(&corpus_path("slides"));
+    info_of(&mut w);
+    for (pages, want) in [
+        (vec![0, 0], vec!["out.png"]),
+        (
+            vec![0, 1, 2, 1],
+            vec!["out_Page_1.png", "out_Page_2.png", "out_Page_3.png"],
+        ),
+    ] {
+        let dir = Scratch::new();
+        let target = dir.path("out.png");
+        match w.ask(&Op::ExportTo {
+            export: Export::Png {
+                pages: pages.clone(),
+                dpi: 72.,
+            },
+            path: target,
+        }) {
+            Answer::Exported(e) => assert_eq!(e.files.len(), want.len(), "{pages:?}"),
+            other => panic!("{pages:?}: {other:?}"),
+        }
+        assert_eq!(files_in(&dir.path("")), want, "{pages:?}");
+    }
+}
+
+/// r1 M1: a rename that fails partway (a directory at the second name)
+/// leaves no new file and no temporary one, and the first name keeps the
+/// file that was there.
+#[test]
+fn a_failed_rename_puts_every_name_back() {
+    let dir = Scratch::new();
+    let first = dir.path("a.png");
+    std::fs::write(&first, b"old").unwrap();
+    std::fs::create_dir(dir.path("b.png")).unwrap();
+    let mut staged = crate::pdf_view::worker::Staged::default();
+    staged.add(&first, b"new a").unwrap();
+    staged.add(&dir.path("b.png"), b"new b").unwrap();
+    // The same name twice is refused, not written over.
+    assert!(staged.add(&first, b"again").is_err());
+    assert!(staged.commit().is_err());
+    assert_eq!(std::fs::read(&first).unwrap(), b"old");
+    assert!(dir.path("b.png").is_dir());
+    assert_eq!(files_in(&dir.path("")), ["a.png", "b.png"]);
+    // And every name in place when all go.
+    let mut staged = crate::pdf_view::worker::Staged::default();
+    staged.add(&first, b"new a").unwrap();
+    staged.add(&dir.path("c.png"), b"new c").unwrap();
+    assert_eq!(staged.commit().unwrap().len(), 2);
+    assert_eq!(std::fs::read(&first).unwrap(), b"new a");
+    assert_eq!(files_in(&dir.path("")), ["a.png", "b.png", "c.png"]);
+}
+
+/// r1 M2: pages are written as they come, so a page that fails after one
+/// was written leaves nothing behind: no file, no temporary one.
+#[test]
+fn a_page_failing_partway_leaves_nothing_behind() {
+    let dir = Scratch::new();
+    let mut w = worker_on(&corpus_path("slides"));
+    info_of(&mut w);
+    match w.ask(&Op::ExportTo {
+        export: Export::Png {
+            pages: vec![0, 9, 1],
+            dpi: 72.,
+        },
+        path: dir.path("out.png"),
+    }) {
+        Answer::Failed(why) => assert!(why.starts_with("page 10"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        files_in(&dir.path("")).is_empty(),
+        "{:?}",
+        files_in(&dir.path(""))
+    );
+}
+
+/// r1 m3: no export replaces the PDF the view reads.
+#[test]
+fn an_export_never_replaces_the_open_pdf() {
+    let dir = Scratch::new();
+    let path = dir.path("slides.pdf");
+    std::fs::copy(corpus_path("slides"), &path).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let mut w = worker_on(&path);
+    info_of(&mut w);
+    match w.ask(&Op::ExportTo {
+        export: Export::Pdf { pages: vec![0] },
+        path: path.clone(),
+    }) {
+        Answer::Failed(why) => assert_eq!(why, crate::pdf_view::worker::EXPORT_OVER_ITSELF),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert_eq!(files_in(&dir.path("")), ["slides.pdf"]);
+}
+
+/// r1 m5: the printers listed for a tab: in front, the Print dialog opens;
+/// behind, or with a dialog already on it, none does; either way its
+/// status stops saying it is looking for printers.
+#[test]
+fn printers_arriving_open_the_dialog_only_in_front_and_stop_looking() {
+    use crate::pdf_view::output::printers_arrived;
+    let path = corpus_path("text");
+    let mut tab = crate::pdf_view::host::pdf_view_tab_with(&path, None, Spawn::InProcess).unwrap();
+    tab.status = LOOKING.into();
+    assert!(!printers_arrived(&mut tab, harness_printers(), false));
+    assert!(tab.dialogs.top().is_none());
+    assert_eq!(tab.status.as_ref(), "");
+    tab.status = LOOKING.into();
+    assert!(printers_arrived(&mut tab, harness_printers(), true));
+    assert_eq!(
+        tab.dialogs.top().map(|d| d.owner),
+        Some(DialogOwner::PdfPrint)
+    );
+    assert_eq!(tab.status.as_ref(), "");
+    let crate::Surface::Pdf(v) = &tab.surface else {
+        unreachable!()
+    };
+    assert_eq!(v.printers, harness_printers());
+    tab.status = LOOKING.into();
+    assert!(
+        !printers_arrived(&mut tab, Vec::new(), true),
+        "a dialog is open"
+    );
+    assert_eq!(tab.status.as_ref(), "");
 }

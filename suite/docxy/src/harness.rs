@@ -8329,17 +8329,20 @@ fn dispatch_verb(
                 };
                 // An export waiting for its file (#2258): this names it, as
                 // the Save dialog would.
-                if let Some(export) = app.active_pdf_mut().and_then(|v| v.export_waiting.take()) {
-                    let target = crate::pdf_view::print::export_target(target, &export)?;
+                // The name is checked before the export is taken: a refusal
+                // keeps it waiting (#2258 r1).
+                if let Some(waiting) = app.active_pdf().and_then(|v| v.export_waiting.clone()) {
+                    let (target, _) = crate::pdf_view::print::export_target(target, &waiting)?;
                     if target.exists() && !overwrite {
-                        if let Some(v) = app.active_pdf_mut() {
-                            v.export_waiting = Some(export);
-                        }
                         return Err(format!(
                             "{} already exists; pass \"overwrite\": true to replace it",
                             target.display()
                         ));
                     }
+                    let Some(export) = app.active_pdf_mut().and_then(|v| v.export_waiting.take())
+                    else {
+                        return Err("the export is no longer waiting".into());
+                    };
                     let kind = match export {
                         crate::pdf_view::worker::Export::Png { .. } => "png",
                         crate::pdf_view::worker::Export::Pdf { .. } => "pdf",

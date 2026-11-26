@@ -290,7 +290,7 @@ pub(crate) enum DialogOwner {
     /// `pdf_view::host`'s `pdf_signed_save_click`.
     PdfSignedSave,
     /// A PDF view's Print, and its two exports (#2258): pages as PNG
-    /// pictures, pages as a PDF. Pressed in `pdf_view::host`'s
+    /// pictures, pages as a PDF. Pressed in `pdf_view::output`'s
     /// `pdf_output_click`: OK prints, or asks where to save.
     PdfPrint,
     PdfExportPng,

@@ -40,15 +40,18 @@ impl Docxy {
             return self.refocus(window, cx);
         };
         if let Some(why) = print::refusal(&facts, Output::Print) {
-            self.set_status(capital(why));
+            self.set_status(print::capitalised(why));
             return self.refocus(window, cx);
         }
         if self.backstage {
             self.backstage_back(window, cx);
         }
         if self.harness {
-            self.open_print_dialog(print::harness_printers(), cx);
-            return;
+            let active = self.active;
+            if let Some(tab) = self.tabs.get_mut(active) {
+                printers_arrived(tab, print::harness_printers(), true);
+            }
+            return cx.notify();
         }
         self.set_status(print::LOOKING);
         let id = self.active_tab_id();
@@ -59,38 +62,29 @@ impl Docxy {
                 let _ = tx.send(print::discover());
             });
         if spawned.is_err() {
-            return self.open_print_dialog(Vec::new(), cx);
+            let active = self.active;
+            if let Some(tab) = self.tabs.get_mut(active) {
+                printers_arrived(tab, Vec::new(), true);
+            }
+            return cx.notify();
         }
         cx.spawn_in(window, async move |this, cx| {
             let printers = rx.recv_async().await.unwrap_or_default();
             let _ = this.update_in(cx, |this, _, cx| {
-                if this.active_tab_is(&id) {
-                    this.open_print_dialog(printers, cx);
+                // The tab that asked, wherever it is now: in front it gets
+                // the dialog; behind, its status only stops looking.
+                let front = this.active_tab_is(&id);
+                let asked = this
+                    .tabs
+                    .iter()
+                    .position(|t| Some((t.title.clone(), t.path.clone())) == id);
+                if let Some(tab) = asked.and_then(|i| this.tabs.get_mut(i)) {
+                    printers_arrived(tab, printers, front);
                 }
+                cx.notify();
             });
         })
         .detach();
-    }
-
-    fn open_print_dialog(&mut self, printers: Vec<PrinterInfo>, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get_mut(self.active) else {
-            return;
-        };
-        let Surface::Pdf(v) = &mut tab.surface else {
-            return;
-        };
-        if v.lock.is_some() || tab.dialogs.top().is_some() {
-            return;
-        }
-        let facts = ViewFacts::of(v);
-        let mut d = print::print_dialog(&facts, &printers);
-        d.focus_on_open();
-        v.printers = printers;
-        tab.dialogs.push(d);
-        if tab.status.as_ref() == print::LOOKING {
-            tab.status = SharedString::default();
-        }
-        cx.notify();
     }
 
     /// File > Export's two choices on a PDF tab (#2258): their dialog.
@@ -104,7 +98,7 @@ impl Docxy {
             return self.refocus(window, cx);
         };
         if let Some(why) = print::refusal(&facts, what) {
-            self.set_status(capital(why));
+            self.set_status(print::capitalised(why));
             return self.refocus(window, cx);
         }
         if self.backstage {
@@ -113,11 +107,10 @@ impl Docxy {
         let Some(tab) = self.tabs.get_mut(self.active) else {
             return;
         };
-        let mut d = match what {
+        let d = match what {
             Output::Png => print::png_dialog(),
             _ => print::pdf_dialog(),
         };
-        d.focus_on_open();
         tab.dialogs.push(d);
         cx.notify();
     }
@@ -211,13 +204,13 @@ impl Docxy {
         let Some(tab) = self.tabs.get(self.active) else {
             return;
         };
-        let (filter, ext) = match export {
-            Export::Png { .. } => ("PNG picture", "png"),
-            Export::Pdf { .. } => ("PDF", "pdf"),
+        let filter = match export {
+            Export::Png { .. } => "PNG picture",
+            Export::Pdf { .. } => "PDF",
         };
         let name = print::export_name(&tab.title, &export);
         let mut dialog = rfd::FileDialog::new()
-            .add_filter(filter, &[ext])
+            .add_filter(filter, &[export.extension()])
             .set_file_name(name);
         if let Some(dir) = tab.path.as_deref().and_then(std::path::Path::parent) {
             dialog = dialog.set_directory(dir);
@@ -230,7 +223,9 @@ impl Docxy {
                 let Some(target) = target.filter(|_| this.active_tab_is(&id)) else {
                     return this.refocus(window, cx);
                 };
-                if let Err(why) = this.pdf_export_to(export, target) {
+                let sent = print::picked_export_target(target, &export)
+                    .and_then(|target| this.pdf_export_to(export, target));
+                if let Err(why) = sent {
                     this.set_status(why);
                 }
                 this.refocus(window, cx);
@@ -240,15 +235,14 @@ impl Docxy {
         );
     }
 
-    /// Hand an export to the active view's worker, to `target` (the Save
-    /// dialog's answer, or a harness's `save-as`): the path the export
-    /// writes, or why not.
+    /// Hand an export to the active view's worker, to `target`, which the
+    /// caller checked (`print::export_target`): the path the export writes,
+    /// or why not.
     pub(crate) fn pdf_export_to(
         &mut self,
         export: Export,
         target: std::path::PathBuf,
     ) -> Result<std::path::PathBuf, String> {
-        let target = print::export_target(target, &export)?;
         let tab = self.tabs.get_mut(self.active).ok_or(PDF_NOT_OPEN_OUTPUT)?;
         let Surface::Pdf(v) = &mut tab.surface else {
             return Err(PDF_NOT_OPEN_OUTPUT.into());
@@ -335,9 +329,22 @@ impl Docxy {
     }
 }
 
-fn capital(s: &str) -> String {
-    let mut c = s.chars();
-    c.next()
-        .map(|f| f.to_uppercase().chain(c).collect())
-        .unwrap_or_default()
+/// The printers listed for `tab`'s Print (#2258 r1): in front (`front`),
+/// its view open and no dialog on it, the Print dialog opens with them; in
+/// every case its status stops saying it is looking for printers. Whether
+/// the dialog opened.
+pub(crate) fn printers_arrived(tab: &mut DocTab, printers: Vec<PrinterInfo>, front: bool) -> bool {
+    if tab.status.as_ref() == print::LOOKING {
+        tab.status = SharedString::default();
+    }
+    let Surface::Pdf(v) = &mut tab.surface else {
+        return false;
+    };
+    if !front || v.lock.is_some() || tab.dialogs.top().is_some() {
+        return false;
+    }
+    let d = print::print_dialog(&ViewFacts::of(v), &printers);
+    v.printers = printers;
+    tab.dialogs.push(d);
+    true
 }

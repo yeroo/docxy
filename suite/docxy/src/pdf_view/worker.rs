@@ -10,12 +10,12 @@
 //! skips anything before it (a test binary run as the child prints its own
 //! lines first). The child reads its file once and keeps one
 //! `PageRenderer`; it ends at the end of its input (the suite closed it, or
-//! died), or by its own watchdog when one request runs past twice its
+//! died), or by its own watchdog when one request runs past twice its own
 //! timeout (a spin the suite can no longer kill).
 //!
 //! The parent's [`Worker`] asks one question at a time and waits at most
-//! its timeout; past it, or when the child dies or answers nonsense, the
-//! child is killed and the next question starts a new one. [`Engine`] runs a
+//! that question's own timeout ([`Op::timeout`]); past it, or when the child
+//! dies or answers nonsense, the child is killed and the next question starts a new one. [`Engine`] runs a
 //! worker on a thread of its own, so the UI thread never waits on a page.
 //! Unit tests and `DOCXY_CONVERT_IN_PROCESS=1` serve in this process over a
 //! pipe pair ([`Spawn::InProcess`]): the same [`serve`] code, no isolation.
@@ -263,6 +263,16 @@ pub(crate) enum Export {
     Png { pages: Vec<usize>, dpi: f64 },
     /// The pages as one new PDF.
     Pdf { pages: Vec<usize> },
+}
+
+impl Export {
+    /// The extension its file takes: `png` or `pdf`.
+    pub(crate) fn extension(&self) -> &'static str {
+        match self {
+            Export::Png { .. } => "png",
+            Export::Pdf { .. } => "pdf",
+        }
+    }
 }
 
 /// What an export wrote.
@@ -673,7 +683,8 @@ pub(crate) fn child_main(args: &[OsString]) -> Option<i32> {
 }
 
 /// Serve `path` on this process's stdin and stdout, under a watchdog that
-/// ends the process when one request runs past twice `timeout`. `before`
+/// ends the process when one request runs past twice its own timeout
+/// ([`Op::timeout`] of `timeout`). `before`
 /// sees each request first (the tests' misbehaving children).
 pub(crate) fn run(path: &Path, timeout: Duration, before: impl FnMut(&Op)) -> i32 {
     first_to_go();
@@ -915,6 +926,12 @@ fn flatten(items: &[pdfcraft_render::OutlineItem], depth: usize, out: &mut Vec<B
 /// Pages are drawn over white, so alpha is 255 and only red and blue swap;
 /// a pixel with less is un-premultiplied too.
 pub(crate) fn straight_bgra(rgba: &[u8]) -> Vec<u8> {
+    straight(rgba, true)
+}
+
+/// Premultiplied RGBA as straight RGBA (`bgr` false: a PNG's order) or
+/// straight BGRA (`bgr` true).
+pub(crate) fn straight(rgba: &[u8], bgr: bool) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
     for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
         let un = |c: u8| match a {
@@ -922,7 +939,11 @@ pub(crate) fn straight_bgra(rgba: &[u8]) -> Vec<u8> {
             0 => 0,
             a => ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8,
         };
-        out.extend_from_slice(&[un(b), un(g), un(r), a]);
+        if bgr {
+            out.extend_from_slice(&[un(b), un(g), un(r), a]);
+        } else {
+            out.extend_from_slice(&[un(r), un(g), un(b), a]);
+        }
     }
     out
 }
@@ -1228,40 +1249,58 @@ impl Worker {
 
     /// Export to `path` (#2258): the child draws each page's PNG (each its
     /// own request and timeout) or makes the pages' PDF, and this writes
-    /// them. Nothing is written unless every file is: each goes to a
-    /// temporary name beside its own first, and they are renamed when all
-    /// are in. A PNG export of several pages refuses when a name it would
-    /// write, other than the one picked (whose replacing the dialog
-    /// confirmed), exists already.
+    /// them, every file or none ([`Staged`]): each answer goes to a
+    /// temporary file beside its name as it comes, so only paths are held
+    /// here, and they are moved into place when all are in. A page asked
+    /// twice is written once. A PNG export of several pages refuses when a
+    /// name it would write, other than the one picked (whose replacing the
+    /// dialog confirmed), exists already; no export replaces the PDF this
+    /// view reads.
     fn export_to(&mut self, export: &Export, path: &Path) -> Answer {
-        let (files, dpi_used) = match export {
+        if opccore::fsio::same_file(path, &self.path) {
+            return Answer::Failed(EXPORT_OVER_ITSELF.into());
+        }
+        let mut staged = Staged::default();
+        let stage = |staged: &mut Staged, name: &Path, bytes: &[u8]| {
+            staged
+                .add(name, bytes)
+                .map_err(|e| format!("the file could not be written: {e}"))
+        };
+        let dpi_used = match export {
             Export::Pdf { pages } => {
                 let op = Op::ExtractPages {
                     pages: pages.clone(),
                 };
                 match self.ask(&op) {
-                    Answer::Bytes(pdf) => (vec![(path.to_path_buf(), pdf)], None),
+                    Answer::Bytes(pdf) => {
+                        if let Err(why) = stage(&mut staged, path, &pdf) {
+                            return Answer::Failed(why);
+                        }
+                    }
                     Answer::Failed(why) => return Answer::Failed(why),
                     _ => return Answer::Failed(DIED.into()),
                 }
+                None
             }
             Export::Png { pages, dpi } => {
-                let names = png_names(path, pages);
+                let pages = distinct(pages);
+                let names = png_names(path, &pages);
                 if let Some(taken) = names.iter().find(|n| n.as_path() != path && n.exists()) {
                     return Answer::Failed(format!(
                         "{} already exists, so nothing was written: choose another name",
                         taken.display()
                     ));
                 }
-                let mut files = Vec::with_capacity(pages.len());
                 let mut used: Option<f64> = None;
-                for (&page, name) in pages.iter().zip(names) {
+                for (&page, name) in pages.iter().zip(&names) {
                     match self.ask(&Op::Png { page, dpi: *dpi }) {
                         Answer::Png { png, dpi: drawn } => {
                             if drawn + 0.5 < *dpi {
                                 used = Some(used.map_or(drawn, |u| u.min(drawn)));
                             }
-                            files.push((name, png));
+                            if let Err(why) = stage(&mut staged, name, &png) {
+                                return Answer::Failed(why);
+                            }
                         }
                         Answer::Failed(why) => {
                             return Answer::Failed(format!("page {}: {why}", page + 1));
@@ -1269,14 +1308,11 @@ impl Worker {
                         _ => return Answer::Failed(DIED.into()),
                     }
                 }
-                (files, used)
+                used
             }
         };
-        match write_all_or_none(&files) {
-            Ok(()) => Answer::Exported(Exported {
-                files: files.into_iter().map(|(p, _)| p).collect(),
-                dpi_used,
-            }),
+        match staged.commit() {
+            Ok(files) => Answer::Exported(Exported { files, dpi_used }),
             Err(e) => Answer::Failed(format!("the file could not be written: {e}")),
         }
     }
@@ -1419,38 +1455,106 @@ pub(crate) fn png_names(path: &Path, pages: &[usize]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Write every `(path, bytes)` or none (#2258): each to a temporary name
-/// beside it, then each renamed onto its own; a failure removes the
-/// temporary files, and the files already there stay as they were.
-fn write_all_or_none(files: &[(PathBuf, Vec<u8>)]) -> std::io::Result<()> {
-    let temp = |p: &Path| {
-        let mut name = std::ffi::OsString::from(".");
-        name.push(p.file_name().unwrap_or_default());
-        name.push(format!(".{}.part", std::process::id()));
-        p.with_file_name(name)
-    };
-    let mut written = Vec::with_capacity(files.len());
-    let result = files.iter().try_for_each(|(path, bytes)| {
-        let t = temp(path);
-        std::fs::write(&t, bytes)?;
-        written.push(t);
-        Ok(())
-    });
-    if let Err(e) = result {
-        for t in &written {
-            let _ = std::fs::remove_file(t);
+/// `pages` without repeats, the first of each kept in its place (#2258):
+/// a range may name a page twice ("1-3, 2"), and a page is one picture.
+pub(crate) fn distinct(pages: &[usize]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    pages.iter().copied().filter(|p| seen.insert(*p)).collect()
+}
+
+/// What an export over the PDF the view reads says (#2258).
+pub(crate) const EXPORT_OVER_ITSELF: &str =
+    "an export cannot replace the PDF that is open: choose another name";
+
+/// The files an export writes, every one or none (#2258). [`Staged::add`]
+/// writes and syncs each to a temporary name beside its own (`.<name>.<pid>
+/// .part`); [`Staged::commit`] moves each into place, a file already at its
+/// name moved aside first (`.<name>.<pid>.old`), and on any failure puts
+/// back every name it had done, the files that were there included. The
+/// temporary files go when it is dropped, committed or not. A file's own
+/// permissions are not carried over to its replacement.
+#[derive(Default)]
+pub(crate) struct Staged {
+    /// Each file's name and its temporary one.
+    files: Vec<(PathBuf, PathBuf)>,
+}
+
+fn sibling(path: &Path, what: &str) -> PathBuf {
+    let mut name = std::ffi::OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".{}.{what}", std::process::id()));
+    path.with_file_name(name)
+}
+
+impl Staged {
+    /// Write `bytes` for `path`, to its temporary file. The same `path` twice
+    /// is refused: the second would overwrite the first's temporary file.
+    pub(crate) fn add(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        if self.files.iter().any(|(p, _)| p == path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} would be written twice", path.display()),
+            ));
         }
-        return Err(e);
+        let temp = sibling(path, "part");
+        // Listed first, so a write that fails halfway is removed too.
+        self.files.push((path.to_path_buf(), temp.clone()));
+        let mut f = std::fs::File::create(&temp)?;
+        f.write_all(bytes)?;
+        f.sync_all()
     }
-    for (path, _) in files {
-        if let Err(e) = std::fs::rename(temp(path), path) {
-            for (p, _) in files {
-                let _ = std::fs::remove_file(temp(p));
+
+    /// Move every file into place, or none: the names written.
+    pub(crate) fn commit(self) -> std::io::Result<Vec<PathBuf>> {
+        // Each name done, and where the file that was there went.
+        let mut done: Vec<(&Path, Option<PathBuf>)> = Vec::with_capacity(self.files.len());
+        for (path, temp) in &self.files {
+            let step = (|| {
+                let aside = if path.is_file() {
+                    let old = sibling(path, "old");
+                    std::fs::rename(path, &old)?;
+                    Some(old)
+                } else {
+                    None
+                };
+                match std::fs::rename(temp, path) {
+                    Ok(()) => Ok(aside),
+                    Err(e) => {
+                        if let Some(old) = &aside {
+                            let _ = std::fs::rename(old, path);
+                        }
+                        Err(e)
+                    }
+                }
+            })();
+            match step {
+                Ok(aside) => done.push((path, aside)),
+                Err(e) => {
+                    for (path, aside) in done.iter().rev() {
+                        let _ = std::fs::remove_file(path);
+                        if let Some(old) = aside {
+                            let _ = std::fs::rename(old, path);
+                        }
+                    }
+                    return Err(e);
+                }
             }
-            return Err(e);
+        }
+        for (_, aside) in &done {
+            if let Some(old) = aside {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+        Ok(self.files.iter().map(|(p, _)| p.clone()).collect())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        for (_, temp) in &self.files {
+            let _ = std::fs::remove_file(temp);
         }
     }
-    Ok(())
 }
 
 fn kill(slot: &Slot) {

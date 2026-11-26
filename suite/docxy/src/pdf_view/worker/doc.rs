@@ -798,15 +798,7 @@ fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     if w == 0 || h == 0 || rgba.len() != w as usize * h as usize * 4 {
         return Err("the page drew nothing".into());
     }
-    let mut straight = Vec::with_capacity(rgba.len());
-    for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
-        let un = |c: u8| match a {
-            255 => c,
-            0 => 0,
-            a => ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8,
-        };
-        straight.extend_from_slice(&[un(r), un(g), un(b), a]);
-    }
+    let straight = super::straight(rgba, false);
     let mut out = Vec::new();
     image::ImageEncoder::write_image(
         image::codecs::png::PngEncoder::new(&mut out),

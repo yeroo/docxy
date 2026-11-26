@@ -79,7 +79,11 @@ test issue 2258 File > Export saves pages as PNG pictures and as a PDF
   assert dialog is none
   call pdf-read {}
   assert reply.export_waiting is png
-  call save-as {"path":"pictures.png"}
+  # A name of another type is refused, and the export still waits.
+  call-error save-as {"path":"pictures.pdf"} => These pages are saved as a .png file, not .pdf: choose a name that ends in .png
+  call pdf-read {}
+  assert reply.export_waiting is png
+  call save-as {"path":"pictures"}
   call pdf-read {"until_idle":true}
   assert reply.exported.0 is pictures_Page_1.png
   assert reply.exported.1 is pictures_Page_3.png
