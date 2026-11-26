@@ -624,6 +624,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "docxy-integration"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "projcore",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "editcore"
 version = "0.1.0"
 
@@ -1111,6 +1121,10 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "integration_fixture"
+version = "0.0.0"
 
 [[package]]
 name = "itertools"
