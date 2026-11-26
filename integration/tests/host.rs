@@ -91,6 +91,13 @@ fn calls(dir: &Path) -> Vec<(String, u64)> {
         .collect()
 }
 
+fn inits(dir: &Path) -> usize {
+    std::fs::read_to_string(dir.join("fixture-inits"))
+        .unwrap_or_default()
+        .lines()
+        .count()
+}
+
 fn methods(dir: &Path) -> Vec<String> {
     calls(dir).into_iter().map(|(method, _)| method).collect()
 }
@@ -258,6 +265,7 @@ fn an_interface_version_outside_the_range_is_refused() {
             format!("Integration plugin {file} not loaded: {why}")
         );
         assert_eq!(plugin.branding(App::Suite), None);
+        assert_eq!(inits(&dir), 0);
         assert!(calls(&dir).is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -271,6 +279,7 @@ fn a_library_without_a_required_symbol_is_refused() {
         refusal(&plugin).1,
         "not an integration plugin: it has no dxi_call"
     );
+    assert_eq!(inits(&dir), 0);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -282,17 +291,30 @@ fn a_plugin_that_refuses_the_host_is_not_used() {
         refusal(&plugin).1,
         "it refused this host: the fixture refuses this host"
     );
+    assert_eq!(inits(&dir), 1);
     assert_eq!(plugin.sign_in(App::Mail), None);
     assert!(calls(&dir).is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
+fn a_plugin_that_starts_too_slowly_is_refused() {
+    let dir = plugin_folder("slow-init", Some("slow-init 2000"));
+    let mut config = config(App::Suite);
+    config.deadlines.init = Duration::from_millis(200);
+    let plugin = load_from(&dir, &config);
+    assert_eq!(refusal(&plugin).1, "it did not start within 0.2 s");
+    assert_eq!(plugin.branding(App::Suite), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn a_call_past_its_deadline_stops_the_plugin_for_the_run() {
-    let dir = plugin_folder("slow", Some("slow 3000"));
+    let dir = plugin_folder("slow", Some("slow 1500"));
     let mut config = config(App::Suite);
     config.deadlines.call = Duration::from_millis(200);
     let plugin = load_from(&dir, &config);
+    let started = std::time::Instant::now();
     assert_eq!(plugin.branding(App::Suite), None);
     let (file, why) = refusal(&plugin);
     assert_eq!(file, fixture_file());
@@ -308,6 +330,8 @@ fn a_call_past_its_deadline_stops_the_plugin_for_the_run() {
         plugin.token(&token_request()),
         TokenAnswer::Unavailable { .. }
     ));
+    // Once the slow call has ended, a call queued behind it would run.
+    std::thread::sleep(Duration::from_millis(2_000).saturating_sub(started.elapsed()));
     assert_eq!(methods(&dir), ["branding"]);
     let _ = std::fs::remove_dir_all(dir);
 }

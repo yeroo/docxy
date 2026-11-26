@@ -5,12 +5,13 @@
 //! - `abi0`, `abi-above`: interface version 0, or one above this build's;
 //! - `init-refuses`: `dxi_init` refuses the host;
 //! - `slow <ms>`: each `dxi_call` sleeps that long first;
+//! - `slow-init <ms>`: `dxi_init` sleeps that long first;
 //! - `interaction`: `token` answers `interaction_required`;
 //! - `panic`: each `dxi_call` panics, caught as INTERNAL_ERROR;
 //! - `only-branding`: `dxi_init` offers `branding` alone.
 //!
 //! Each `dxi_call` appends `<method> <OS thread id>` to `fixture-calls`
-//! beside the library.
+//! beside the library, and each `dxi_init` a line to `fixture-inits`.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::path::PathBuf;
@@ -159,6 +160,23 @@ fn mode() -> Vec<String> {
     }
 }
 
+fn append(log: &std::path::Path, line: &str) {
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+/// Sleep for the mode's second word, in milliseconds.
+fn sleep_ms(mode: &[String]) {
+    let ms = mode.get(1).and_then(|m| m.parse().ok()).unwrap_or(2_000);
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
 fn is(mode: &[String], word: &str) -> bool {
     mode.first().is_some_and(|m| m == word)
 }
@@ -180,6 +198,12 @@ pub extern "C" fn dxi_abi() -> u32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dxi_init(_host: *const u8, _len: usize, out: *mut DxiBuf) -> i32 {
     let mode = mode();
+    if let Some(log) = beside("fixture-inits") {
+        append(&log, "init");
+    }
+    if is(&mode, "slow-init") {
+        sleep_ms(&mode);
+    }
     if is(&mode, "init-refuses") {
         return fail(NOT_CONFIGURED, "the fixture refuses this host");
     }
@@ -212,14 +236,7 @@ pub unsafe extern "C" fn dxi_call(
     let request = unsafe { std::slice::from_raw_parts(request, len) };
     let request = String::from_utf8_lossy(request).into_owned();
     if let Some(log) = beside("fixture-calls") {
-        use std::io::Write as _;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(log)
-        {
-            let _ = writeln!(file, "{method} {}", os_thread_id());
-        }
+        append(&log, &format!("{method} {}", os_thread_id()));
     }
     let mode = mode();
     let answered = std::panic::catch_unwind(|| answer(&mode, &method, &request));
@@ -236,8 +253,7 @@ pub unsafe extern "C" fn dxi_call(
 
 fn answer(mode: &[String], method: &str, request: &str) -> Result<String, (i32, String)> {
     if is(mode, "slow") {
-        let ms = mode.get(1).and_then(|m| m.parse().ok()).unwrap_or(2_000);
-        std::thread::sleep(std::time::Duration::from_millis(ms));
+        sleep_ms(mode);
     }
     if is(mode, "panic") {
         panic!("the fixture panics on purpose");
