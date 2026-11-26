@@ -384,7 +384,14 @@ with its layout (#2257); printing and exporting it as drawn (#2258).
   `png {page, dpi}` and `extract-pages {pages}` (bytes after the line);
   the parent's `Op::ExportTo {export, path}` asks the child per page
   (each PNG its own request and timeout) and writes every file or none
-  (`write_all_or_none`: temporary names beside them, then renames).
+  (`Staged`, r1: each answer written and synced to `.<name>.<pid>.part`
+  as it comes, so the suite holds paths, not pictures; `commit` moves a
+  file already at a name aside to `.<name>.<pid>.old`, renames, and on
+  any failure puts every done name back; the temporary files go on drop;
+  the same name twice is refused). A page named twice is one picture
+  (`distinct`, where the export is built). No export replaces the PDF the
+  view reads (`EXPORT_OVER_ITSELF`, `fsio::same_file`). A replaced file's
+  own permissions are not carried over.
   `Op::timeout`: print and extract get `JOB_FACTOR` (3) × the child's
   timeout, in the parent's `exchange` and in the child's watchdog
   (`Busy` holds each request's limit, twice it). A print or export goes
@@ -417,8 +424,10 @@ with its layout (#2257); printing and exporting it as drawn (#2258).
   (`bs-pdf-export`, the `bs_export` page drawn by `pdf_export_page` on a
   PDF tab) has tiles `pdf-export-png` / `pdf-export-pdf` (probes), each a
   dialog (`pdf-export-png`: pages, 72/150/300/600 dpi; `pdf-export-pdf`)
-  then the native Save dialog (`export_target`: the extension added, any
-  other refused). PNG names: one page the name picked, several
+  then the native Save dialog (`with_extension`, shared with Save As's
+  `pdf_save_as_target`: the extension added, any other refused;
+  `picked_export_target` refuses a name the extension was added to that
+  is a file already). PNG names: one page the name picked, several
   `<stem>_Page_<n>.png` zero-padded to the highest page's digits
   (`png_names`); one of those taken (but the picked one) refuses all.
   The rail filter has `pdf_only` (`backstage_rail_items(project, doc,
@@ -430,7 +439,9 @@ with its layout (#2257); printing and exporting it as drawn (#2258).
   JSON and `jobs`), `export_waiting` and `exported` (the last export's
   file names). An export's Save dialog is the `save-as` verb: Save… keeps
   the export on the view (`export_waiting`), and `save-as` on that tab
-  writes it instead of a Save As (one queued export, one path).
+  writes it instead of a Save As (one queued export, one path); a name it
+  refuses keeps the export waiting. `printers_arrived` opens the dialog
+  only on the tab in front and clears "Looking for printers…" either way.
   `uiharness/cases/pdf-print.uit`.
 - Tests (`pdf_view/print_tests.rs`): sheets' size per paper and
   orientation, the order chosen, sizing measured on the sheet as drawn
