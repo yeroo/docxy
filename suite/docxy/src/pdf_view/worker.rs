@@ -554,8 +554,11 @@ fn first_to_go() {
 /// the page with why. `RLIMIT_DATA`, not `RLIMIT_AS`: glibc's per-thread
 /// arenas reserve address space they never use, which an address-space
 /// limit counts. No core is written for that abort (`RLIMIT_CORE` 0).
-/// Only here, in the child's own `run`: never in [`serve`], which also runs
-/// in the suite's process ([`Spawn::InProcess`]).
+/// Only ever in a child process: the worker's own `run`, and
+/// `convert_child::child_main` for a PDF conversion (#2257, whose parent
+/// retries a child that died by the PDF's text). Never in [`serve`], which
+/// also runs in the suite's process ([`Spawn::InProcess`]), nor anywhere
+/// else in the suite's process.
 pub(crate) fn limit_memory() {
     #[cfg(target_os = "linux")]
     {

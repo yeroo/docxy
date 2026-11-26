@@ -81,6 +81,13 @@ pdfcraft-annot = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51f
 pdfcraft-cos = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 pdfcraft-forms = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 pdfcraft-model = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+# Convert to editable document with the layout (#2257), in the converting
+# child only (pdf_view/convert.rs): a page's paragraphs, pictures, ruled
+# lines and background (`-edit`), a picture's PNG or JPEG bytes (`-create`)
+# and the Word document made of them (`-export`). Same rev.
+pdfcraft-create = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-edit = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-export = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 # A PDF's password (#2256), cleared from memory when the view lets go of
 # it (pdf_view/worker.rs `Secret`). In the lock through craft-pdf.
 zeroize = "1.9"

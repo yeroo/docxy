@@ -29,6 +29,7 @@ committed and never run the tools.
 | `damaged-noxref.pdf` | 1 (A4) | The objects only: no xref table, trailer or `startxref`. |
 | `damaged-truncated.pdf` | 1 (A4) | Cut in the middle of its last object (the `/Info` dictionary): no xref or trailer, every page object whole. |
 | `damaged-unreadable.pdf` | - | A `%PDF-` header and 4 KB of bytes no reader can use (no object, no xref): it says why it cannot be opened. |
+| `convert.pdf` | 3 (Letter) | Convert to editable document (#2257), written by hand in the base-14 fonts (not embedded): every page the same running header ("Annual Field Notes") and a "Page N of 3" footer; page 1 a title, two paragraphs (one red word) around a Flate RGB picture, and a ruled 3 x 3 table; page 2 a heading across the page over two columns of lines; page 3 a paragraph and three Courier lines. |
 
 The passwords are made up for the corpus. Every encrypted file restricts
 printing, copying and changes (`/P -32`) to its user password; its owner
@@ -44,7 +45,7 @@ files.
 `ref/<name>-<page>.png` is `pdftoppm -r 72 -png` of each page: one pixel per
 point, what the test draws at scale 1 (of the slice 2 files, `annots` only;
 the others are checked by what they hold; every slice 3 file but
-`damaged-unreadable`). The comparison and its tolerance are
+`damaged-unreadable`; not `convert`, checked by what it converts to). The comparison and its tolerance are
 in `suite/docxy/src/pdf_view/tests.rs` (`differing`).
 
 ## How it was made
@@ -77,6 +78,12 @@ in `suite/docxy/src/pdf_view/tests.rs` (`differing`).
   enc-aes-128 enc-aes-256 enc-owner-only incremental objstm
   damaged-offsets damaged-noxref damaged-truncated damaged-unreadable`
   writes only them, byte for byte the same.
+- `convert.pdf` (#2257) is written by `RawPdf` too: its columns are lines
+  side by side at the same baselines (the layout PdfCraft's export takes
+  for a table), and its picture a zlib-compressed RGB image. poppler reads
+  its text back as it is made (`pdftotext`). `python3
+  scripts/make-pdf-view-corpus.py convert` writes only it, byte for byte
+  the same.
 
 ## Not here yet
 

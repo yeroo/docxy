@@ -585,8 +585,9 @@ pub(crate) const CORPUS: [&str; 8] = [
 ];
 
 /// The slice 2 files without a reference rendering (#2255): checked by what
-/// they hold (`form_tests`), and in the mutation test.
-pub(crate) const UNREFERENCED: [&str; 4] = ["links", "annots-noap", "forms", "signed"];
+/// they hold (`form_tests`), and in the mutation test; and slice 4's
+/// `convert` (#2257), checked by what it converts to (`convert/tests.rs`).
+pub(crate) const UNREFERENCED: [&str; 5] = ["links", "annots-noap", "forms", "signed", "convert"];
 
 /// The slice 3 files (#2256), each with a reference rendering: encrypted,
 /// an incremental update, object and cross-reference streams, damaged.

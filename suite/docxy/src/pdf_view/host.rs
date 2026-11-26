@@ -1104,8 +1104,9 @@ impl Docxy {
         });
     }
 
-    /// Convert to editable document: today's conversion of the PDF
-    /// (#633), as a new document tab after the view. A view from a
+    /// Convert to editable document: the PDF converted with its layout
+    /// (#2257, `pdf_view/convert.rs`; the text importer of #633 when that
+    /// fails), as a new document tab after the view. A view from a
     /// protected zone gives a Protected View tab, as opening the file would.
     pub(crate) fn pdf_convert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.tabs.get(self.active) else {

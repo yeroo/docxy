@@ -2,7 +2,8 @@
 
 Notes for the suite's PDF view: opening a PDF as it looks; its links,
 comments and form, the only thing it writes back (#2255); encrypted,
-updated and damaged files (#2256).
+updated and damaged files (#2256); converting it to an editable document
+with its layout (#2257).
 
 ## PDF view: the renderer and its patch table (#2245)
 
@@ -25,7 +26,13 @@ updated and damaged files (#2256).
   `/Annots`, for Hidden flags), same rev; they bring `-content`, nothing to
   patch. `stream_limited` is `pub(crate)` in craft-pdf, so `incremental` in
   `info` reads the public `reconstructed`, `encryption_changed` and
-  `full_save_required` only. Not used yet: `-crypt`, `-print`, `-export`.
+  `full_save_required` only. Not used yet: `-crypt`, `-print`.
+- Slice 4 (#2257) adds `-edit`, `-create` and `-export`, same rev, for the
+  conversion; no patch entry (their craft-libs crates are git
+  dependencies, PdfCraft's root patches crates.io only). `-edit`'s
+  `icu_segmenter` 2.3 moved the lock's icu family from 2.2 to 2.4 (gpui's
+  `url` shares it); `-create` brings `jpeg-encoder` (IJG, credited in
+  NOTICE).
 
 ## PDF view: the worker child (#2245)
 
@@ -260,3 +267,99 @@ updated and damaged files (#2256).
   from the file before its damage. The mutation test adds them (encrypted
   ones unlocked) and `structural` mutations; `a_flate_bomb_answers_in_time`
   makes its bombs in the test (`zero_bomb`).
+
+## PDF view: convert to an editable document with the layout (#2257)
+
+- `pdf_view/convert.rs`, run by the converting child's `What::Pdf`
+  (`convert_child::convert_bytes`; the child sets the worker's
+  `limit_memory` for a PDF): `read_pages` builds `pdfcraft_export::Page`s
+  as `pdfcraft-engine`'s `export_pages_within` does (the engine crate is
+  not used: it brings JS, OCR and signing), copying the engine's
+  `pub(crate)` `weight_and_slant` and `display_unit`; pictures through
+  one `ImageBudget`, within `docxcore::import::html_image`'s
+  `MAX_IMAGE_BYTES`/`MAX_MEDIA_BYTES` (the suite loads the result).
+  `docx_with_language` writes the document; it is loaded with
+  `load_package` and becomes `ConvertedDoc { doc, base: Some(pkg) }`.
+- `convert_with` runs that step in `catch_unwind`: an error, a panic or a
+  file that keeps nothing (no text, no picture: a blank PDF stays a `load
+  error`) goes to the text importer (`import_pdf`, #951), whose encrypted
+  message covers a file that needs its password (the convert child has
+  none; an owner-only file converts). Tests inject the step.
+- Time and memory (r1, r2): the layout step's `Limits` from its start.
+  Reading (after `inspect`, each page, each picture, before the export)
+  stops at `READ_TIME` (8 s); the export and its loading are checked after
+  each against `DONE_TIME` (12 s); more than `MAX_LAYOUT_BLOCKS` (20,000)
+  text blocks stops it at once. Each gives an `Err` and the text importer
+  runs in the same child. Measured in release on this laptop: 300 pages of
+  text read in 0.5 s, 600 in 1.6 s (reading grows faster than the pages;
+  the export, load and save of those under 0.2 s); 300 pages of table
+  cells (86,700 blocks) export in 0.3 s, load in 7.0 s, save in 0.6 s,
+  about 0.1 ms a block, so the cap keeps that to about 2.3 s; the text
+  importer took 0.2 s on each. Not bounded: one page or one `inspect` that
+  alone runs past the 20 s (PdfCraft's own decode budgets bound them), and
+  the work after `DONE_TIME`'s last check (the passes and the child's
+  save, about 0.1 s for 20,000 blocks). Then the parent kills the child,
+  and the tab says it took too long; that is not retried, as the suite
+  waits on its UI thread. An abort (an allocation past `limit_memory`'s
+  `RLIMIT_DATA`, which `catch_unwind` cannot reach) kills the child: the
+  parent (`convert_child::convert`, `retrying`) tries a PDF whose child
+  died (`DIED`) once more as `What::PdfText` (`--convert-import
+  pdf-text`, `import_pdf` alone, no limit set), within what is left of
+  the same `TIMEOUT` (none under `RETRY_MIN`, 1 s).
+- Running headers and footers (`convert/running.rs`), on the pages before
+  the export: an unrotated block wholly in the top or bottom 12 % whose
+  text, with digit runs as `#`, repeats on at least 2 and more than half
+  the pages, middles within 6 pt and an edge (left, centre, right) within
+  12 pt, and each digit run the same on every page, each page's number or
+  the page count (a date cell, an amount or a count not starting at 1
+  stays in the body). Removed from every page; the first page's pieces
+  become a header and a footer part (Header/Footer style, centre and
+  right tab stops of the text width, hand-written run XML in schema
+  order), referenced from
+  the first section only; digit runs that are each page's number are
+  `PAGE`, the page count `NUMPAGES`. No running piece on page 1 of 3 or
+  more pages: `w:titlePg` with empty first-page parts. `pgMar
+  w:header/w:footer` from the pieces' positions.
+- Columns (`convert/columns.rs`): PdfCraft flows every page as one column,
+  and takes lines side by side at shared baselines for a table (its
+  `tables()` clusters short blocks' left edges). So a page in 2 or 3
+  equal columns (gutters at least `max(12 pt, body)` in the middle 80 %;
+  each band a fifth of the text height and half filled; no rule in the
+  region) is split before the export into **virtual pages**: the band
+  above (the real page's size), then the region with its columns stacked
+  on a page whose PdfCraft text area (`min(w/8, 1 in)` margins) is one
+  column wide. One section per virtual page comes out; the region's gets
+  `w:cols`, a continuous start and the real page's `pgSz`/`pgMar` back.
+  Where a column begins is its highest block or picture; a block above
+  where every column has begun is lifted into the band (a heading over
+  the first column; from another column only when the band's own text is
+  over it), never a column's last block.
+  The export sizes headings against each virtual page, so a band's
+  paragraphs get their level again against the real page's body
+  (`heading_level`, PdfCraft's `level` rule). A positioned page
+  (`positioned`, copied: rotated text, overlaps), text between column
+  runs, unequal or more columns stay as PdfCraft flows them. The section
+  break is PdfCraft's own 1 pt paragraph.
+- Fonts and colours: `pdfcraft_export::Block` has no font. Each block's
+  colour is replaced by a unique code (`code_color`, 1 to 2^24 - 1, never
+  black) before the export, which only copies colours (`chr`, a cell's
+  colour); after loading, every coded run (body, cells, text boxes,
+  hyperlinks) gets its block's real colour (none for black) and
+  `fonts::family` (PdfCraft's `font_family`, then the base 14 as Word's
+  Arial/Times New Roman/Courier New, DejaVu's installed names). A text
+  box is written twice (DrawingML and a VML `mc:Fallback`) and docxcore
+  saves edited blocks into the first copy only, so `twin_copies` rewrites
+  every identical copy with `blocks_to_xml`. The tests check the saved
+  file's every part for a code colour.
+- Corpus: `convert.pdf` (RawPdf, README there), checked by what it
+  converts to, before and after a save and reload; `columns.pdf`,
+  `scanned.pdf` and `rotated.pdf` (a positioned page) too, and every corpus
+  file converts or says why in time. It is in the worker's mutation test
+  (`UNREFERENCED`).
+- Not done: links as hyperlinks, form values as text, footnotes,
+  even/odd headers, floating pictures, unequal or more than 3 columns,
+  text below columns, fonts by metrics, page numbers that do not start at
+  1 as a field; a page whose forms run past PdfCraft's reading limits, or
+  a picture past the budgets, converts without it and says nothing
+  (`export_pages_within`'s `truncated` is not carried across the child);
+  terminal docxy and wasm (slice 6).
