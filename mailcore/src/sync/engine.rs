@@ -2375,11 +2375,64 @@ pub struct EngineOptions {
     /// first. Off, a type comes only with a delta that carried the class,
     /// a search hit or `FetchMeetingMessage`.
     pub meeting_type_fill: bool,
+    /// The application's name on the browser page a sign-in ends on.
+    /// `None` (the default) keeps the terminal client's pages.
+    pub app_name: Option<&'static str>,
+    /// A source of tokens the engine asks before the browser sign-in.
+    /// `None` (the default) asks none.
+    pub broker: Option<Broker>,
     /// How long a sign-in waits for the browser's redirect (default
     /// [`SIGNIN_TIMEOUT`]): a test's short wait (#2213).
     #[cfg(test)]
     pub signin_timeout: Duration,
 }
+
+/// A token source outside the engine, such as an operating system's
+/// account broker. The engine asks it, on its own thread:
+/// - when it holds no saved token, at start and at a `SignIn`, before the
+///   browser sign-in;
+/// - for a token it gave, near its expiry and on a 401, in place of a
+///   refresh.
+///
+/// A token it gives has no refresh token and is kept in memory only, never
+/// in the token file.
+pub trait TokenBroker {
+    /// A token for `scopes` (space-separated), with no prompt.
+    fn silent(&self, scopes: &str) -> BrokerResult;
+}
+
+/// What a [`TokenBroker`] answers.
+pub enum BrokerResult {
+    Token {
+        access_token: String,
+        expires_at_unix: u64,
+        account: String,
+        /// The scopes the token holds, when the broker knows them.
+        scopes: Option<Vec<String>>,
+    },
+    /// A token only a sign-in the person takes part in can give.
+    InteractionRequired(String),
+    Unavailable(String),
+}
+
+/// The [`TokenBroker`] of [`EngineOptions::broker`]. Two are equal when
+/// they are the same broker.
+#[derive(Clone, Copy)]
+pub struct Broker(pub &'static (dyn TokenBroker + Sync));
+
+impl std::fmt::Debug for Broker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Broker")
+    }
+}
+
+impl PartialEq for Broker {
+    fn eq(&self, other: &Broker) -> bool {
+        std::ptr::addr_eq(self.0, other.0)
+    }
+}
+
+impl Eq for Broker {}
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -2391,6 +2444,8 @@ impl Default for EngineOptions {
             calendar_window: CalendarWindow::default(),
             size_fill: true,
             meeting_type_fill: true,
+            app_name: None,
+            broker: None,
             #[cfg(test)]
             signin_timeout: SIGNIN_TIMEOUT,
         }
@@ -2615,6 +2670,8 @@ struct Engine {
     /// `None` means "not signed in" — the engine has emitted `SignInRequired`
     /// and is waiting for a `SignIn` command.
     token: Option<TokenSet>,
+    /// `token` came from the broker: it is renewed there, never saved.
+    brokered: bool,
     config: EngineConfig,
     evt_tx: Sender<SyncEvent>,
     state: SyncState,
@@ -2922,6 +2979,7 @@ impl Engine {
         Engine {
             store,
             token: None,
+            brokered: false,
             config,
             evt_tx,
             state: SyncState::Idle,
@@ -2993,12 +3051,52 @@ impl Engine {
             }
             // No cache yet, or a cache that failed to decrypt/parse, or a
             // reference whose item is gone: either way the user has to
-            // (re-)sign in, told which (#2169).
-            Ok(None) => self.enter_signin(self.no_saved_token_reason()),
-            Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
+            // (re-)sign in, told which (#2169), unless the broker gives a
+            // token.
+            Ok(None) => self.broker_or_signin(self.no_saved_token_reason()),
+            Err(e) => self.broker_or_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
             Ok(Some(Saved::OtherCloud(saved))) => {
-                self.enter_signin(SignInReason::OtherCloud { saved })
+                self.broker_or_signin(SignInReason::OtherCloud { saved })
             }
+        }
+    }
+
+    /// At start with no saved token: the broker's token, or a sign-in asked
+    /// for `reason`.
+    fn broker_or_signin(&mut self, reason: SignInReason) {
+        match self.ask_broker() {
+            Some(t) => self.signed_in(t, true),
+            None => self.enter_signin(reason),
+        }
+    }
+
+    /// A token from [`EngineOptions::broker`]: asked for
+    /// [`auth::sign_in_scope`], and once more for `AuthConfig::scope` alone
+    /// when that needs the person, so a tenant that consented only to the
+    /// required scopes still gives one. `None` with no broker or no token.
+    fn ask_broker(&self) -> Option<TokenSet> {
+        let broker = self.config.options.broker?;
+        let cfg = &self.config.cfg;
+        let full = auth::sign_in_scope(cfg);
+        let mut answer = broker.0.silent(&full);
+        if matches!(answer, BrokerResult::InteractionRequired(_)) && full != cfg.scope {
+            answer = broker.0.silent(&cfg.scope);
+        }
+        match answer {
+            BrokerResult::Token {
+                access_token,
+                expires_at_unix,
+                account,
+                scopes,
+            } => Some(TokenSet {
+                access_token,
+                refresh_token: String::new(),
+                expires_at_unix,
+                account,
+                scopes,
+                cloud: cfg.cloud,
+            }),
+            BrokerResult::InteractionRequired(_) | BrokerResult::Unavailable(_) => None,
         }
     }
 
@@ -8254,6 +8352,7 @@ impl Engine {
             }
             op => apply_op(client, store, op),
         };
+        self.renew_brokered_near_expiry()?;
         let client = self.client();
         match apply(&client, &self.store) {
             Err(GraphError::Unauthorized) => match self.try_refresh() {
@@ -10377,6 +10476,7 @@ impl Engine {
         &mut self,
         f: impl Fn(&GraphClient) -> Result<T, GraphError>,
     ) -> Result<T, GraphError> {
+        self.renew_brokered_near_expiry()?;
         let first = {
             let client = self.client();
             f(&client)
@@ -10468,6 +10568,22 @@ impl Engine {
         }
     }
 
+    /// A token the broker gave, within the expiry skew, is asked for again
+    /// before a call: it has no refresh token for the call's 401 to use.
+    /// No token from the broker is a sign-in (`refused_refresh`).
+    fn renew_brokered_near_expiry(&mut self) -> Result<(), GraphError> {
+        let near = self.brokered
+            && self
+                .token
+                .as_ref()
+                .is_some_and(|t| t.expires_at_unix <= now_unix() + EXPIRY_SKEW_SECS);
+        if near && let Refresh::SignIn(reason) = self.try_refresh() {
+            self.refused_refresh = Some(reason);
+            return Err(GraphError::Unauthorized);
+        }
+        Ok(())
+    }
+
     /// Sends [`SyncEvent::TokenStoredUnencrypted`] the first time this run
     /// a token load or save ends in the plaintext file (#1877).
     fn note_storage(&mut self, storage: tokencache::Storage) {
@@ -10501,6 +10617,19 @@ impl Engine {
         let Some(token) = self.token.as_ref() else {
             return Refresh::SignIn(SignInReason::NotSignedIn);
         };
+        if self.brokered {
+            return match self.ask_broker() {
+                Some(t) => {
+                    self.token = Some(t);
+                    self.announce_scopes();
+                    Refresh::Done
+                }
+                None => Refresh::SignIn(SignInReason::Expired {
+                    code: String::new(),
+                    aadsts: None,
+                }),
+            };
+        }
         if token.refresh_token.is_empty() {
             return Refresh::SignIn(SignInReason::Expired {
                 code: String::new(),
@@ -10550,6 +10679,12 @@ impl Engine {
     /// `Error` already sent) is [`Engine::sign_in_failed`], as a
     /// `SignInStarted` went out and the client must hear the sign-in ended.
     fn sign_in(&mut self) {
+        if self.token.is_none()
+            && let Some(t) = self.ask_broker()
+        {
+            self.signed_in(t, true);
+            return;
+        }
         let full = auth::sign_in_scope(&self.config.cfg);
         // Only a sign-in whose optional scopes add a scope can fall back,
         // and not one whose held token already has every required scope
@@ -10591,7 +10726,12 @@ impl Engine {
                 return;
             }
         };
+        self.signed_in(t, false);
+    }
 
+    /// Takes `t` as the session's after a sign-in, `brokered` when the
+    /// broker gave it, and runs the first pass.
+    fn signed_in(&mut self, t: TokenSet, brokered: bool) {
         // The account may have another mailbox than the one that
         // filled the store (#1946: `prompt=select_account`): its
         // check is owed before anything is drained or synced, and
@@ -10607,10 +10747,11 @@ impl Engine {
         self.mailbox_unchecked = true;
         self.check_retry = None;
         self.check_backoff = BACKOFF_MIN;
-        if let Ok(storage) = self.save_token(&t) {
+        if !brokered && let Ok(storage) = self.save_token(&t) {
             self.note_storage(storage);
         }
         self.token = Some(t);
+        self.brokered = brokered;
         // The saved sign-in that waited for its store (#2167) is
         // replaced by this one.
         self.saved_unavailable = None;
@@ -10682,17 +10823,19 @@ impl Engine {
         // ends it, and the commands before it go to `deferred`, in order,
         // as `take_waiting` does everywhere.
         let timeout = self.signin_timeout();
+        let pages = SignInPages::for_app(self.config.options.app_name);
         let mut abort = || !self.take_waiting();
-        let code = match listen_for_code(&listener, &req.state, fallback, timeout, &mut abort) {
-            Ok(code) => code,
-            Err(_) if self.shutting_down => return SignInAttempt::Aborted,
-            Err(f) => {
-                return SignInAttempt::Failed {
-                    text: f.message,
-                    consent: f.consent,
-                };
-            }
-        };
+        let code =
+            match listen_for_code(&listener, &req.state, fallback, &pages, timeout, &mut abort) {
+                Ok(code) => code,
+                Err(_) if self.shutting_down => return SignInAttempt::Aborted,
+                Err(f) => {
+                    return SignInAttempt::Failed {
+                        text: f.message,
+                        consent: f.consent,
+                    };
+                }
+            };
         match auth::redeem_code(&self.config.cfg, &self.config.auth_base, &req, &code) {
             Ok(t) => SignInAttempt::Signed(t),
             Err(e) => SignInAttempt::Failed {
@@ -10975,6 +11118,7 @@ impl Engine {
     /// `BACKOFF_MIN`.
     fn enter_signin(&mut self, reason: SignInReason) {
         self.token = None;
+        self.brokered = false;
         self.refused_refresh = None;
         // No saved sign-in waits for its store any more (#2167).
         self.saved_unavailable = None;
@@ -11106,6 +11250,61 @@ const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 /// a new tab carries it on.
 const SIGNIN_RETRY_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>lookxy</title></head><body><h3>lookxy: signing in again without the optional permissions</h3><p>Continue in the new browser tab; you can close this one.</p></body></html>";
 
+/// The three pages a sign-in's browser tab can end on: the constants above,
+/// or the same pages naming an application ([`EngineOptions::app_name`]).
+struct SignInPages {
+    success: String,
+    error: String,
+    retry: String,
+}
+
+impl SignInPages {
+    fn for_app(app: Option<&str>) -> SignInPages {
+        let Some(app) = app else {
+            return SignInPages {
+                success: SIGNIN_SUCCESS_HTML.to_string(),
+                error: SIGNIN_ERROR_HTML.to_string(),
+                retry: SIGNIN_RETRY_HTML.to_string(),
+            };
+        };
+        let app = html_text(app);
+        let page = |heading: &str, body: &str| {
+            format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><title>{app}</title></head><body><h3>{app}: {heading}</h3><p>{body}</p></body></html>"
+            )
+        };
+        SignInPages {
+            success: page(
+                "sign-in complete",
+                &format!("You can close this tab and return to {app}."),
+            ),
+            error: page(
+                "sign-in failed",
+                &format!("You can close this tab and try again in {app}."),
+            ),
+            retry: page(
+                "signing in again without the optional permissions",
+                "Continue in the new browser tab; you can close this one.",
+            ),
+        }
+    }
+}
+
+/// `s` as HTML text: `&`, `<`, `>` and `"` escaped.
+fn html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Blocks (up to `timeout`, [`SIGNIN_TIMEOUT`] outside tests) for the
 /// browser to land on the loopback redirect `listener` is already bound
 /// to, accepts exactly one connection, and extracts the authorization
@@ -11127,6 +11326,7 @@ fn listen_for_code(
     listener: &TcpListener,
     expected_state: &str,
     fallback: bool,
+    pages: &SignInPages,
     timeout: Duration,
     abort: &mut dyn FnMut() -> bool,
 ) -> Result<String, RedirectFailure> {
@@ -11136,7 +11336,9 @@ fn listen_for_code(
     let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
-            Ok((stream, _addr)) => return handle_redirect(stream, expected_state, fallback),
+            Ok((stream, _addr)) => {
+                return handle_redirect_with(stream, expected_state, fallback, pages);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if abort() {
                     return Err(RedirectFailure::other("sign-in stopped by a shutdown"));
@@ -11273,10 +11475,26 @@ fn read_request_line(
 /// `fallback` (#2218): a refusal for consent will be followed by a sign-in
 /// without the optional scopes, so such a redirect gets
 /// [`SIGNIN_RETRY_HTML`] rather than the error page.
+#[cfg(test)]
 fn handle_redirect(
     stream: TcpStream,
     expected_state: &str,
     fallback: bool,
+) -> Result<String, RedirectFailure> {
+    handle_redirect_with(
+        stream,
+        expected_state,
+        fallback,
+        &SignInPages::for_app(None),
+    )
+}
+
+/// [`handle_redirect`] serving `pages`.
+fn handle_redirect_with(
+    stream: TcpStream,
+    expected_state: &str,
+    fallback: bool,
+    pages: &SignInPages,
 ) -> Result<String, RedirectFailure> {
     let request_line = read_request_line(
         &stream,
@@ -11301,7 +11519,7 @@ fn handle_redirect(
         // bare code) is shown only from the redirect that carries our
         // `state` (Entra echoes it on an error, RFC 6749 §4.1.2.1).
         if !state_matches {
-            write_html_response(stream, SIGNIN_ERROR_HTML);
+            write_html_response(stream, &pages.error);
             return Err(RedirectFailure::other(if is_oauth_error_code(err) {
                 format!("authorization denied: {err}")
             } else {
@@ -11314,9 +11532,9 @@ fn handle_redirect(
         write_html_response(
             stream,
             if consent && fallback {
-                SIGNIN_RETRY_HTML
+                &pages.retry
             } else {
-                SIGNIN_ERROR_HTML
+                &pages.error
             },
         );
         let err = one_line(err);
@@ -11332,7 +11550,7 @@ fn handle_redirect(
         return Err(RedirectFailure { message, consent });
     }
     if !state_matches {
-        write_html_response(stream, SIGNIN_ERROR_HTML);
+        write_html_response(stream, &pages.error);
         return Err(RedirectFailure::other("redirect state did not match"));
     }
     let Some(code) = params
@@ -11340,10 +11558,10 @@ fn handle_redirect(
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.clone())
     else {
-        write_html_response(stream, SIGNIN_ERROR_HTML);
+        write_html_response(stream, &pages.error);
         return Err(RedirectFailure::other("redirect had no authorization code"));
     };
-    write_html_response(stream, SIGNIN_SUCCESS_HTML);
+    write_html_response(stream, &pages.success);
     Ok(code)
 }
 
@@ -11701,6 +11919,7 @@ mod tests {
             scope: "Mail.ReadWrite offline_access".into(),
             optional_scope: String::new(),
             cloud: Cloud::Global,
+            login_hint: None,
         }
     }
 
@@ -52820,5 +53039,317 @@ mod tests {
             assert!(store.mailbox_check_owed().unwrap());
             finish(handle, dir);
         }
+    }
+
+    // --- A token broker ([`TokenBroker`]) ---------------------------------
+
+    /// A broker whose answer `answer` chooses from the call's scopes and
+    /// its index, and that records the scopes of each call.
+    type Answer = Box<dyn Fn(&str, usize) -> BrokerResult + Send + Sync>;
+
+    struct FakeBroker {
+        answer: Answer,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TokenBroker for FakeBroker {
+        fn silent(&self, scopes: &str) -> BrokerResult {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(scopes.to_string());
+            (self.answer)(scopes, calls.len() - 1)
+        }
+    }
+
+    fn fake_broker(
+        answer: impl Fn(&str, usize) -> BrokerResult + Send + Sync + 'static,
+    ) -> &'static FakeBroker {
+        Box::leak(Box::new(FakeBroker {
+            answer: Box::new(answer),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }))
+    }
+
+    fn broker_calls(broker: &FakeBroker) -> Vec<String> {
+        broker.calls.lock().unwrap().clone()
+    }
+
+    fn brokered(access_token: &str, expires_in: u64) -> BrokerResult {
+        BrokerResult::Token {
+            access_token: access_token.into(),
+            expires_at_unix: now_unix() + expires_in,
+            account: "person@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+        }
+    }
+
+    /// An engine with `broker` on `routes` (behind the mailbox check's
+    /// probe), its token file seeded by `seed`.
+    fn broker_engine(
+        tag: &str,
+        routes: Vec<(Route, Option<usize>)>,
+        cfg: AuthConfig,
+        broker: &'static FakeBroker,
+        seed: impl FnOnce(&std::path::Path),
+    ) -> (SyncHandle, PathBuf, PathBuf, FakeServer) {
+        let srv = FakeServer::start_limited(with_probe_limited(routes, "ROOT"));
+        let base = srv.base_url.clone();
+        let dir = unique_dir(tag);
+        let token_path = dir.join("token.bin");
+        seed(&token_path);
+        let options = EngineOptions {
+            broker: Some(Broker(broker)),
+            ..EngineOptions::without_prefetch()
+        };
+        let handle = spawn_with_bases_and_options(
+            dir.join("mail.db"),
+            token_path.clone(),
+            cfg,
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+            options,
+        );
+        (handle, dir, token_path, srv)
+    }
+
+    /// The `Authorization` header of each request to `path_prefix`, the
+    /// mailbox check's probe left out.
+    fn bearers(srv: &FakeServer, path_prefix: &str) -> Vec<String> {
+        srv.requests()
+            .iter()
+            .filter(|r| {
+                r.path.starts_with(path_prefix)
+                    && !r.path.starts_with("/me/mailFolders/msgfolderroot")
+            })
+            .filter_map(|r| {
+                r.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.clone())
+            })
+            .collect()
+    }
+
+    fn is_sign_in_event(e: &SyncEvent) -> bool {
+        matches!(
+            e,
+            SyncEvent::SignInRequired { .. } | SyncEvent::SignInStarted { .. }
+        )
+    }
+
+    #[test]
+    fn a_brokered_token_signs_in_with_no_browser_and_is_never_saved() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-start",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker), [test_cfg().scope]);
+        assert!(!token_path.exists());
+        assert!(tokencache::load(&token_path).unwrap().is_none());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(
+            !used.is_empty() && used.iter().all(|b| b == "Bearer BROKERED"),
+            "{used:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_saved_token_comes_before_the_broker() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-saved",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(broker_calls(broker).is_empty());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(used.iter().all(|b| b == "Bearer AT"), "{used:?}");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn the_required_scopes_alone_are_asked_when_the_full_set_needs_the_person() {
+        let cfg = AuthConfig {
+            optional_scope: "User.ReadBasic.All".into(),
+            ..test_cfg()
+        };
+        let full = auth::sign_in_scope(&cfg);
+        let broker = fake_broker(|scopes, _| {
+            if scopes.contains("User.ReadBasic.All") {
+                BrokerResult::InteractionRequired("consent".into())
+            } else {
+                brokered("REQUIRED-ONLY", 3600)
+            }
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-required",
+            vec![(empty_folders_route(200), None)],
+            cfg.clone(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker), [full, cfg.scope]);
+        assert!(
+            bearers(&srv, "/me/mailFolders")
+                .iter()
+                .all(|b| b == "Bearer REQUIRED-ONLY")
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_broker_without_a_token_leads_to_the_browser() {
+        for (tag, answer) in [("broker-interaction", true), ("broker-unavailable", false)] {
+            let broker = fake_broker(move |_, _| {
+                if answer {
+                    BrokerResult::InteractionRequired("needs the person".into())
+                } else {
+                    BrokerResult::Unavailable("no broker here".into())
+                }
+            });
+            let (handle, dir, _token_path, _srv) = broker_engine(
+                tag,
+                vec![(empty_folders_route(200), None)],
+                test_cfg(),
+                broker,
+                |_| {},
+            );
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
+            assert_eq!(broker_calls(broker).len(), 1);
+            handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+            next_sign_in_started(&handle);
+            assert_eq!(broker_calls(broker).len(), 2, "{tag}");
+            finish(handle, dir);
+        }
+    }
+
+    #[test]
+    fn a_brokered_token_near_its_expiry_is_asked_for_again() {
+        let broker = fake_broker(|_, n| {
+            if n == 0 {
+                brokered("FIRST", 10)
+            } else {
+                brokered("SECOND", 3600)
+            }
+        });
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-expiry",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 2);
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(used.iter().all(|b| b == "Bearer SECOND"), "{used:?}");
+        assert!(!token_path.exists());
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_401_asks_the_broker_once_and_a_second_one_asks_for_a_sign_in() {
+        let broker = fake_broker(|_, n| brokered(&format!("T{n}"), 3600));
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-401",
+            vec![(empty_folders_route(401), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInStarted { .. })),
+            "{events:?}"
+        );
+        assert_eq!(broker_calls(broker).len(), 2);
+        let used = bearers(&srv, "/me/mailFolders");
+        assert_eq!(used, ["Bearer T0", "Bearer T1"], "{used:?}");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn the_sign_in_pages_name_the_app_when_told() {
+        let default = SignInPages::for_app(None);
+        assert_eq!(default.success, SIGNIN_SUCCESS_HTML);
+        assert_eq!(default.error, SIGNIN_ERROR_HTML);
+        assert_eq!(default.retry, SIGNIN_RETRY_HTML);
+        let named = SignInPages::for_app(Some("Mail <&> \"X\""));
+        let app = "Mail &lt;&amp;&gt; &quot;X&quot;";
+        assert!(
+            named
+                .success
+                .contains(&format!("<h3>{app}: sign-in complete</h3>"))
+                && named.success.contains(&format!("return to {app}.")),
+            "{}",
+            named.success
+        );
+        assert!(
+            named
+                .error
+                .contains(&format!("<h3>{app}: sign-in failed</h3>"))
+        );
+        assert!(named.retry.contains(&format!("<title>{app}</title>")));
+        assert!(!format!("{}{}{}", named.success, named.error, named.retry).contains("lookxy"));
+    }
+
+    #[test]
+    fn a_sign_in_ends_on_the_named_app_page() {
+        let routes = vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#.into(),
+            },
+            empty_folders_route(200),
+        ];
+        let srv = FakeServer::start(with_probe(routes, "ROOT"));
+        let base = srv.base_url.clone();
+        let dir = unique_dir("signin-named-page");
+        let options = EngineOptions {
+            app_name: Some("Fixture Mail"),
+            ..EngineOptions::without_prefetch()
+        };
+        let handle = spawn_with_bases_and_options(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+            options,
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        let (_, response) = sign_in_through_loopback(&handle);
+        assert!(
+            response.contains("<h3>Fixture Mail: sign-in complete</h3>"),
+            "{response}"
+        );
+        finish(handle, dir);
     }
 }
