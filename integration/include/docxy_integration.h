@@ -1,7 +1,7 @@
 /* The C ABI of an integration plugin, interface version 1.
  * docs/integration-plugins.md in the docxy repository is the contract. Its
- * answers' fields are all optional, so a field it adds (branding's accents)
- * keeps the interface version. */
+ * answers' fields are all optional, so a field it adds keeps the interface
+ * version. */
 #ifndef DOCXY_INTEGRATION_H
 #define DOCXY_INTEGRATION_H
 

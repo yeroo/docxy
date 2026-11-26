@@ -43,8 +43,6 @@ pub enum Source {
 }
 
 impl Source {
-    /// HKLM [`REGISTRY_KEY`] [`REGISTRY_VALUE`] on Windows, [`ENV_VAR`]
-    /// elsewhere.
     pub fn for_this_os() -> Source {
         if cfg!(windows) {
             Source::Registry {
@@ -269,8 +267,7 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
     }
 }
 
-/// Whether `path` names a plugin library: [`abi::FILE_PREFIX`] and the
-/// platform's library extension, in any case.
+/// Whether `path` names a plugin library, as [`abi::FILE_PREFIX`] says.
 pub fn is_plugin_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
@@ -583,9 +580,9 @@ fn load_library(path: &Path) -> Result<libloading::Library, String> {
     use libloading::os::windows::{
         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
     };
-    // SAFETY: loading runs the library's initialisers. Only an administrator
-    // sets the folder on Windows. The flags keep its own dependencies to its
-    // folder and the system's, never the current directory or PATH.
+    // SAFETY: loading runs the library's initialisers. The flags keep its
+    // own dependencies to its folder and the system's, never the current
+    // directory or PATH.
     unsafe {
         Library::load_with_flags(
             path,

@@ -1,7 +1,6 @@
 //! The JSON a host and an integration plugin exchange: what `dxi_init`
 //! takes and answers, and each method's request and answer. Each type
 //! encodes and decodes, so a host and a plugin written in Rust share it.
-//! A field that is absent, null, of another type or empty decodes as `None`.
 
 use projcore::json::Json;
 
@@ -195,11 +194,8 @@ impl Rgb {
 /// malformed is `None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct AccentSet {
-    /// Primary buttons, the selection and the focus ring.
     pub primary: Option<Rgb>,
-    /// Links and the secondary accent.
     pub link: Option<Rgb>,
-    /// Small marks only, such as the active tab's and an unread mark.
     pub highlight: Option<Rgb>,
 }
 
@@ -403,8 +399,6 @@ impl TokenAnswer {
         }
     }
 
-    /// A status the host does not know, or an `ok` without a token or an
-    /// expiry, is `Unavailable`.
     pub fn from_json(text: &str) -> Result<TokenAnswer, String> {
         let json = Json::parse(text)?;
         let why = json.text("why");
@@ -521,8 +515,7 @@ pub fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-/// [`base64_encode`]'s inverse; `None` on a character outside the alphabet,
-/// a length that is not a multiple of 4, or padding anywhere but the end.
+/// [`base64_encode`]'s inverse; `None` on malformed input.
 pub fn base64_decode(text: &str) -> Option<Vec<u8>> {
     let bytes = text.as_bytes();
     if !bytes.len().is_multiple_of(4) {

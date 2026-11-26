@@ -97,8 +97,9 @@ pub struct AuthConfig {
     /// The Microsoft cloud to sign in to and sync with (#2225): its login
     /// host and Graph root. [`Cloud::Global`] by default.
     pub cloud: Cloud,
-    /// The account the interactive sign-in proposes (`login_hint`). With
-    /// one, the sign-in does not ask the person to pick an account first.
+    /// The account the interactive sign-in proposes (`login_hint`). With a
+    /// non-empty one, the sign-in does not ask the person to pick an account
+    /// first.
     pub login_hint: Option<String>,
 }
 

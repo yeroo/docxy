@@ -637,11 +637,10 @@ without one nothing changes.
 ## Integration plugins
 
 Beside format plugins, a host built on docxy's crates can load one
-**integration plugin**: a `dxi_*` shared library that gives it product names
-and icons, Microsoft 365 sign-in settings, a silent token source and the
-person's organization and desktop. The crate is `docxy-integration`
-(`integration/`); its contract, where a host finds the library and how it
-differs from a format plugin are in `docs/integration-plugins.md`.
+**integration plugin**, a `dxi_*` shared library. The crate is
+`docxy-integration` (`integration/`); its contract, what it gives a host,
+where a host finds the library and how it differs from a format plugin are
+in `docs/integration-plugins.md`.
 
 ## Desktop suite entry table
 

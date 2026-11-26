@@ -60,8 +60,8 @@ Return codes: 0 ok, 1 unknown method, 2 malformed request, 3 not configured, 4 i
 A host accepts the interface versions from its `MIN_ABI_VERSION` to its `ABI_VERSION` (`abi.rs`;
 both are 1 now). It refuses a library outside that range, a library without one of the five
 symbols, or one whose `dxi_init` refuses, and calls it no further. The message names the file and
-the reason; for a version, it gives the library's version and the host's range. A later host can add
-version 2 and keep loading version-1 plugins until it raises its minimum.
+the reason. A later host can add version 2 and keep loading version-1 plugins until it raises its
+minimum.
 
 ## Buffers and strings
 
@@ -123,7 +123,7 @@ keeps the answers. It asks `token` each time it needs a token. An `ok` answer wi
 - **Status:** not configured, loaded (the file and the plugin's version), or refused (the file or
   folder, and why). A plugin that stopped answering is refused from then on.
 - **The notice:** the message about a refusal or a stop, given once, for the host to show.
-- **Never logged or shown:** the access token and the login hint.
+- **Not to be logged or shown:** the access token and the login hint.
 
 ## Tests
 

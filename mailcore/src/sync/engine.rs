@@ -2378,8 +2378,7 @@ pub struct EngineOptions {
     /// The application's name on the browser page a sign-in ends on.
     /// `None` (the default) keeps the terminal client's pages.
     pub app_name: Option<&'static str>,
-    /// A source of tokens the engine asks before the browser sign-in.
-    /// `None` (the default) asks none.
+    /// The [`TokenBroker`]; `None` (the default) asks none.
     pub broker: Option<Broker>,
     /// How long a sign-in waits for the browser's redirect (default
     /// [`SIGNIN_TIMEOUT`]): a test's short wait (#2213).
@@ -10569,8 +10568,8 @@ impl Engine {
     }
 
     /// A token the broker gave, within the expiry skew, is asked for again
-    /// before a call: it has no refresh token for the call's 401 to use.
-    /// No token from the broker is a sign-in (`refused_refresh`).
+    /// before a call. No token from the broker is a sign-in
+    /// (`refused_refresh`).
     fn renew_brokered_near_expiry(&mut self) -> Result<(), GraphError> {
         let near = self.brokered
             && self
@@ -11290,7 +11289,7 @@ impl SignInPages {
     }
 }
 
-/// `s` as HTML text: `&`, `<`, `>` and `"` escaped.
+/// `s` as HTML text.
 fn html_text(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -11469,12 +11468,7 @@ fn read_request_line(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Reads the HTTP request line off one accepted loopback connection, pulls
-/// `code`/`state` (or `error`) out of its query string, writes back a small
-/// HTML page, and returns the code (or an error — see [`listen_for_code`]).
-/// `fallback` (#2218): a refusal for consent will be followed by a sign-in
-/// without the optional scopes, so such a redirect gets
-/// [`SIGNIN_RETRY_HTML`] rather than the error page.
+/// [`handle_redirect_with`] serving the terminal client's pages.
 #[cfg(test)]
 fn handle_redirect(
     stream: TcpStream,
@@ -11489,7 +11483,12 @@ fn handle_redirect(
     )
 }
 
-/// [`handle_redirect`] serving `pages`.
+/// Reads the HTTP request line off one accepted loopback connection, pulls
+/// `code`/`state` (or `error`) out of its query string, writes back one of
+/// `pages`, and returns the code (or an error, see [`listen_for_code`]).
+/// `fallback` (#2218): a refusal for consent will be followed by a sign-in
+/// without the optional scopes, so such a redirect gets `pages.retry`
+/// rather than the error page.
 fn handle_redirect_with(
     stream: TcpStream,
     expected_state: &str,

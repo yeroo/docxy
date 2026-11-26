@@ -33,7 +33,7 @@ pub(crate) struct Drawn {
 
 /// The roles of `accent` ([`for_tab`]): `accent` in each, white text on its
 /// fill, except that the brand takes each colour the plugin gives that the
-/// suite takes ([`brand::accents`]). A type's own accent stays.
+/// suite takes ([`brand::accents`]).
 pub(crate) fn drawn(accent: u32, plugin: &brand::Accents) -> Drawn {
     let mut d = Drawn {
         fill: accent,
@@ -152,7 +152,7 @@ pub(crate) fn text() -> u32 {
     TEXT.load(Ordering::Relaxed)
 }
 
-/// The fill as a translucent wash of opacity `alpha` (#1534), the project
+/// The fill as a translucent wash of opacity `alpha`, the project
 /// table's selection colours: it reads on the light and the dark theme.
 pub(crate) fn wash(alpha: f32) -> gpui::Hsla {
     let c: gpui::Hsla = gpui::rgb(fill()).into();

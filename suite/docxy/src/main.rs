@@ -18986,7 +18986,7 @@ impl Docxy {
         this.recovery_pending = recovered;
         // A format plugin that did not load (`main` logged each one): the
         // first says so on the status line, else the integration plugin's
-        // refusal.
+        // notice.
         let notice = project_formats::global()
             .errors
             .first()
@@ -54878,7 +54878,6 @@ pub fn run(extensions: ext::Extensions) {
         eprintln!("{msg}");
         crashlog::startup(&config_root(), &msg);
     }
-    // The integration plugin, at the same point and said the same way.
     if let Some(notice) = brand::start(&config_root(), want_harness) {
         let msg = format!("docxy: {notice}");
         eprintln!("{msg}");

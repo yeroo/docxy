@@ -62,7 +62,7 @@ fn icon_ico() -> Option<&'static [u8]> {
 }
 
 /// The rows About adds for the integration: its line, the organization and
-/// desktop it reports, and its state. None with no plugin configured.
+/// desktop it reports, and its state. Empty with no plugin configured.
 pub(crate) fn about_rows_of(
     status: &Status,
     about_line: Option<&str>,
@@ -221,9 +221,7 @@ pub(crate) fn accents(dark: bool) -> Accents {
 }
 
 /// The plugin's [`accents`] on the global theme's tokens, run after every
-/// `Theme::change`: the primary on `primary`, its hover and active shades and
-/// `ring`, its text on `primary_foreground`, and on `selection` at the
-/// theme's own opacity; the link on `link` and its hover and active shades.
+/// `Theme::change`.
 pub(crate) fn apply_accents_to_theme(cx: &mut gpui::App) {
     let dark = gpui_component::Theme::global(cx).mode.is_dark();
     let accents = accents(dark);
@@ -395,9 +393,7 @@ mod tests {
     }
 
     /// Product-name literals the guard below lets through, each with its file
-    /// and why: identifiers, logs, panics, harness data and the terminal
-    /// editor's inputs, none of them text the suite shows. A literal is kept
-    /// only as written here.
+    /// and why. A literal is kept only as written here.
     const NAME_LITERALS_KEPT: &[(&str, &str, &str)] = &[
         (
             "crashlog.rs",
@@ -553,10 +549,10 @@ mod tests {
         ),
     ];
 
-    /// Whether a literal holding the product name is an identifier or a log
-    /// line: an environment variable (`DOCXY_`), the config folder
-    /// (`.join("docxy")`), an stderr line's `docxy: ` prefix, or one of
-    /// [`NAME_LITERALS_KEPT`] and [`NAME_HEADERS_KEPT`].
+    /// Whether a literal holding the product name is kept: an environment
+    /// variable (`DOCXY_`), the config folder (`.join("docxy")`), an stderr
+    /// line's `docxy: ` prefix, or one of [`NAME_LITERALS_KEPT`] and
+    /// [`NAME_HEADERS_KEPT`].
     fn kept_name_literal(file: &str, literal: &str, before: &str) -> bool {
         literal.starts_with("DOCXY_")
             || (literal == "docxy" && before.ends_with(".join("))
@@ -719,7 +715,7 @@ mod tests {
     }
 
     /// The suite shows its name only through this module, so an integration
-    /// plugin's name replaces it everywhere. The guard does not see a name
+    /// plugin's name replaces it. The guard does not see a name
     /// built from parts: `concat!` or `format!` pieces, or char escapes.
     #[test]
     fn the_product_name_is_written_only_here() {

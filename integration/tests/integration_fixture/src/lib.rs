@@ -2,7 +2,7 @@
 //! beside the library chooses what it does; no file is `normal`:
 //!
 //! - `normal`: interface version 1, every method answered;
-//! - `abi0`, `abi-above`: interface version 0, or one above this build's;
+//! - `abi0`, `abi-above`: interface version 0, or 2;
 //! - `init-refuses`: `dxi_init` refuses the host;
 //! - `slow <ms>`: each `dxi_call` sleeps that long first;
 //! - `slow-init <ms>`: `dxi_init` sleeps that long first;

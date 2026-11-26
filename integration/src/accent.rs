@@ -61,9 +61,7 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
 }
 
 /// `color` for `role` on a theme whose background is `background`, or why
-/// the host keeps its own colour. A primary fill takes black or white text,
-/// the higher contrast, and needs [`MIN_CONTRAST`] with it; a link or a
-/// highlight needs [`MIN_CONTRAST`] against `background`.
+/// the host keeps its own colour.
 pub fn check(role: Role, color: Rgb, background: Rgb) -> Result<Accepted, String> {
     match role {
         Role::Primary => {
