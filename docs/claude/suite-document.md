@@ -395,6 +395,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's docu
   Word measures it to that cell's text: `compatibilityMode` below 15 or
   none (the HTML and Markdown packages), from `TableCtx::compat_mode`;
   never left of the text, so a Word document's `tblInd 0` table stays.
+  A flow view that fits tables to its width (#1895: Web Layout, the
+  embedded `DocView`) cuts the drawn indent to what the fitted table
+  leaves of it (`table_view::fitted_indent`, r1), so an imported quoted
+  reply's table (a `pct` share of the body) and its indent stay in a
+  narrow pane; Print Layout draws it whole.
   A table style's `tblInd` is not read; PDF export does not draw it.
   `flow.tables.N.inset` is a table's left less the text column's, in px
   (`table-ind.uit`, its own script: `table-jc.uit` leaves Print Layout

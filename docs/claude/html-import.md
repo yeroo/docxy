@@ -1119,9 +1119,13 @@ A batch from #1989 and #1930 (plan-2), import only.
     that room is centred in the body (equal indents).
   - `end_html_table` passes the room's width to `layout` as its `avail`
     (a nested table drops a room: it takes its cell's width).
-    `place_in_room` writes a
-    percentage `tblW` as twips, since Word resolves `pct` against the body
-    and would stretch it back.
+    `place_in_room` writes a percentage `tblW` as the share of the body
+    its twips in the room are (`Room::body`, #2151 r1): Word resolves
+    `pct` against the body, so it gets the same width, and the suite's
+    flow views (#1895) still fit a `pct` table to their width, where a
+    `dxa` one stayed wide and scrolled (a quoted reply's `width=100%`
+    table in a narrow mail pane). A fixed width the page gives stays
+    `dxa`. Cards placed in a room (#1940) take the same path.
   - A table that fills the room exactly, or fits and is centred in it, in
     a centred room gets `jc center`, whatever its `align`.
   - Otherwise it gets no `jc` and a `w:tblInd` of its left edge: the
@@ -1171,7 +1175,12 @@ A batch from #1989 and #1930 (plan-2), import only.
   (`blockquote`, a `margin-left` div, a list item). `body_room` is
   unchanged: equal indents make a centred room, where a full table gets
   `jc center` (a box centred in a room centred in the body is centred in
-  the body); a narrower one gets `tblInd` at the room's left.
+  the body); a narrower one gets `tblInd` at the room's left. A
+  percentage width is written as its room's share of the body (r1, see
+  the #2114 section), so a flow view still fits it.
+- A cell's tail, pending box and card end (`TableAcc::card_at`) are
+  cleared together in `Builder::end_cell` (r1): anchored on a block count
+  only, they would match in a later cell.
 - Quirks mode, a padding-less card at a quirky edge (measured in Chrome:
   `<td><div style=background:#eee><p>x` is flush, 0 / 0):
   - Top: `top_spacing`'s walk goes on past a card with no top padding

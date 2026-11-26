@@ -75,10 +75,9 @@ fn a_full_table_in_a_blockquote_is_centred_in_its_room() {
     let t = tables(&d)[0];
     let pr = tblpr(t);
     assert_eq!(t.grid.iter().sum::<u32>(), 11790 - 2 * 600);
-    assert!(
-        pr.contains("<w:tblW w:w=\"10590\" w:type=\"dxa\"/>"),
-        "{pr}"
-    );
+    // As its share of the body (#2151 r1): 10590 / 11790 of 5000, which
+    // Word resolves to the same twips and a flow view fits.
+    assert!(pr.contains("<w:tblW w:w=\"4491\" w:type=\"pct\"/>"), "{pr}");
     assert!(pr.contains("<w:jc w:val=\"center\"/>"), "{pr}");
     assert!(!pr.contains("w:tblInd"), "{pr}");
 }
@@ -110,10 +109,7 @@ fn a_table_in_a_left_indented_block_is_laid_out_right_of_it() {
         let t = tables(&d)[0];
         let pr = tblpr(t);
         assert_eq!(t.grid.iter().sum::<u32>(), 11790 - 600, "{page}");
-        assert!(
-            pr.contains("<w:tblW w:w=\"11190\" w:type=\"dxa\"/>"),
-            "{pr}"
-        );
+        assert!(pr.contains("<w:tblW w:w=\"4746\" w:type=\"pct\"/>"), "{pr}");
         assert!(!pr.contains("<w:jc "), "{pr}");
         assert!(
             pr.contains("<w:tblInd w:w=\"708\" w:type=\"dxa\"/>"),

@@ -326,6 +326,9 @@ pub(crate) struct Room {
     pub width: u32,
     /// The room is centred in the body (equal indents on both sides).
     pub centred: bool,
+    /// The body's width, which Word resolves a `pct` `tblW` against
+    /// (#2151 r1).
+    pub body: u32,
 }
 
 /// What a `<td>` / `<th>` says about itself, its row and its table.
@@ -769,8 +772,10 @@ fn layout_in(t: RawTable, avail: u32, declared: bool, budget: &Budget) -> Table 
 }
 
 /// Place a table laid out in `room` (#2114, #1930 plan-2) on the body: its
-/// percentage width as the twips it is in the room (Word resolves `pct`
-/// against the body and would stretch it back), and `jc center` when it
+/// percentage width as the share of the body its twips in the room are
+/// (Word resolves `pct` against the body, and a flow view fits a `pct`
+/// table to its width, #1895, where `dxa` would keep it wide: #2151 r1),
+/// and `jc center` when it
 /// fills the room exactly or is centred in it and the room is centred in
 /// the body (its own `align` then moves nothing). Otherwise (a wider table
 /// too, which a browser starts at the room's left) no `jc` and the
@@ -788,7 +793,8 @@ fn place_in_room(
     cell_margin: u32,
 ) -> Option<u32> {
     if let Some(w @ Width::Pct(_)) = spec.width {
-        spec.width = Some(Width::Twips(resolve(w, avail)));
+        let twips = f64::from(resolve(w, avail));
+        spec.width = Some(Width::Pct(twips * 100.0 / f64::from(room.body.max(1))));
     }
     let width: u32 = grid.iter().fold(0u32, |a, &w| a.saturating_add(w));
     let place = spec.jc.take();
@@ -1446,6 +1452,7 @@ mod tests {
             indent: 1395,
             width: 9000,
             centred: true,
+            body: 11790,
         };
         let table = |width, jc| {
             layout(
@@ -1484,7 +1491,7 @@ mod tests {
         let pr = t.raw_tblpr.unwrap();
         assert!(
             pr.starts_with(
-                "<w:tblPr><w:tblW w:w=\"9000\" w:type=\"dxa\"/><w:jc w:val=\"center\"/>"
+                "<w:tblPr><w:tblW w:w=\"3817\" w:type=\"pct\"/><w:jc w:val=\"center\"/>"
             ),
             "{pr}"
         );

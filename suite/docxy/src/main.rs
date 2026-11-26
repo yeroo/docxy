@@ -42677,10 +42677,15 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     // A left table's `w:tblInd` moves it right of the text's left (#2151),
     // whether or not it fits: Word keeps the indent on a wider one, and a
     // left margin (unlike gpui's auto ones) never pushes it past the left,
-    // so the sideways scroll still reaches its right edge.
+    // so the sideways scroll still reaches its right edge. A view fitting
+    // tables to its width cuts it to what the table leaves (r1).
     let indent = match align {
-        table_view::HAlign::Left => docxcore::table::left_edge(t, ctx.tbl.compat_mode),
-        _ => 0,
+        table_view::HAlign::Left => table_view::fitted_indent(
+            tw_px(docxcore::table::left_edge(t, ctx.tbl.compat_mode), zoom),
+            tw_px(widest.min(i32::MAX as u32) as i32, zoom),
+            ctx.fit_width,
+        ),
+        _ => 0.0,
     };
     v_flex()
         .relative()
@@ -42690,7 +42695,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         // The flow column's 4 px below a top-level table (#1986), past its
         // own 8 px: a later `mb` replaces the bottom margin.
         .when(ctx.gap_below && path.len() == 1, |d| d.mb(px(8. + 4.)))
-        .when(indent > 0, |d| d.ml(px(tw_px(indent, zoom))))
+        .when(indent > 0.0, |d| d.ml(px(indent)))
         .when(fits, |d| match align {
             table_view::HAlign::Left => d,
             table_view::HAlign::Center => d.mx_auto(),

@@ -1551,6 +1551,7 @@ fn body_room(body: u32, indent: i32, right: i32) -> html_table::Room {
             .saturating_sub(right)
             .clamp(html_table::MIN_COL, body),
         centred: indent == right,
+        body,
     }
 }
 
@@ -5084,10 +5085,13 @@ impl<'a> Html<'a> {
     }
 
     /// Whether the elements below `elems[i]` reach a quirky container (the
-    /// body, or a `td` / `th`, not a card) with no bottom padding or bottom
-    /// border line between (#1979, #2114 r2 m3, #1883): in quirks mode a block's user-agent bottom is
-    /// then dropped if its paragraph ends that flow, as Chrome drops it at
-    /// a cell's end through a `div` too.
+    /// body, or a `td` / `th`) with no bottom padding or bottom border line
+    /// between (#1979, #2114 r2 m3, #1883): in quirks mode a block's
+    /// user-agent bottom is then dropped if its paragraph ends that flow,
+    /// as Chrome drops it at a cell's end through a `div` too. A card with
+    /// no bottom padding or line counts as one (#2151): whether the quirk
+    /// passes through it is settled when its enclosing flow ends
+    /// ([`Self::card_bottoms`]); a padded card does not.
     fn bottom_unseparated(&self, i: usize, in_table: bool) -> bool {
         if !self.budget.work(i / 16 + 1) {
             return false;
@@ -5276,15 +5280,18 @@ impl<'a> Html<'a> {
     /// and list still fresh, from the innermost table, cell or card out
     /// (inline elements, containers and the rest are see-through), gives
     /// it its top box, folded outermost first onto the margin group open
-    /// at the bottom of the paragraph above in its flow ([`Builder::tail`]):
-    /// positive margins collapse (the largest counts, less what is already
-    /// paid), padding or a top border line (#1883) closes the group,
-    /// negative margins are summed.
+    /// at the bottom of the paragraph above in its flow ([`Builder::tail`]),
+    /// or with none, onto the box waiting for it ([`Builder::pending`],
+    /// #2151: a block that ended in a table, an empty block), which is
+    /// owed here too: positive margins collapse (the largest counts, less
+    /// what is already paid), padding or a top border line (#1883) closes
+    /// the group, negative margins are summed.
     /// Freshness is monotonic (an element is stale once one inside it is),
     /// so the walk stops at the first stale one.
     ///
-    /// In quirks mode, at the start of the body or a cell (not a card), the
-    /// members drop their user-agent tops from the outermost in, up to and
+    /// In quirks mode, at the start of the body or a cell, or of a card with
+    /// no top padding or line at such a start ([`Self::card_at_quirky_top`],
+    /// #2151), the members drop their user-agent tops from the outermost in, up to and
     /// including the first with top padding or a top border line (#1979,
     /// #1883; #2114 r2 m2, measured in Chrome: `<div dir=ltr><ol><li>` and
     /// `<td><div><p>` start at 0, `<div style="padding-top:1px"><ol>` keeps
@@ -12035,7 +12042,9 @@ mod batch_2114_tests {
             "{WRAP}<table width='100%'><tr><td>x</td></tr></table></div>"
         ));
         let pr = tblpr(tables(&d)[0]);
-        assert!(pr.contains("<w:tblW w:w=\"9000\" w:type=\"dxa\"/>"), "{pr}");
+        // As its share of the body, which Word resolves to the same 9000
+        // and a flow view fits (#2151 r1): 9000 / 11790.
+        assert!(pr.contains("<w:tblW w:w=\"3817\" w:type=\"pct\"/>"), "{pr}");
     }
 
     #[test]
