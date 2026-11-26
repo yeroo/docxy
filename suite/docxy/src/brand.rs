@@ -394,57 +394,179 @@ mod tests {
         );
     }
 
-    /// Product-name literals the guard below lets through, by file and the
-    /// literal's start: logs, panics, harness data and the terminal editor's
-    /// inputs, none of them text the suite shows.
-    const NAME_LITERALS_KEPT: &[(&str, &str)] = &[
-        // The crash log's version block and its entry line.
-        ("crashlog.rs", "docxy suite"),
-        ("crashlog.rs", "=== {kind} {} pid {pid} docxy "),
-        // Panics, which go to the crash log.
-        ("main.rs", "failed to open docxy window"),
+    /// Product-name literals the guard below lets through, each with its file
+    /// and why: identifiers, logs, panics, harness data and the terminal
+    /// editor's inputs, none of them text the suite shows. A literal is kept
+    /// only as written here.
+    const NAME_LITERALS_KEPT: &[(&str, &str, &str)] = &[
+        (
+            "crashlog.rs",
+            "docxy suite",
+            "the crash log's version block",
+        ),
+        (
+            "crashlog.rs",
+            "=== {kind} {} pid {pid} docxy {} thread {thread}\\n{build_lines}{}\\n\\n",
+            "the crash log's entry line",
+        ),
+        (
+            "main.rs",
+            "failed to open docxy window",
+            "a panic, in the crash log",
+        ),
+        ("main.rs", "io.github.yeroo.docxy", "the window's `app_id`"),
         (
             "native_dialog.rs",
-            "native_modal( outside Docxy::native_dialog",
+            "native_modal( outside Docxy::native_dialog: {stray:?}",
+            "a panic, in the crash log",
         ),
         (
             "dialog.rs",
-            "dialog '{}' ({}) does not match its catalogue entry",
+            "dialog '{}' ({}) does not match its catalogue entry: it has [{}], the catalogue lists [{}]; update suite/docxy/src/dialog/catalog/entries.rs",
+            "a panic, in the crash log",
         ),
-        // A family name no font has, to find the fallback.
-        ("font_subst.rs", "\\u{1}docxy no such font"),
-        // The sheet ribbon's table, whose About label `own_label` replaces.
-        ("sheet_ribbon.rs", "About docxy suite"),
-        // The harness's test extension and a harness case: a harness loads
-        // no integration plugin.
-        ("ext_fixture.rs", "docxy link"),
+        (
+            "font_subst.rs",
+            "\\u{1}docxy no such font",
+            "a family name no font has, to find the fallback",
+        ),
+        (
+            "sheet_ribbon.rs",
+            "About docxy suite",
+            "the ribbon table's label, which `own_label` replaces",
+        ),
+        ("sheet_ribbon.rs", "about-docxy", "the About command's id"),
+        (
+            "macos_menu.rs",
+            "DocxyMenuBar",
+            "the menu bar's key context",
+        ),
+        (
+            "pdf_view/worker.rs",
+            "docxy-pdf-worker",
+            "the PDF worker's hello",
+        ),
+        (
+            "convert_child.rs",
+            "docxy-convert-{}-{nanos}-{}",
+            "a temporary file's name",
+        ),
+        (
+            "ext_fixture.rs",
+            "docxy link",
+            "the harness's test extension's text",
+        ),
+        (
+            "ext_fixture.rs",
+            "https://example.com/docxy",
+            "the harness's test extension's link",
+        ),
         (
             "dialog/catalog/entries.rs",
             "call ribbon-click {\"tab\":\"Help\",\"command\":\"About docxy suite\"}",
+            "a harness case; a harness loads no integration plugin",
         ),
-        // The terminal docxy editor's inputs, in the inputs catalogue.
-        ("inputs.rs", "docxy's "),
-        // The headers of generated files: harness cases and the ribbon export.
+        (
+            "inputs.rs",
+            "docxy-find",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy-replace",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy-comment",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy-compare-original",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy-compare-revised",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy-vim-command",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy-save-as",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy's Find bar: Find field",
+            "a terminal docxy editor's input",
+        ),
+        (
+            "inputs.rs",
+            "docxy's Find bar: Replace field",
+            "a terminal docxy editor's input",
+        ),
+        (
+            "inputs.rs",
+            "docxy's new comment text",
+            "a terminal docxy editor's input",
+        ),
+        (
+            "inputs.rs",
+            "docxy's Compare: original path",
+            "a terminal docxy editor's input",
+        ),
+        (
+            "inputs.rs",
+            "docxy's Compare: revised path",
+            "a terminal docxy editor's input",
+        ),
+        (
+            "inputs.rs",
+            "docxy's vim : command line",
+            "a terminal docxy editor's input",
+        ),
+        (
+            "inputs.rs",
+            "docxy's Backstage Save As file name",
+            "a terminal docxy editor's input",
+        ),
+    ];
+
+    /// Generated files' headers the guard lets through, by file and the
+    /// literal's start.
+    const NAME_HEADERS_KEPT: &[(&str, &str, &str)] = &[
         (
             "dialog/catalog/cases.rs",
-            "# GENERATED from suite/docxy/src/",
+            "# GENERATED from suite/docxy/src/dialog/catalog/entries.rs by",
+            "the generated harness cases' header",
         ),
-        ("ribbon_export.rs", "From suite/docxy (docxy_ribbon,"),
+        (
+            "ribbon_export.rs",
+            "From suite/docxy (docxy_ribbon, table_tab, QAT_ITEMS, BACKSTAGE_RAIL, icons, theme).",
+            "the ribbon export's header",
+        ),
     ];
 
     /// Whether a literal holding the product name is an identifier or a log
-    /// line: an environment variable, a word with no space (a file or
-    /// folder name, an id, a URL) other than the bare name, the config
-    /// folder (`.join("docxy")`), or an stderr line's `docxy: ` prefix.
+    /// line: an environment variable (`DOCXY_`), the config folder
+    /// (`.join("docxy")`), an stderr line's `docxy: ` prefix, or one of
+    /// [`NAME_LITERALS_KEPT`] and [`NAME_HEADERS_KEPT`].
     fn kept_name_literal(file: &str, literal: &str, before: &str) -> bool {
-        let bare = literal.eq_ignore_ascii_case("docxy");
         literal.starts_with("DOCXY_")
-            || (!bare && !literal.contains(char::is_whitespace))
-            || (bare && before.ends_with(".join("))
+            || (literal == "docxy" && before.ends_with(".join("))
             || literal.starts_with("docxy: ")
             || NAME_LITERALS_KEPT
                 .iter()
-                .any(|(f, start)| *f == file && literal.starts_with(start))
+                .any(|(f, kept, _)| *f == file && literal == *kept)
+            || NAME_HEADERS_KEPT
+                .iter()
+                .any(|(f, start, _)| *f == file && literal.starts_with(start))
     }
 
     /// `src` without the items under `#[cfg(test)]`, in rustfmt's layout: a
@@ -597,7 +719,8 @@ mod tests {
     }
 
     /// The suite shows its name only through this module, so an integration
-    /// plugin's name replaces it everywhere.
+    /// plugin's name replaces it everywhere. The guard does not see a name
+    /// built from parts: `concat!` or `format!` pieces, or char escapes.
     #[test]
     fn the_product_name_is_written_only_here() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -606,7 +729,8 @@ mod tests {
     }
 
     /// The guard's scanner: a literal in code counts, one in a comment, a
-    /// test item or a char literal does not, and an identifier is kept.
+    /// test item or a char literal does not, and only the identifiers and
+    /// literals it names are kept.
     #[test]
     fn the_guard_finds_a_name_in_code_and_not_in_comments_or_tests() {
         let src = concat!(
@@ -624,10 +748,13 @@ mod tests {
             "}\n",
             "const E: &str = \"After docxy\";\n",
             "const F: &str = \"docxy\";\n",
+            "const G: &str = \"Docxy\";\n",
         );
         let named: Vec<String> = string_literals(&without_test_items(src))
             .into_iter()
-            .filter(|(before, l)| l.contains("docxy") && !kept_name_literal("x.rs", l, before))
+            .filter(|(before, l)| {
+                l.to_ascii_lowercase().contains("docxy") && !kept_name_literal("x.rs", l, before)
+            })
             .map(|(_, l)| l)
             .collect();
         assert_eq!(
@@ -636,8 +763,10 @@ mod tests {
                 "Quit docxy",
                 "docxy \"raw\"",
                 "a \\\" docxy",
+                "docxy-find",
                 "After docxy",
-                "docxy"
+                "docxy",
+                "Docxy"
             ]
         );
     }

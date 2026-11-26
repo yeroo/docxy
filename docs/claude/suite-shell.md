@@ -207,5 +207,5 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   with no plugin, names no app. Left as they are: identifiers (config folders, environment
   variables, `app_id`, temp names), stderr and crash-log lines, `--version` and the title-bar
   label per tab type. `brand::tests::the_product_name_is_written_only_here` fails on any other
-  product-name literal in non-test source outside `brand.rs`; its `NAME_LITERALS_KEPT` names the
-  rest it keeps.
+  product-name literal in non-test source outside `brand.rs` that `NAME_LITERALS_KEPT` and
+  `NAME_HEADERS_KEPT` do not name; each named literal there has its reason.
