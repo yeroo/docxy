@@ -498,10 +498,20 @@ the same renderer for terminal docxy and the VS Code extension (#2259).
   before the hello are skipped, one question at a time on `Engine`'s
   thread, `recv_timeout` 20 s; a timeout, death or nonsense kills it, the
   question answers why, the next starts a new child. A page that failed is
-  never asked again (`failed`). No child, or a child that cannot open the
-  file (`Next::TextOnly`): `TextOnly` runs `import_pdf` (#951) on the
-  engine thread and shows its text as one stream, the status saying why
-  and `HOW_TO_GET_PAGES`; a locked file says `LOCKED` (no prompt).
+  never asked again (`failed`). No child (none found, or `Ans::NoChild`: it
+  cannot be started) or a reasoned `Failed` on `info` (`Next::TextOnly`):
+  `TextOnly` runs `import_pdf` (#951) on the engine thread and shows its
+  text as one stream; the status gives why, and `HOW_TO_GET_PAGES` only
+  when there is no child (`t` repeats it). A child that died (`DIED`) or
+  ran out of time (`TOO_LONG`) opening the file: the reason, no text (the
+  file is not read again in docxy's process). A locked file says `LOCKED`
+  (no prompt). A panic in a source answers `DIED` (`Engine` catches it; the
+  panic hook leaves the engine thread's alone). Quitting, or dropping the
+  `Engine`, kills the child through its shared `Killer`, mid-question too.
+  The hello wait has one deadline. Every text drawn (a page's, a reason,
+  the file name) goes through `clean_text`/`clean_line`: C0/C1 controls and
+  DEL become U+FFFD, `\r` is a line break, tabs expand to 8, bidi controls
+  and invisible format characters are dropped.
 - The viewer: Image mode when the `Picker` has a protocol (not
   Halfblocks), Text otherwise; `t` toggles (Halfblocks pages too), `w` fit
   page / fit width (Up/Down scroll; a fit-width raster is cropped to the
@@ -517,7 +527,9 @@ the same renderer for terminal docxy and the VS Code extension (#2259).
   `fit`, `scroll`, `source` child|text-only, `status`, `unopened`,
   `failed`, `drawn`, `busy`, `outline`, `lines`: the body's text rows);
   `{"until_idle":true}` replies once nothing is pending, at most 5 s. Any
-  other verb is refused.
+  other verb is refused. The harness's terminal `open` of a `.pdf` in docxy
+  waits on it (`term::waits_for_pdf`), so a case's first key finds the
+  pages read.
 - VS Code: `offxy.pdfViewer` (`src/pdfviewer.ts`, a
   `CustomReadonlyEditorProvider`, `*.pdf` at priority `default`) posts the
   bytes to `media/pdf.js`. **wasm32 has no unwinding**: a panic, the memory

@@ -216,6 +216,15 @@ fn counts_of(j: &Json) -> Result<Counts, String> {
     })
 }
 
+/// Whether `open` waits for terminal docxy's PDF viewer to have read the
+/// file (#2259): docxy opening a `.pdf`.
+pub fn waits_for_pdf(app: &str, file: &Path) -> bool {
+    app == "docxy"
+        && file
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("pdf"))
+}
+
 /// One running editor.
 struct Session {
     pty: Pty,
@@ -338,6 +347,17 @@ impl Terminal {
         // Ready once it answers and has drawn: the start-up query is behind
         // it, since the control server comes up after it.
         self.wait("its first frame", |c| c.frames >= 1)?;
+        // Terminal docxy's PDF viewer (#2259) reads the file's pages from its
+        // child after the first frame: a case's first key waits for them, as
+        // a person waits for the page count. A file named .pdf that is no PDF
+        // opens in the editor, which has no `pdf-read`: nothing to wait for.
+        if waits_for_pdf(&self.spec.app, file) {
+            let s = self.session()?;
+            let _ = s.conn.call(
+                "pdf-read",
+                Json::obj(vec![("until_idle", Json::Bool(true))]),
+            );
+        }
         Ok(())
     }
 
@@ -595,6 +615,14 @@ mod tests {
                 home.join("config").join("docxy").join("ctl")
             }
         );
+    }
+
+    #[test]
+    fn docxy_opening_a_pdf_waits_for_its_pages() {
+        assert!(waits_for_pdf("docxy", Path::new("a/slides.pdf")));
+        assert!(waits_for_pdf("docxy", Path::new("SLIDES.PDF")));
+        assert!(!waits_for_pdf("docxy", Path::new("a.docx")));
+        assert!(!waits_for_pdf("xlsxy", Path::new("a.pdf")));
     }
 
     #[test]

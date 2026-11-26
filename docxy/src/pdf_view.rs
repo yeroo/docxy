@@ -9,9 +9,14 @@
 //! dependency crates.io refuses), and a hostile file costs the child, never
 //! the editor. Questions go to the child one at a time on a thread of its
 //! own ([`Engine`]), so a slow page never freezes the screen; a page the
-//! child fails on says why and is not asked again. Without the child, the
-//! text importer (#951) shows the file's text as one stream and the status
-//! says why the pages are not drawn.
+//! child fails on says why and is not asked again. Without the child (none
+//! found, or it cannot be started), or when it gives a reason it cannot open
+//! the file, the text importer (#951) shows the file's text as one stream
+//! and the status says why the pages are not drawn. When the child dies or
+//! runs out of time opening the file, nothing else reads it in docxy's own
+//! process: the viewer says why and shows no text. Every text from the file
+//! is cleaned of control characters before it reaches a cell
+//! ([`clean_text`]).
 //!
 //! It is its own small loop beside the editor's `App`: nothing here edits,
 //! saves or converts. It publishes the editor's control server with two
@@ -23,11 +28,11 @@ pub(crate) mod child;
 #[cfg(test)]
 mod tests;
 
-use child::{Ans, Child, Meta, Raster, Req, Source, TextOnly};
+use child::{Ans, Child, Killer, Meta, Raster, Req, Source, TextOnly};
 use ctlcore::field::{Field, InputCounts};
 use ctlcore::json::Json;
 use ratatui::Frame;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -111,8 +116,13 @@ struct Want {
 #[derive(Debug, PartialEq)]
 pub(crate) enum Next {
     Nothing,
-    /// The child cannot show the file: read its text instead, saying why.
-    TextOnly(String),
+    /// The child cannot show the file: read its text instead, saying why;
+    /// `missing` when there is no child to run (the status says how to get
+    /// one).
+    TextOnly {
+        why: String,
+        missing: bool,
+    },
 }
 
 /// The protocol last encoded, and what it encodes.
@@ -150,6 +160,8 @@ pub(crate) struct Viewer {
     goto_at: Option<(u16, u16)>,
     /// The body's text rows as last drawn.
     shown: Vec<String>,
+    /// Why the text only is shown, as the status says it (`t` repeats it).
+    text_only_why: String,
 }
 
 impl Viewer {
@@ -183,15 +195,17 @@ impl Viewer {
             proto: None,
             goto_at: None,
             shown: Vec::new(),
+            text_only_why: String::new(),
         };
         if let Some(why) = no_child {
-            v.fall_back(&why);
+            v.fall_back(&why, true);
         }
         v
     }
 
-    /// From now on the pages come from the text importer, because `why`.
-    pub(crate) fn fall_back(&mut self, why: &str) {
+    /// From now on the pages come from the text importer, because `why`;
+    /// `missing` when there is no child, so the status says how to get one.
+    pub(crate) fn fall_back(&mut self, why: &str, missing: bool) {
         self.text_only = true;
         self.mode = Mode::Text;
         self.meta = None;
@@ -203,7 +217,12 @@ impl Viewer {
         self.proto = None;
         self.page = 0;
         self.scroll = 0;
-        self.status = format!("Text only: {why}; {HOW_TO_GET_PAGES}");
+        self.text_only_why = if missing {
+            format!("Text only: {why}; {HOW_TO_GET_PAGES}")
+        } else {
+            format!("Text only: {why}")
+        };
+        self.status = self.text_only_why.clone();
     }
 
     /// A question is pending.
@@ -305,6 +324,12 @@ impl Viewer {
         if matches!(req, Req::Info) {
             self.asked_info = true;
         }
+        // A child that could not be started fails anything but the opening.
+        let ans = match (&req, ans) {
+            (Req::Info, ans) => ans,
+            (_, Ans::NoChild(why)) => Ans::Failed(why),
+            (_, ans) => ans,
+        };
         match (req, ans) {
             (Req::Info, Ans::Info(m)) => {
                 self.page = self.page.min(m.pages.len().saturating_sub(1));
@@ -314,11 +339,21 @@ impl Viewer {
                 self.unopened = Some(LOCKED.into());
                 self.status.clear();
             }
-            (Req::Info, Ans::Failed(why)) => {
-                if !self.text_only {
-                    return Next::TextOnly(why);
-                }
+            (Req::Info, Ans::NoChild(why)) if !self.text_only => {
+                return Next::TextOnly { why, missing: true };
+            }
+            // The child died or ran out of time on the file: it is not read
+            // again in docxy's own process.
+            (Req::Info, Ans::Failed(why))
+                if self.text_only || why == child::DIED || why == child::TOO_LONG =>
+            {
                 self.unopened = Some(format!("This PDF can't be opened: {why}"));
+            }
+            (Req::Info, Ans::Failed(why)) => {
+                return Next::TextOnly {
+                    why,
+                    missing: false,
+                };
             }
             (Req::Pixels { .. }, Ans::Pixels(r)) => {
                 if let Some(want) = want {
@@ -337,7 +372,7 @@ impl Viewer {
                 self.failed.insert(page, why);
             }
             (Req::Text { page }, Ans::Text(t)) => {
-                self.texts.insert(page, Ok(t));
+                self.texts.insert(page, Ok(clean_text(&t)));
             }
             (Req::Text { page }, Ans::Failed(why)) => {
                 self.texts.insert(page, Err(why));
@@ -369,9 +404,8 @@ impl Viewer {
             }
             return false;
         }
-        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Char('q') if ctrl => return true,
+            // q, Esc and Ctrl+Q.
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::PageDown | KeyCode::Right | KeyCode::Char(' ' | 'n') => self.turn(1),
             KeyCode::PageUp | KeyCode::Left | KeyCode::Char('p') => self.turn(-1),
@@ -424,7 +458,7 @@ impl Viewer {
 
     fn toggle_mode(&mut self) {
         if self.text_only {
-            self.status = format!("Text only: {HOW_TO_GET_PAGES}");
+            self.status = self.text_only_why.clone();
             return;
         }
         self.mode = match self.mode {
@@ -458,7 +492,10 @@ impl Viewer {
             self.proto = None;
         }
         let bar = Style::default().add_modifier(Modifier::REVERSED);
-        f.render_widget(Paragraph::new(self.header()).style(bar), header);
+        f.render_widget(
+            Paragraph::new(clean_line(&self.header())).style(bar),
+            header,
+        );
         self.draw_body(f, body);
         self.goto_at = None;
         let foot = match &self.goto {
@@ -468,7 +505,7 @@ impl Viewer {
                 f.set_cursor_position((footer.x + (label.len() + digits.len()) as u16, footer.y));
                 format!("{label}{digits}")
             }
-            None if !self.status.is_empty() => format!(" {}", self.status),
+            None if !self.status.is_empty() => format!(" {}", clean_line(&self.status)),
             None => format!(" {}", self.hint()),
         };
         f.render_widget(Paragraph::new(foot).style(bar), footer);
@@ -528,7 +565,7 @@ impl Viewer {
         };
         match text {
             Some(t) => {
-                let lines = wrap(&t, usize::from(body.width));
+                let lines = wrap(&clean_text(&t), usize::from(body.width));
                 let max = lines.len().saturating_sub(usize::from(body.height));
                 self.scroll = self.scroll.min(max);
                 let shown: Vec<String> = lines
@@ -697,6 +734,62 @@ impl Viewer {
     }
 }
 
+/// `text` as it may be drawn in cells: a PDF's text (or its file name, or
+/// a reason the child gives) is the file's, and a terminal acts on control
+/// characters. C0 and C1 controls (but `\n`) and DEL become U+FFFD, so no
+/// ESC, BEL, CSI or OSC reaches a cell; `\r\n` and a lone `\r` are line
+/// breaks; a tab is spaces to the next multiple of 8 columns; bidi controls
+/// and invisible format characters that would move or hide what the cells
+/// show are dropped (ZWJ and ZWNJ, which join, are kept).
+pub(crate) fn clean_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut col = 0usize;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => {
+                out.push('\n');
+                col = 0;
+            }
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                out.push('\n');
+                col = 0;
+            }
+            '\t' => {
+                let n = 8 - col % 8;
+                out.extend(std::iter::repeat_n(' ', n));
+                col += n;
+            }
+            c if c.is_control() => {
+                out.push('\u{FFFD}');
+                col += 1;
+            }
+            '\u{061C}'
+            | '\u{200B}'
+            | '\u{200E}'
+            | '\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+            | '\u{FFF9}'..='\u{FFFB}' => {}
+            c => {
+                out.push(c);
+                col += c.width().unwrap_or(0);
+            }
+        }
+    }
+    out
+}
+
+/// [`clean_text`] on one line: its line breaks are spaces.
+pub(crate) fn clean_line(text: &str) -> String {
+    clean_text(text).replace('\n', " ")
+}
+
 /// `text`'s lines wrapped to `width` columns by display width (a wide
 /// character takes two): at spaces, and inside a word longer than a line.
 pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -731,9 +824,15 @@ pub(crate) fn wrap(text: &str, width: usize) -> Vec<String> {
 
 // ---- the engine and the loop -------------------------------------------------------------
 
-/// A source answering on a thread of its own: `ask` never waits.
+/// The engine thread's name: the panic hook leaves its panics to it.
+const ENGINE_THREAD: &str = "docxy-pdf-engine";
+
+/// A source answering on a thread of its own: `ask` never waits. A panic
+/// in the source answers [`child::DIED`] (the viewer is never left waiting);
+/// dropping the engine, or [`Engine::kill`], ends the source's child.
 pub(crate) struct Engine {
     tx: mpsc::Sender<Req>,
+    killer: Option<Killer>,
 }
 
 impl Engine {
@@ -741,22 +840,39 @@ impl Engine {
         mut source: Box<dyn Source>,
         answer: impl Fn(Req, Ans) -> bool + Send + 'static,
     ) -> Engine {
+        let killer = source.killer();
         let (tx, rx) = mpsc::channel::<Req>();
         let _ = std::thread::Builder::new()
-            .name("docxy-pdf-engine".into())
+            .name(ENGINE_THREAD.into())
             .spawn(move || {
                 for req in rx {
-                    let ans = source.ask(&req);
+                    let ans =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| source.ask(&req)))
+                            .unwrap_or_else(|_| Ans::Failed(child::DIED.into()));
                     if !answer(req, ans) {
                         return;
                     }
                 }
             });
-        Engine { tx }
+        Engine { tx, killer }
     }
 
     pub(crate) fn ask(&self, req: Req) {
         let _ = self.tx.send(req);
+    }
+
+    /// End the source's child now, even mid-question (a quit): the engine
+    /// thread's wait ends with the child's output.
+    pub(crate) fn kill(&self) {
+        if let Some(k) = &self.killer {
+            k.kill();
+        }
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 
@@ -781,6 +897,11 @@ pub(crate) fn run(path: &str) -> std::io::Result<()> {
 
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // The engine catches its own (it answers DIED): neither the screen
+        // nor the terminal's state is touched.
+        if std::thread::current().name() == Some(ENGINE_THREAD) {
+            return;
+        }
         drop(Restore);
         default_hook(info);
     }));
@@ -897,8 +1018,8 @@ pub(crate) fn run(path: &str) -> std::io::Result<()> {
                     Err(e) => req.reply_err(e),
                 },
                 Msg::Pdf(req, ans) => {
-                    if let Next::TextOnly(why) = viewer.on_answer(req, ans) {
-                        viewer.fall_back(&why);
+                    if let Next::TextOnly { why, missing } = viewer.on_answer(req, ans) {
+                        viewer.fall_back(&why, missing);
                         engine = engine_for(Box::new(TextOnly::new(file.clone())), &tx);
                     }
                 }
@@ -912,6 +1033,8 @@ pub(crate) fn run(path: &str) -> std::io::Result<()> {
             break Ok(());
         }
     };
+    // A quit mid-question ends the child now, not at its watchdog.
+    engine.kill();
     drop(ctl_server);
     drop(restore);
     terminal.show_cursor()?;

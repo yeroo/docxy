@@ -88,6 +88,7 @@ def script_editor(text):
         if words[0].lower() == 'terminal' and len(words) > 1:
             return words[1]
         return None
+    return None
 
 
 def opens_pdf(text):
@@ -110,7 +111,6 @@ def pdf_child(environ, suite, exe_suffix):
     when set, else the one the suite's workspace builds beside the suite."""
     named = environ.get('DOCXY_PDF')
     return Path(named) if named else suite.parent / f'docxy-pdf{exe_suffix}'
-    return None
 
 
 def script_plugins(text):

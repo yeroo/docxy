@@ -10,6 +10,7 @@ use ratatui::backend::TestBackend;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use unicode_width::UnicodeWidthChar;
 
 fn corpus(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("../corpus/pdf-view/{name}.pdf"))
@@ -223,9 +224,102 @@ fn without_the_child_the_text_importer_shows_the_text_and_says_why() {
     assert!(s.contains("Привет, мир!"), "{s}");
     assert!(s.contains("text.pdf · text only"), "{s}");
     // `t` cannot show pages: it says how to get them.
+    v.status.clear();
     v.on_key(key(KeyCode::Char('t')));
     assert_eq!(v.mode, Mode::Text);
-    assert!(v.status.contains(HOW_TO_GET_PAGES));
+    assert_eq!(
+        v.status,
+        format!("Text only: docxy-pdf was not found; {HOW_TO_GET_PAGES}")
+    );
+}
+
+#[test]
+fn a_child_that_cannot_be_started_falls_back_saying_how_to_get_one() {
+    let mut v = Viewer::new("x.pdf", Some(plain()), None);
+    v.take_next();
+    assert_eq!(
+        v.on_answer(Req::Info, Ans::NoChild("cannot exec".into())),
+        Next::TextOnly {
+            why: "cannot exec".into(),
+            missing: true
+        }
+    );
+    v.fall_back("cannot exec", true);
+    assert!(v.status.contains(HOW_TO_GET_PAGES), "{}", v.status);
+}
+
+/// A file the child died on or ran out of time with is not read again in
+/// docxy's own process: no text importer, the reason only.
+#[test]
+fn a_child_that_dies_or_times_out_opening_the_file_shows_no_text() {
+    for why in [child::DIED, child::TOO_LONG] {
+        let mut v = Viewer::new("x.pdf", Some(plain()), None);
+        v.take_next();
+        assert_eq!(
+            v.on_answer(Req::Info, Ans::Failed(why.into())),
+            Next::Nothing
+        );
+        assert!(!v.text_only);
+        assert_eq!(
+            v.unopened.as_deref(),
+            Some(format!("This PDF can't be opened: {why}").as_str())
+        );
+        assert_eq!(v.take_next(), None, "nothing more is asked");
+        let mut t = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        t.draw(|f| v.draw(f)).unwrap();
+        assert!(
+            screen(&t).contains("This PDF can't be opened"),
+            "{}",
+            screen(&t)
+        );
+    }
+}
+
+/// No control character of a page's text (or of a reason, or of the file
+/// name) reaches a cell: an OSC or CSI in a CMap would act on the terminal.
+#[test]
+fn control_characters_in_the_text_never_reach_a_cell() {
+    let nasty = "a\x1b]0;x\x07b\u{9b}31mc\td\r\ne\u{202E}f\u{200D}g\x7f";
+    assert_eq!(
+        clean_text(nasty),
+        "a\u{FFFD}]0;x\u{FFFD}b\u{FFFD}31mc   d\ne\u{FFFD}f\u{200D}g\u{FFFD}"
+            .replace("e\u{FFFD}f", "ef")
+    );
+    assert_eq!(clean_text("\tx\rab\ty"), "        x\nab      y");
+    let mut v = Viewer::new("evil\x1b[2J.pdf", Some(plain()), None);
+    v.take_next();
+    v.on_answer(Req::Info, Ans::Info(meta(2)));
+    let req = v.take_next().unwrap();
+    v.on_answer(req, Ans::Text(format!("{nasty} {}", "word ".repeat(30))));
+    v.status = "child said \x1b]52;c;aGk=\x07".into();
+    let mut t = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    t.draw(|f| v.draw(f)).unwrap();
+    let buf = t.backend().buffer();
+    for cell in buf.content() {
+        assert!(
+            !cell.symbol().chars().any(|c| c.is_control()),
+            "{:?} in a cell",
+            cell.symbol()
+        );
+    }
+    for line in &v.shown {
+        assert!(
+            line.chars().map(|c| c.width().unwrap_or(0)).sum::<usize>() <= 40,
+            "{line:?} is wider than the body"
+        );
+    }
+    // A page that failed with such a reason is cleaned too.
+    v.on_key(key(KeyCode::PageDown));
+    let req = v.take_next().unwrap();
+    v.on_answer(req, Ans::Failed("bad\x1b[31m".into()));
+    t.draw(|f| v.draw(f)).unwrap();
+    assert!(
+        t.backend()
+            .buffer()
+            .content()
+            .iter()
+            .all(|c| !c.symbol().chars().any(|c| c.is_control()))
+    );
 }
 
 #[test]
@@ -234,10 +328,17 @@ fn a_child_that_cannot_open_the_file_falls_back_to_its_text() {
     v.take_next();
     assert_eq!(
         v.on_answer(Req::Info, Ans::Failed("no page tree".into())),
-        Next::TextOnly("no page tree".into())
+        Next::TextOnly {
+            why: "no page tree".into(),
+            missing: false
+        }
     );
-    v.fall_back("no page tree");
+    v.fall_back("no page tree", false);
     assert!(v.text_only);
+    // The child is there: the status gives its reason, not how to get it.
+    assert_eq!(v.status, "Text only: no page tree");
+    v.on_key(key(KeyCode::Char('t')));
+    assert_eq!(v.status, "Text only: no page tree", "t repeats the reason");
     assert_eq!(
         v.take_next(),
         Some(Req::Info),
@@ -480,6 +581,18 @@ fn fake_child() {
     };
     let out = std::io::stdout();
     let mut out = out.lock();
+    if mode == "chatter" {
+        // Lines forever, never the hello.
+        loop {
+            if writeln!(out, "not the hello")
+                .and_then(|()| out.flush())
+                .is_err()
+            {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     writeln!(out, "a line before the hello").unwrap();
     writeln!(out, r#"{{"hello":"docxy-pdf","protocol":1}}"#).unwrap();
     out.flush().unwrap();
@@ -573,10 +686,86 @@ fn a_child_that_dies_or_answers_nonsense_fails_the_question() {
         corpus("text"),
         Duration::from_secs(5),
     );
-    let Ans::Failed(why) = c.ask(&Req::Info) else {
-        panic!("failed")
+    let Ans::NoChild(why) = c.ask(&Req::Info) else {
+        panic!("no child")
     };
     assert!(why.contains("could not be started"), "{why}");
+}
+
+#[test]
+fn a_source_that_panics_answers_died_and_the_engine_goes_on() {
+    struct Panics(usize);
+    impl Source for Panics {
+        fn ask(&mut self, _: &Req) -> Ans {
+            self.0 += 1;
+            if self.0 == 1 {
+                panic!("a bad page");
+            }
+            Ans::Text("fine".into())
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = Engine::start(Box::new(Panics(0)), move |req, ans| {
+        tx.send((req, ans)).is_ok()
+    });
+    engine.ask(Req::Text { page: 0 });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        (Req::Text { page: 0 }, Ans::Failed(child::DIED.into()))
+    );
+    engine.ask(Req::Text { page: 1 });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        (Req::Text { page: 1 }, Ans::Text("fine".into()))
+    );
+}
+
+/// A quit while the child works on a page ends the child at once, not at
+/// its watchdog.
+#[test]
+fn killing_the_engine_ends_a_child_that_hangs() {
+    let child = fake("hang", Duration::from_secs(60));
+    let killer = child.killer().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let engine = Engine::start(Box::new(child), move |req, ans| tx.send((req, ans)).is_ok());
+    engine.ask(Req::Info);
+    // Started, and its hello read: the question is with it now.
+    let start = std::time::Instant::now();
+    let pid = loop {
+        if let Some(pid) = killer.pid() {
+            break pid;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "the child never started"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    let killed = std::time::Instant::now();
+    engine.kill();
+    let (_, ans) = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(ans, Ans::Failed(child::DIED.into()));
+    assert!(killed.elapsed() < Duration::from_secs(10));
+    assert_eq!(killer.pid(), None);
+    #[cfg(target_os = "linux")]
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "the child {pid} still runs"
+    );
+    let _ = pid;
+}
+
+#[test]
+fn a_child_that_chatters_and_never_says_hello_is_given_up_in_time() {
+    let mut c = fake("chatter", Duration::from_secs(2));
+    let start = std::time::Instant::now();
+    assert_eq!(c.ask(&Req::Info), Ans::Failed(child::TOO_LONG.into()));
+    assert!(
+        start.elapsed() < Duration::from_secs(6),
+        "{:?}",
+        start.elapsed()
+    );
 }
 
 #[test]

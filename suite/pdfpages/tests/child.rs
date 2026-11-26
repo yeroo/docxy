@@ -319,8 +319,13 @@ fn no_corpus_file_or_mutation_hangs_or_answers_nonsense() {
                         outcome.push(if ok == Some(true) { "ok" } else { "failed" });
                     }
                     Err(e) if e == "no answer in time" => panic!("{what}: {req}: hung"),
-                    // The child died (an abort past its memory limit): the
-                    // parent fails the page; the next request starts another.
+                    // Output that is no answer is the child's bug, not a death.
+                    Err(e) if e.starts_with("not JSON") || e == "cut short" => {
+                        panic!("{what}: {req}: {e}")
+                    }
+                    // The child died (an abort past its memory limit): its
+                    // output ended, or reading it failed. The parent fails
+                    // the page; the next request starts another.
                     Err(_) => {
                         outcome.push("died");
                         break;

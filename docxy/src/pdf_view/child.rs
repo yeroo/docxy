@@ -12,8 +12,8 @@ use ctlcore::json::Json;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 /// How long one question may take: the suite's (`convert_child::TIMEOUT`).
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(20);
@@ -72,11 +72,49 @@ pub(crate) enum Ans {
     Pixels(Raster),
     Text(String),
     Failed(String),
+    /// The child could not be started at all (not a failure of the file).
+    NoChild(String),
 }
 
 /// Something that answers questions about one PDF.
 pub(crate) trait Source: Send {
     fn ask(&mut self, req: &Req) -> Ans;
+
+    /// What ends the source's child process from another thread, if it has
+    /// one.
+    fn killer(&self) -> Option<Killer> {
+        None
+    }
+}
+
+/// The child process of a [`Child`], shared so the viewer's loop can end it
+/// while the engine thread waits on it (a quit during a slow page).
+#[derive(Clone, Default)]
+pub(crate) struct Killer(Arc<Mutex<Option<std::process::Child>>>);
+
+impl Killer {
+    fn put(&self, child: std::process::Child) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+    }
+
+    /// End the running process, if there is one, and reap it.
+    pub(crate) fn kill(&self) {
+        let taken = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut child) = taken {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// The running process's id (the tests').
+    #[cfg(test)]
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(std::process::Child::id)
+    }
 }
 
 // ---- finding the child ---------------------------------------------------------
@@ -137,18 +175,17 @@ enum Said {
     Other,
 }
 
-/// A running child: its process, its stdin, and its output read on a
-/// thread of its own so a wait can time out.
+/// A running child: its stdin, its output read on a thread of its own so a
+/// wait can time out, and its process (in the shared [`Killer`]).
 struct Running {
-    child: std::process::Child,
     stdin: ChildStdin,
     said: mpsc::Receiver<Said>,
+    process: Killer,
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.process.kill();
     }
 }
 
@@ -159,6 +196,7 @@ pub(crate) struct Child {
     file: PathBuf,
     timeout: Duration,
     running: Option<Running>,
+    process: Killer,
 }
 
 impl Child {
@@ -180,18 +218,19 @@ impl Child {
             file,
             timeout,
             running: None,
+            process: Killer::default(),
         }
     }
 
     /// The running child, started (and its hello read) when there is none.
-    fn connect(&mut self) -> Result<&mut Running, String> {
+    fn connect(&mut self) -> Result<&mut Running, Ans> {
         if self.running.is_none() {
             self.running = Some(self.spawn()?);
         }
         Ok(self.running.as_mut().expect("started above"))
     }
 
-    fn spawn(&self) -> Result<Running, String> {
+    fn spawn(&self) -> Result<Running, Ans> {
         let mut child = Command::new(&self.exe)
             .args(&self.args)
             .arg(&self.file)
@@ -201,22 +240,33 @@ impl Child {
             // Anything it prints there would be drawn over the viewer.
             .stderr(Stdio::null())
             .spawn()
-            .map_err(|e| format!("{} could not be started: {e}", self.exe.display()))?;
-        let stdin = child.stdin.take().ok_or(DIED)?;
-        let stdout = child.stdout.take().ok_or(DIED)?;
+            .map_err(|e| {
+                Ans::NoChild(format!("{} could not be started: {e}", self.exe.display()))
+            })?;
+        let died = || Ans::Failed(DIED.into());
+        let stdin = child.stdin.take().ok_or_else(died)?;
+        let stdout = child.stdout.take().ok_or_else(died)?;
+        self.process.put(child);
         let (tx, said) = mpsc::channel();
         let _ = std::thread::Builder::new()
             .name("docxy-pdf-reader".into())
             .spawn(move || read_answers(BufReader::new(stdout), tx));
-        let running = Running { child, stdin, said };
+        let running = Running {
+            stdin,
+            said,
+            process: self.process.clone(),
+        };
         // Anything before the hello is skipped (a test binary run as the
-        // child prints its own lines first).
+        // child prints its own lines first), all within one timeout: a child
+        // that chatters and never says hello is not waited on forever.
+        let deadline = Instant::now() + self.timeout;
         loop {
-            match running.said.recv_timeout(self.timeout) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match running.said.recv_timeout(left) {
                 Ok(Said::Json(j, _)) if is_hello(&j) => return Ok(running),
                 Ok(_) => continue,
-                Err(mpsc::RecvTimeoutError::Timeout) => return Err(TOO_LONG.into()),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(DIED.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Err(Ans::Failed(TOO_LONG.into())),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(died()),
             }
         }
     }
@@ -226,6 +276,7 @@ impl Drop for Child {
     fn drop(&mut self) {
         // Ends the child: `Running`'s drop kills it.
         self.running = None;
+        self.process.kill();
     }
 }
 
@@ -268,13 +319,17 @@ fn read_answers(mut out: impl BufRead, tx: mpsc::Sender<Said>) {
 }
 
 impl Source for Child {
+    fn killer(&self) -> Option<Killer> {
+        Some(self.process.clone())
+    }
+
     fn ask(&mut self, req: &Req) -> Ans {
         let timeout = self.timeout;
         let running = match self.connect() {
             Ok(r) => r,
-            Err(why) => {
+            Err(ans) => {
                 self.running = None;
-                return Ans::Failed(why);
+                return ans;
             }
         };
         let line = match req {

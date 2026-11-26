@@ -101,6 +101,8 @@ class ScriptCases(unittest.TestCase):
         self.assertIsNone(sweep.script_editor('test t\nterminal docxy\n'),
                           'only the first line names an editor')
         self.assertIsNone(sweep.script_editor('terminal\n'))
+        self.assertIsNone(sweep.script_editor(''), 'no lines: the suite')
+        self.assertIsNone(sweep.script_editor('# only a comment\n\n'))
         committed = {p.name: sweep.script_editor(p.read_text(encoding='utf-8'))
                      for p in sweep.CASES.glob('terminal-*.uit')}
         self.assertEqual(sorted(set(committed.values())), ['docxy', 'xlsxy', 'yppxy'])
