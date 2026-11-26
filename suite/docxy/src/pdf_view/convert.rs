@@ -31,10 +31,21 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 mod columns;
 mod fonts;
 mod running;
+
+/// How long the layout step may take: half the child's whole
+/// [`crate::convert_child::TIMEOUT`], so a slow file leaves the text
+/// importer the other half. Checked per page, before each page's pictures,
+/// and before the export and its loading.
+pub(crate) const LAYOUT_TIME: Duration =
+    Duration::from_secs(crate::convert_child::TIMEOUT.as_secs() / 2);
+
+/// What the layout step says past [`LAYOUT_TIME`].
+pub(crate) const LAYOUT_TOO_LONG: &str = "the layout conversion took too long";
 
 /// The most blocks that get a code colour: every 24-bit colour but black.
 /// Blocks past it keep their colour and no font.
@@ -82,13 +93,31 @@ pub(crate) fn convert_with(
     }
 }
 
-/// The PDF converted with its layout; `Ok(None)` when it keeps nothing.
+/// The PDF converted with its layout within [`LAYOUT_TIME`]; `Ok(None)`
+/// when it keeps nothing.
 pub(crate) fn layout(bytes: &[u8]) -> Result<Option<ConvertedDoc>, String> {
+    layout_until(bytes, Instant::now() + LAYOUT_TIME)
+}
+
+/// Past `deadline`, an error ([`LAYOUT_TOO_LONG`]).
+fn on_time(deadline: Instant) -> Result<(), String> {
+    if Instant::now() < deadline {
+        Ok(())
+    } else {
+        Err(LAYOUT_TOO_LONG.into())
+    }
+}
+
+/// [`layout`], given up at `deadline`.
+pub(crate) fn layout_until(
+    bytes: &[u8],
+    deadline: Instant,
+) -> Result<Option<ConvertedDoc>, String> {
     let Read {
         mut pages,
         mut sources,
         title,
-    } = read_pages(bytes)?;
+    } = read_pages(bytes, deadline)?;
     if pages
         .iter()
         .all(|p| p.blocks.is_empty() && p.images.is_empty())
@@ -146,10 +175,12 @@ pub(crate) fn layout(bytes: &[u8]) -> Result<Option<ConvertedDoc>, String> {
         .iter_mut()
         .map(|v| std::mem::take(&mut v.page))
         .collect();
+    on_time(deadline)?;
     let docx = pdfcraft_export::docx_with_language(&export, &title, None);
     if docx.is_empty() {
         return Err("PdfCraft could not write the converted document".into());
     }
+    on_time(deadline)?;
     let mut pkg = docxcore::package::load_package(&docx).map_err(|e| e.to_string())?;
     pkg.ensure_styles(&["Heading1", "Heading2"]);
     sections(
@@ -173,8 +204,9 @@ pub(crate) fn layout(bytes: &[u8]) -> Result<Option<ConvertedDoc>, String> {
 /// The PDF's pages as `pdfcraft_export` takes them, each block's source
 /// beside it (same order), as `pdfcraft-engine`'s `export_pages_within`
 /// builds them; pictures within `docxcore`'s HTML import budgets
-/// (`html_image`), which the suite holds the converted document in too.
-pub(crate) fn read_pages(bytes: &[u8]) -> Result<Read, String> {
+/// (`html_image`), which the suite holds the converted document in too;
+/// given up at `deadline`.
+pub(crate) fn read_pages(bytes: &[u8], deadline: Instant) -> Result<Read, String> {
     use docxcore::import::html_image::{MAX_IMAGE_BYTES, MAX_MEDIA_BYTES};
     let bytes = Arc::new(bytes.to_vec());
     let cos = pdfcraft_cos::Document::open_with_password(bytes.clone(), None)
@@ -186,6 +218,7 @@ pub(crate) fn read_pages(bytes: &[u8]) -> Result<Read, String> {
     let mut pages = Vec::with_capacity(info.pages.len());
     let mut sources = Vec::with_capacity(info.pages.len());
     for (i, page) in info.pages.iter().enumerate() {
+        on_time(deadline)?;
         let visible = |r: [f64; 4]| {
             let a = page.user_to_view(r[0] as f32, r[1] as f32);
             let b = page.user_to_view(r[2] as f32, r[3] as f32);
@@ -225,9 +258,11 @@ pub(crate) fn read_pages(bytes: &[u8]) -> Result<Read, String> {
                 rotation: b.rotation - f64::from(page.rotation),
             });
         }
+        on_time(deadline)?;
         let placed = pdfcraft_edit::reading_images(&cos, i).unwrap_or_default();
         let mut images = Vec::new();
         for im in &placed {
+            on_time(deadline)?;
             let Some(object) = im.object else { continue };
             let prepared = encoded.entry(object).or_insert_with(|| {
                 let (ext, data) =
@@ -563,7 +598,7 @@ fn add_running(
             color: None,
         },
     };
-    pkg.ensure_styles(&["Header", "Footer"]);
+    pkg.ensure_styles(&[crate::hf::style_id(true), crate::hf::style_id(false)]);
     let mut refs = Vec::new();
     for (lines, is_header) in [(&r.header, true), (&r.footer, false)] {
         if lines.is_empty() {
@@ -574,7 +609,9 @@ fn add_running(
             refs.push((is_header, "default", rid));
         }
         if r.title_page {
-            if let Some((rid, _)) = pkg.create_hf_part(is_header, "<w:p/>") {
+            if let Some((rid, _)) =
+                pkg.create_hf_part(is_header, &crate::hf::empty_content(is_header))
+            {
                 refs.push((is_header, "first", rid));
             }
         }

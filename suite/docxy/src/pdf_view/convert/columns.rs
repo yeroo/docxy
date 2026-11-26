@@ -332,7 +332,7 @@ pub(crate) fn detect(page: &Page) -> Option<Layout> {
             image_band,
             top,
         };
-        lift_heads(&mut layout, blocks, beside);
+        lift_heads(&mut layout, blocks, &page.images, beside);
         if layout.block_band.iter().flatten().count() < 2 {
             return None;
         }
@@ -343,43 +343,52 @@ pub(crate) fn detect(page: &Page) -> Option<Layout> {
 
 /// Blocks of the region wholly above where every column has begun (a
 /// heading over the first column) belong to the band above: unless the
-/// band already has text beside another column.
-fn lift_heads(layout: &mut Layout, blocks: &[Block], beside: Option<usize>) {
+/// band already has text beside another column. Where a column begins is
+/// its highest block or picture, so a column that opens with a picture
+/// lifts nothing of the others; and a column keeps at least one block of
+/// its own.
+fn lift_heads(layout: &mut Layout, blocks: &[Block], images: &[Image], beside: Option<usize>) {
     let n = layout.bands.len();
     let mut tops = vec![f64::NEG_INFINITY; n];
-    let mut seconds = vec![f64::NEG_INFINITY; n];
-    for (b, at) in blocks.iter().zip(&layout.block_band) {
+    let mut left = vec![0usize; n];
+    let placed = blocks
+        .iter()
+        .map(|b| b.rect)
+        .zip(&layout.block_band)
+        .chain(images.iter().map(|i| i.rect).zip(&layout.image_band));
+    for (r, at) in placed {
         if let Some(j) = *at {
-            let t = b.rect[3];
-            if t > tops[j] {
-                seconds[j] = tops[j];
-                tops[j] = t;
-            } else if t > seconds[j] {
-                seconds[j] = t;
-            }
+            tops[j] = tops[j].max(r[3]);
         }
+    }
+    for j in layout.block_band.iter().flatten() {
+        left[*j] += 1;
     }
     let start = tops.iter().copied().fold(f64::INFINITY, f64::min);
     if !start.is_finite() {
         return;
     }
-    for (b, at) in blocks.iter().zip(layout.block_band.iter_mut()) {
-        if let Some(j) = *at {
-            let lifted = b.rect[1] >= start - 1.0 && beside.is_none_or(|k| k == j);
-            // A column keeps at least its own text.
-            if lifted && seconds[j].is_finite() {
-                *at = None;
-            }
+    // Highest first, so what a column keeps is its lowest text.
+    let mut order: Vec<usize> = (0..blocks.len()).collect();
+    order.sort_by(|&a, &b| blocks[b].rect[3].total_cmp(&blocks[a].rect[3]));
+    for i in order {
+        let Some(j) = layout.block_band[i] else {
+            continue;
+        };
+        let above = blocks[i].rect[1] >= start - 1.0;
+        if above && beside.is_none_or(|k| k == j) && left[j] > 1 {
+            layout.block_band[i] = None;
+            left[j] -= 1;
         }
     }
-    let lifted_top = blocks
+    let region_top = blocks
         .iter()
         .zip(&layout.block_band)
         .filter(|(_, at)| at.is_some())
         .map(|(b, _)| b.rect[3])
         .fold(f64::NEG_INFINITY, f64::max);
-    if lifted_top.is_finite() {
-        layout.top = lifted_top;
+    if region_top.is_finite() {
+        layout.top = region_top;
     }
 }
 
@@ -533,6 +542,65 @@ mod tests {
         ));
         let l = detect(&letter(blocks)).unwrap();
         assert_eq!(l.block_band, vec![None, Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn a_column_opening_with_a_picture_lifts_nothing_of_the_other() {
+        // The left column opens with a figure, its text below; the right
+        // column's text starts higher than the left column's text.
+        let mut blocks = Vec::new();
+        for i in 0..6 {
+            blocks.push(line(72.0, 540.0 - i as f64 * 13.0, 210.0));
+        }
+        for i in 0..14 {
+            blocks.push(line(324.0, 650.0 - i as f64 * 13.0, 214.0));
+        }
+        let mut page = letter(blocks);
+        page.images.push(Image {
+            ext: "png",
+            bytes: std::sync::Arc::from(&b"png"[..]),
+            rect: [72.0, 560.0, 282.0, 660.0],
+            size: [210.0, 100.0],
+            rotation: 0.0,
+        });
+        let l = detect(&page).unwrap();
+        assert!(
+            l.block_band.iter().all(|b| b.is_some()),
+            "{:?}",
+            l.block_band
+        );
+        assert_eq!(l.image_band, vec![Some(0)]);
+        let v = split(page.clone(), sources(&page), 0);
+        assert_eq!(v.len(), 1, "no band above the columns");
+        // Reading order: the picture and the left column, then the right.
+        let p = &v[0].page;
+        assert_eq!(p.images.len(), 1);
+        let left_low = p.blocks[..6]
+            .iter()
+            .map(|b| b.rect[1])
+            .fold(f64::INFINITY, f64::min);
+        assert!(p.images[0].rect[1] > p.blocks[0].rect[3] - 1.0);
+        assert!(p.blocks[6..].iter().all(|b| b.rect[3] < left_low));
+    }
+
+    #[test]
+    fn a_column_keeps_one_block_of_its_own() {
+        // Two one-block columns under a heading over the first: the heading
+        // goes to the band, each column keeps its block.
+        let blocks = vec![
+            block("Two columns", [54.0, 715.0, 186.0, 737.0], 18.0),
+            block("Left column text", [54.0, 327.0, 188.0, 690.0], 9.0),
+            block("Right column text", [324.0, 327.0, 473.0, 690.0], 9.0),
+        ];
+        let l = detect(&letter(blocks.clone())).unwrap();
+        assert_eq!(l.block_band, vec![None, Some(0), Some(1)]);
+        // A right column of one block level with the start is never lifted.
+        let blocks = vec![
+            block("Left text", [54.0, 600.0, 188.0, 690.0], 9.0),
+            block("Right text", [324.0, 600.0, 473.0, 690.0], 9.0),
+        ];
+        let l = detect(&letter(blocks)).unwrap();
+        assert_eq!(l.block_band, vec![Some(0), Some(1)]);
     }
 
     #[test]

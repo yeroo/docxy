@@ -13077,7 +13077,7 @@ fn convert_doc_with(
     let kind = match what {
         What::Rtf => open_mode::Converted::Rtf,
         What::Html => open_mode::Converted::Html,
-        What::Pdf => open_mode::Converted::Pdf,
+        What::Pdf | What::PdfText => open_mode::Converted::Pdf,
         What::Recover => open_mode::Converted::Recovered,
         What::RecoverText => open_mode::Converted::RecoveredText,
     };

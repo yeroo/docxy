@@ -285,13 +285,25 @@ with its layout (#2257).
   error`) goes to the text importer (`import_pdf`, #951), whose encrypted
   message covers a file that needs its password (the convert child has
   none; an owner-only file converts). Tests inject the step.
+- Time and memory (r1): the layout step stops itself at `LAYOUT_TIME`
+  (half of `convert_child::TIMEOUT`; checked per page, per picture, before
+  the export and before loading it) and falls back in the same child with
+  the other half. An abort (an allocation past `limit_memory`'s
+  `RLIMIT_DATA`, which `catch_unwind` cannot reach) kills the child: the
+  parent (`convert_child::convert`, `retrying`) tries a PDF whose child
+  died (`DIED`) once more as `What::PdfText` (`--convert-import
+  pdf-text`, `import_pdf` alone, no limit set). A child killed for time is
+  not retried: the suite waits on its UI thread.
 - Running headers and footers (`convert/running.rs`), on the pages before
   the export: an unrotated block wholly in the top or bottom 12 % whose
   text, with digit runs as `#`, repeats on at least 2 and more than half
   the pages, middles within 6 pt and an edge (left, centre, right) within
-  12 pt. Removed from every page; the first page's pieces become a header
-  and a footer part (Header/Footer style, centre and right tab stops of
-  the text width, hand-written run XML in schema order), referenced from
+  12 pt, and each digit run the same on every page, each page's number or
+  the page count (a date cell, an amount or a count not starting at 1
+  stays in the body). Removed from every page; the first page's pieces
+  become a header and a footer part (Header/Footer style, centre and
+  right tab stops of the text width, hand-written run XML in schema
+  order), referenced from
   the first section only; digit runs that are each page's number are
   `PAGE`, the page count `NUMPAGES`. No running piece on page 1 of 3 or
   more pages: `w:titlePg` with empty first-page parts. `pgMar
@@ -306,6 +318,9 @@ with its layout (#2257).
   on a page whose PdfCraft text area (`min(w/8, 1 in)` margins) is one
   column wide. One section per virtual page comes out; the region's gets
   `w:cols`, a continuous start and the real page's `pgSz`/`pgMar` back.
+  Where a column begins is its highest block or picture; a block above
+  where every column has begun is lifted into the band (a heading over
+  the first column), never a column's last block.
   The export sizes headings against each virtual page, so a band's
   paragraphs get their level again against the real page's body
   (`heading_level`, PdfCraft's `level` rule). A positioned page

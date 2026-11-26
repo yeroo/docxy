@@ -4,7 +4,7 @@
 //! red word) and the cairo files `columns.pdf` and `scanned.pdf`.
 
 use super::*;
-use crate::pdf_view::tests::{ENCRYPTED, corpus_path, user_password};
+use crate::pdf_view::tests::{ENCRYPTED, UNREADABLE, corpus_path, user_password};
 use docxcore::model::{Document, PageGeom};
 use docxcore::package::Package;
 use std::time::Instant;
@@ -476,8 +476,20 @@ fn every_corpus_pdf_converts_or_says_why() {
     names.sort();
     names.push("source".into());
     assert!(names.len() >= 24, "{names:?}");
+    // What the layout step keeps nothing of: text only in annotations, or
+    // nothing readable at all.
+    let without_text = ["annots", "annots-noap", UNREADABLE];
     for name in &names {
         let bytes = corpus(name);
+        // The layout step itself, not hidden behind the fallback: never a
+        // panic, and a document for every file with text it may read.
+        let own = catch_unwind(AssertUnwindSafe(|| layout(&bytes)))
+            .unwrap_or_else(|_| panic!("{name}: the layout step panicked"));
+        if user_password(name).is_some() || without_text.contains(&name.as_str()) {
+            assert!(!matches!(own, Ok(Some(_))), "{name}");
+        } else {
+            assert!(matches!(own, Ok(Some(_))), "{name}: {:?}", own.err());
+        }
         let start = Instant::now();
         let got = convert(&bytes);
         let took = start.elapsed();
@@ -521,6 +533,29 @@ fn a_failing_or_panicking_pdfcraft_step_falls_back() {
     // The layout step's own document when it has one.
     let own = convert_with(&pdf, layout).unwrap();
     assert!(own.base.is_some());
+}
+
+/// The layout step stops at its deadline, so the text importer still has
+/// time in the same child (#2257 r1).
+#[test]
+fn a_layout_past_its_deadline_falls_back_to_the_text_importer() {
+    let bytes = corpus("convert");
+    let past = Instant::now();
+    assert_eq!(
+        layout_until(&bytes, past).err().as_deref(),
+        Some(LAYOUT_TOO_LONG)
+    );
+    let c = convert_with(&bytes, |b| layout_until(b, past)).unwrap();
+    assert!(c.base.is_none(), "the text importer's document");
+    let all: String = c.doc.body.iter().map(text).collect();
+    assert!(all.contains("spoonbills"), "{all}");
+    // Half the child's time, the other half left to the fallback.
+    assert_eq!(LAYOUT_TIME * 2, crate::convert_child::TIMEOUT);
+    assert!(
+        layout_until(&bytes, Instant::now() + LAYOUT_TIME)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[test]

@@ -10,8 +10,9 @@
 //! centres or right edges within [`X_TOL`]. A piece is running when it is
 //! on at least two pages and on more than half of them. A digit run that is
 //! the page's own number on every page it is on is the PAGE field, one that
-//! is the page count everywhere NUMPAGES; any other keeps the first page's
-//! digits.
+//! is the page count everywhere NUMPAGES; any other must be the same on
+//! every page, or the piece is no running one (its text differs per page:
+//! dates, amounts, numbers that do not count the pages from 1) and stays.
 
 #[cfg(test)]
 use pdfcraft_export::Block;
@@ -213,7 +214,7 @@ pub(crate) fn find(pages: &[Page]) -> Option<Running> {
         let mut on: Vec<usize> = g.iter().map(|&k| cands[k].page).collect();
         on.sort_unstable();
         on.dedup();
-        if on.len() < 2 || on.len() * 2 <= n {
+        if on.len() < 2 || on.len() * 2 <= n || !digits_repeat(&g, &cands, n) {
             continue;
         }
         for &k in &g {
@@ -304,6 +305,21 @@ fn slot(g: &[usize], cands: &[Cand], width: f64) -> Slot {
     }
 }
 
+/// Whether every digit run of a group is the same on all its pages, or is
+/// each page's number, or the page count: otherwise the text differs from
+/// page to page (dates, amounts, Bates numbers, a count that does not start
+/// at 1) and stays in the body, where each page has its own.
+fn digits_repeat(g: &[usize], cands: &[Cand], n: usize) -> bool {
+    let count = cands[g[0]].digits.len();
+    (0..count).all(|j| {
+        let digits = |k: usize| cands[k].digits.get(j);
+        let value = |k: usize| digits(k).and_then(|d| d.parse::<usize>().ok());
+        g.iter().all(|&k| digits(k) == digits(g[0]))
+            || g.iter().all(|&k| value(k) == Some(cands[k].page + 1))
+            || g.iter().all(|&k| value(k) == Some(n))
+    })
+}
+
 /// A field's [`Seg`] made from what the first page shows.
 type Field = fn(String) -> Seg;
 
@@ -385,7 +401,7 @@ pub(crate) fn part_xml(
     text_width: i32,
     look: &dyn Fn(&Piece) -> RunLook,
 ) -> String {
-    let style = if is_header { "Header" } else { "Footer" };
+    let style = crate::hf::style_id(is_header);
     let mut xml = String::new();
     for line in lines {
         xml.push_str(&format!(
@@ -598,17 +614,50 @@ mod tests {
             ]
         );
         assert_eq!(r.footer_from_bottom, Some(30.0));
-        // Other digits keep the first page's.
+        // Digits the same on every page are kept as they are.
+        let pages: Vec<Page> = (0..2)
+            .map(|_| letter(vec![body(600.0), header("Rev 7 2026", 72.0, 30.0)]))
+            .collect();
+        let r = find(&pages).unwrap();
+        assert_eq!(r.footer[0][0].segs, vec![Seg::Text("Rev 7 2026".into())]);
+    }
+
+    #[test]
+    fn digits_that_differ_per_page_and_count_nothing_stay_in_the_body() {
+        // A table's date cell at the same place on every page.
+        let pages: Vec<Page> = (0..3)
+            .map(|i| {
+                letter(vec![
+                    body(600.0),
+                    header(&format!("2026-11-{:02}", 3 + i * 7), 72.0, 30.0),
+                ])
+            })
+            .collect();
+        assert!(find(&pages).is_none());
+        // Page numbers that do not start at 1 (front matter, Bates numbers).
+        let pages: Vec<Page> = (0..3)
+            .map(|i| {
+                letter(vec![
+                    body(600.0),
+                    header(&format!("Page {}", i + 5), 280.0, 30.0),
+                ])
+            })
+            .collect();
+        assert!(find(&pages).is_none());
+        // A piece whose digits vary stays; a repeating header beside it
+        // still runs.
         let pages: Vec<Page> = (0..2)
             .map(|i| {
                 letter(vec![
+                    header("Annual Report", 260.0, 760.0),
                     body(600.0),
                     header(&format!("Rev {} 2026", 7 + i), 72.0, 30.0),
                 ])
             })
             .collect();
         let r = find(&pages).unwrap();
-        assert_eq!(r.footer[0][0].segs, vec![Seg::Text("Rev 7 2026".into())]);
+        assert!(r.footer.is_empty());
+        assert_eq!(r.removed[0], vec![true, false, false]);
     }
 
     #[test]
