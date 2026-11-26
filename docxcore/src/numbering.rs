@@ -1202,6 +1202,21 @@ mod tests {
     /// A huge `w:ilvl` is level 8: the counters never grow past nine
     /// levels (#1948 r3).
     #[test]
+    fn a_huge_ilvl_is_the_last_level() {
+        let n = parse_numbering_xml(
+            "<w:numbering><w:abstractNum w:abstractNumId=\"1\"><w:lvl w:ilvl=\"0\">\
+             <w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%1.\"/></w:lvl></w:abstractNum>\
+             <w:num w:numId=\"1\"><w:abstractNumId w:val=\"1\"/></w:num></w:numbering>",
+        );
+        let mut counters = HashMap::new();
+        assert_eq!(n.step(1, 2_000_000_000, &mut counters), Some(1));
+        assert_eq!(n.step(1, i32::MAX, &mut counters), Some(2));
+        assert!(counters.values().all(|c| c.len() <= 9), "{counters:?}");
+    }
+
+    /// #2002 r1: a `w:lvl` past OOXML's nine levels is skipped, so the
+    /// levels never grow to its `w:ilvl`; levels 0..8 still read.
+    #[test]
     fn a_level_past_the_ninth_is_skipped_not_grown_to_2002() {
         let lvl = |i: i64, text: &str| {
             format!(
@@ -1223,18 +1238,5 @@ mod tests {
             assert_eq!(n.level(1, i).map(|l| l.text), Some(format!("%{}.", i + 1)));
             assert!(n.level_run_props(1, i).is_some_and(|r| r.bold));
         }
-    }
-
-    #[test]
-    fn a_huge_ilvl_is_the_last_level() {
-        let n = parse_numbering_xml(
-            "<w:numbering><w:abstractNum w:abstractNumId=\"1\"><w:lvl w:ilvl=\"0\">\
-             <w:numFmt w:val=\"decimal\"/><w:lvlText w:val=\"%1.\"/></w:lvl></w:abstractNum>\
-             <w:num w:numId=\"1\"><w:abstractNumId w:val=\"1\"/></w:num></w:numbering>",
-        );
-        let mut counters = HashMap::new();
-        assert_eq!(n.step(1, 2_000_000_000, &mut counters), Some(1));
-        assert_eq!(n.step(1, i32::MAX, &mut counters), Some(2));
-        assert!(counters.values().all(|c| c.len() <= 9), "{counters:?}");
     }
 }
