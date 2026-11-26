@@ -418,8 +418,23 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the document edi
   `flex_none` box of the measured width (`marker_box_width`), the number
   left in it at its own width, so the text starts on the stop whatever the
   glyphs lay out at: DirectWrite drew "1." a pixel wider than measured and
-  put the text at 41 (#1986 ci1). The numbering level's own `w:rPr` is not
-  read.
+  put the text at 41 (#1986 ci1).
+- #2002: over the mark's look the number takes its numbering level's own
+  `w:lvl/w:rPr` (`Numbering::level_run_props`, a `numStyleLink` followed),
+  as Word draws it: `Numbering::marker_props` lays bold, italic (on, or an
+  explicit off in `raw_props`), colour (an explicit `auto` drops the
+  mark's), size and font over the mark; the suite's `marker_mark` calls it
+  at the level `list_markers` counts (`ilvl` clamped 0..8) and feeds
+  `marker_look`. A bullet level keeps the mark's font: the view draws its
+  own `•`/`◦`, not the level's `w:lvlText` glyph that Symbol or Wingdings
+  maps (`doc-word-compare-fonts.uit` pins the Segoe UI substitute). docxy's
+  own lists have no level `w:rPr`, so they draw as before. Not drawn from
+  it: underline, strike, caps, highlight, `w:rStyle`, `w:lvlOverride`
+  levels. The line keeps the mark's size (`para_text_px`): a level size
+  larger than the text does not grow the line, as Word's would. PDF export,
+  terminal docxy and the editable HTML page keep their markers' look. On a
+  dark page a marker's explicit colour, black included, maps through
+  `dark_page::text` like any run's (`run_ink`, #2079).
 - A nested HTML list sits at its own indent (600 twips per list): an item
   with a left of its own takes no level step (Lists, above).
 - Harness (test extension): `ext-doc-load {"html": ...}` imports a page

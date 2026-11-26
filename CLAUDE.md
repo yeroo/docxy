@@ -37,8 +37,8 @@ issue number to find its notes.
   fields (#1437), Web Layout and DocView fitting tables to the view width, horizontal
   scroll (#1895), Print Layout's y-only caret follow (#2080), the flow view drawing an
   imported mail: exact spacing and line height, list numbers in the mark's look, the
-  layout dump (#1986), nested tables widening their fitted cells and wide pictures
-  scaled to the room (#1963), list level and style indents drawn, HTML
+  layout dump (#1986), list markers in their level's `w:rPr` (#2002), nested
+  tables widening their fitted cells and wide pictures scaled to the room (#1963), list level and style indents drawn, HTML
   import's pinned list indents (#2231), list markers from the numbering
   part, counted across a table's cells (#2087), fields inside tracked
   changes: loaded `w:del`, tracked insertion, Compare (#1625), plain text
