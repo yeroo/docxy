@@ -11873,6 +11873,8 @@ fn bounds_probe(cell: UnitCell) -> AnyElement {
 /// where it sits across the text `column` it is drawn in (its x and width,
 /// window coordinates): `left` (at the column's left, as a table wider
 /// than it is), `center`, `right`, else `other`; `null` with no column.
+/// `inset` (#2151) is its left edge less the column's left, in px: where a
+/// `w:tblInd` put it (`null` with no column).
 fn painted_tables_json(
     tables: &PaintedTables,
     text_w: Option<f32>,
@@ -11924,6 +11926,10 @@ fn painted_tables_json(
                         Json::Bool(view.is_some() && right > 0. && right <= view_w + 1.),
                     ),
                     ("place", place),
+                    (
+                        "inset",
+                        column.map_or(Json::Null, |(cx, _)| round(f32::from(b.origin.x) - cx)),
+                    ),
                 ])
             })
             .collect(),
@@ -11949,6 +11955,10 @@ struct TableCtx<'a> {
     /// While a table pen is on (#763): where the tables and top-level
     /// paragraphs this frame lays out are recorded.
     draw: Option<std::rc::Rc<std::cell::RefCell<table_draw::DrawGeom>>>,
+    /// The package's `compatibilityMode` (#2151): below 15, or none, Word
+    /// measures a table's `w:tblInd` to its first cell's text
+    /// ([`docxcore::table::left_edge`]).
+    compat_mode: Option<u32>,
 }
 
 impl<'a> TableCtx<'a> {
@@ -11963,6 +11973,7 @@ impl<'a> TableCtx<'a> {
             cache: Default::default(),
             gridlines,
             draw: None,
+            compat_mode: pkg.and_then(Package::compatibility_mode),
         }
     }
 
@@ -42455,6 +42466,15 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     // unknown, the table stays at the left.
     let room = ctx.fit_width.or(ctx.line_width).or(ctx.hf_width);
     let fits = room.is_some_and(|r| tw_px(widest.min(i32::MAX as u32) as i32, zoom) <= r + 0.5);
+    let align = table_view::h_align(t);
+    // A left table's `w:tblInd` moves it right of the text's left (#2151),
+    // whether or not it fits: Word keeps the indent on a wider one, and a
+    // left margin (unlike gpui's auto ones) never pushes it past the left,
+    // so the sideways scroll still reaches its right edge.
+    let indent = match align {
+        table_view::HAlign::Left => docxcore::table::left_edge(t, ctx.tbl.compat_mode),
+        _ => 0,
+    };
     v_flex()
         .relative()
         .flex_none()
@@ -42463,7 +42483,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         // The flow column's 4 px below a top-level table (#1986), past its
         // own 8 px: a later `mb` replaces the bottom margin.
         .when(ctx.gap_below && path.len() == 1, |d| d.mb(px(8. + 4.)))
-        .when(fits, |d| match table_view::h_align(t) {
+        .when(indent > 0, |d| d.ml(px(tw_px(indent, zoom))))
+        .when(fits, |d| match align {
             table_view::HAlign::Left => d,
             table_view::HAlign::Center => d.mx_auto(),
             table_view::HAlign::Right => d.ml_auto(),

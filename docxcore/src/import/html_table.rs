@@ -328,9 +328,6 @@ pub(crate) struct Room {
     pub centred: bool,
 }
 
-/// Word's left cell margin when a table names none (Normal Table's 0.075").
-const WORD_CELL_MARGIN: u32 = 108;
-
 /// What a `<td>` / `<th>` says about itself, its row and its table.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct CellSpec {
@@ -751,15 +748,24 @@ fn layout_in(t: RawTable, avail: u32, declared: bool, budget: &Budget) -> Table 
         out_rows.push(row);
     }
 
-    let indent = spec
-        .room
-        .and_then(|room| place_in_room(&mut spec, room, &grid, avail));
-    Table {
+    let mut table = Table {
         grid,
         rows: out_rows,
-        raw_tblpr: Some(tblpr(&spec, indent)),
         ..Table::default()
-    }
+    };
+    let indent = match spec.room {
+        Some(room) => {
+            // Word measures the indent to the first cell's text: its own
+            // left padding (`tcMar`) if it has one, else the table's
+            // `cellpadding`, else Word's 108 (#2151).
+            table.raw_tblpr = Some(tblpr(&spec, None));
+            let margin = u32::try_from(crate::table::first_cell_left_margin(&table)).unwrap_or(0);
+            place_in_room(&mut spec, room, &table.grid, avail, margin)
+        }
+        None => None,
+    };
+    table.raw_tblpr = Some(tblpr(&spec, indent));
+    table
 }
 
 /// Place a table laid out in `room` (#2114, #1930 plan-2) on the body: its
@@ -772,8 +778,15 @@ fn layout_in(t: RawTable, avail: u32, declared: bool, budget: &Budget) -> Table 
 /// at the room's left, right or middle. A package with no
 /// `compatibilityMode` (the Markdown one) is laid out by Word in an older
 /// mode, where `tblInd` is measured to the first cell's text: its left
-/// cell margin is added.
-fn place_in_room(spec: &mut TableSpec, room: Room, grid: &[u32], avail: u32) -> Option<u32> {
+/// cell margin (`cell_margin`, its own padding or the table's, #2151) is
+/// added.
+fn place_in_room(
+    spec: &mut TableSpec,
+    room: Room,
+    grid: &[u32],
+    avail: u32,
+    cell_margin: u32,
+) -> Option<u32> {
     if let Some(w @ Width::Pct(_)) = spec.width {
         spec.width = Some(Width::Twips(resolve(w, avail)));
     }
@@ -792,7 +805,6 @@ fn place_in_room(spec: &mut TableSpec, room: Room, grid: &[u32], avail: u32) -> 
             Some("right") => free,
             _ => 0,
         };
-    let cell_margin = spec.cellpadding.map_or(WORD_CELL_MARGIN, px_twips);
     Some(offset.saturating_add(cell_margin).min(MAX_TWIPS))
 }
 

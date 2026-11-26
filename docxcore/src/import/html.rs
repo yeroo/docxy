@@ -1529,9 +1529,11 @@ fn table_spec(attrs: &Attrs, look: &Look, body: u32) -> TableSpec {
                 _ => None,
             },
         },
-        // In a centred fixed-width block, outside any cell (#2114): the
-        // room left between its indents.
-        room: (look.centred_box && !look.in_cell)
+        // In a centred fixed-width block (#2114) or an indented one (a
+        // `blockquote`, a `margin-left` div, a list item; #2151), outside
+        // any cell: the room left between its indents, which is centred in
+        // the body when they are equal.
+        room: (!look.in_cell && (look.centred_box || look.indent != 0 || look.indent_right != 0))
             .then(|| body_room(body, look.indent, look.indent_right)),
     }
 }
@@ -11854,7 +11856,6 @@ mod batch_2114_tests {
         for page in [
             "<table width='100%'><tr><td>x</td></tr></table>",
             "<div><table width='100%'><tr><td>x</td></tr></table></div>",
-            "<div style='margin-left:40px'><table width='100%'><tr><td>x</td></tr></table></div>",
         ] {
             let d = doc(page);
             let t = tables(&d)[0];
@@ -12645,3 +12646,10 @@ mod tests_1973;
 #[cfg(test)]
 #[path = "html_tests_1989.rs"]
 mod tests_1989;
+
+// The leftovers of #2114 (#2151): a block's box next to a child table,
+// margins through empty blocks, tables in indented blocks, a padding-less
+// card at a quirky cell edge.
+#[cfg(test)]
+#[path = "html_tests_2151.rs"]
+mod tests_2151;
