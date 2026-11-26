@@ -25,11 +25,15 @@ explicit (it builds as a path dependency here), and the Wayland clipboard
 (`src/linux/wayland/clipboard.rs`, `client.rs`, and the new
 `clipboard/formats.rs` and `client/rich_clipboard.rs`) gains the formats beside
 a copy's text, its source kept until the compositor cancels it, and a read of
-gpui's own copy while that source is alive. Each modified file says so on its
-first line, except `src/linux/x11/clipboard.rs`, which says so right after its
-licence header (kept first). That file's only change is the header's closing
-`*/` indented one space: rustfmt on Windows rewrites a column-0 `*/`, and
-`cargo fmt --all` reaches this crate.
+gpui's own copy while that source is alive. A copy's images are written as
+their own mime on both backends (#2282): Wayland's source offers them (and the
+text mimes only with text), and X11 (`src/linux/x11/clipboard.rs`, `client.rs`
+and the new `clipboard/tests.rs`) serves them, leaves a payload past one
+request out, and opens its connections on a given display for the tests. Each
+modified file says so on its first line, except `src/linux/x11/clipboard.rs`,
+which says so right after its licence header (kept first); there the header's
+closing `*/` is also indented one space: rustfmt on Windows rewrites a
+column-0 `*/`, and `cargo fmt --all` reaches this crate.
 
 **Licence.** Apache-2.0, as upstream: `gpui_linux/LICENSE-APACHE` is
 upstream's licence file (a symlink there, a copy here).

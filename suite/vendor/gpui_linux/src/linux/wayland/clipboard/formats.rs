@@ -1,4 +1,5 @@
-// Added for docxy (#1966): the formats a copy offers beside gpui's text.
+// Added for docxy (#1966): the formats a copy offers beside gpui's text, and
+// its images (#2282).
 
 //! What gpui's own latest copy is on the Wayland selection, beside its text.
 //!
@@ -13,6 +14,8 @@ use std::{
     os::fd::AsRawFd,
     time::Duration,
 };
+
+use gpui::{ClipboardEntry, ClipboardItem};
 
 /// gpui's own latest copy: the `wl_data_source` that is the selection (until
 /// the compositor cancels it), and the formats it serves beside the text.
@@ -104,6 +107,32 @@ impl<S: PartialEq> OwnCopy<S> {
             .map(<[u8]>::to_vec)
             .or_else(|| text.map(|text| text.as_bytes().to_vec()))
     }
+}
+
+/// `item`'s images as formats (mime, bytes) (#2282): entry order, the first
+/// of each mime.
+pub(crate) fn image_formats(item: &ClipboardItem) -> Vec<(String, Vec<u8>)> {
+    let mut formats: Vec<(String, Vec<u8>)> = Vec::new();
+    for entry in item.entries() {
+        if let ClipboardEntry::Image(image) = entry {
+            let mime = image.format.mime_type();
+            if !formats.iter().any(|(held, _)| held == mime) {
+                formats.push((mime.to_owned(), image.bytes.clone()));
+            }
+        }
+    }
+    formats
+}
+
+/// Whether a copy of `item` offers the text mimes (#2282): when it has text,
+/// or no image (gpui's empty answer, as before). A copy of images alone
+/// offers only theirs.
+pub(crate) fn offers_text(item: &ClipboardItem) -> bool {
+    item.text().is_some()
+        || !item
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
 }
 
 /// Who answers a read of the selection.
@@ -325,6 +354,93 @@ mod tests {
         assert_eq!(
             read_fd_bounded(piped(b""), timeout, 5).unwrap(),
             Some(Vec::new())
+        );
+    }
+
+    const TEXT: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+
+    fn image(format: gpui::ImageFormat, bytes: &[u8]) -> ClipboardEntry {
+        ClipboardEntry::Image(gpui::Image::from_bytes(format, bytes.to_vec()))
+    }
+
+    fn text(text: &str) -> ClipboardEntry {
+        ClipboardEntry::String(gpui::ClipboardString::new(text.to_owned()))
+    }
+
+    #[test]
+    fn an_items_images_are_formats_in_order_the_first_of_a_mime() {
+        use gpui::ImageFormat::{Gif, Jpeg, Png};
+        let item = ClipboardItem {
+            entries: vec![
+                image(Jpeg, b"jpeg"),
+                text("caption"),
+                image(Png, b"png one"),
+                image(Png, b"png two"),
+                image(Gif, b"gif"),
+            ],
+        };
+        assert_eq!(
+            image_formats(&item),
+            [
+                ("image/jpeg".to_owned(), b"jpeg".to_vec()),
+                ("image/png".to_owned(), b"png one".to_vec()),
+                ("image/gif".to_owned(), b"gif".to_vec()),
+            ]
+        );
+        assert!(image_formats(&ClipboardItem::new_string("t".into())).is_empty());
+    }
+
+    #[test]
+    fn text_mimes_are_offered_with_text_or_without_an_image() {
+        let png = || image(gpui::ImageFormat::Png, b"png");
+        assert!(offers_text(&ClipboardItem::new_string("t".into())));
+        assert!(offers_text(&ClipboardItem { entries: vec![] }));
+        assert!(!offers_text(&ClipboardItem {
+            entries: vec![png()]
+        }));
+        assert!(offers_text(&ClipboardItem {
+            entries: vec![text("t"), png()]
+        }));
+    }
+
+    /// A copy of an image offers its mime and gpui's own, no text; with text
+    /// both. The suite's RTF merged after keeps the image beside it.
+    #[test]
+    fn an_images_copy_offers_and_sends_its_mime() {
+        let png = image(gpui::ImageFormat::Png, b"png");
+        let alone = ClipboardItem {
+            entries: vec![png.clone()],
+        };
+        let mut copy: OwnCopy<u32> = OwnCopy::new();
+        copy.merge(image_formats(&alone));
+        assert!(!offers_text(&alone));
+        assert_eq!(copy.mime_types(&[], "pid/1"), ["image/png", "pid/1"]);
+        assert_eq!(copy.send_bytes("image/png", None), Some(b"png".to_vec()));
+
+        let both = ClipboardItem {
+            entries: vec![text("t"), png],
+        };
+        copy.copied();
+        copy.merge(image_formats(&both));
+        copy.merge(vec![("text/rtf".into(), b"{\\rtf1 t}".to_vec())]);
+        assert_eq!(
+            copy.mime_types(&TEXT, "pid/1"),
+            [
+                "text/plain;charset=utf-8",
+                "UTF8_STRING",
+                "text/plain",
+                "image/png",
+                "text/rtf",
+                "pid/1",
+            ]
+        );
+        assert_eq!(
+            copy.send_bytes("image/png", Some("t")),
+            Some(b"png".to_vec())
+        );
+        assert_eq!(
+            copy.send_bytes("text/plain", Some("t")),
+            Some(b"t".to_vec())
         );
     }
 }

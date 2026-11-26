@@ -15,7 +15,8 @@
  */
 
 // Modified for docxy (#1966): the header's closing `*/` indented one space, as
-// rustfmt on Windows wants it (Linux rustfmt takes either).
+// rustfmt on Windows wants it (Linux rustfmt takes either). (#2282): a copy's
+// images served as their own mime, a payload past one request refused.
 
 // More info about using the clipboard on X11:
 // https://tronche.com/gui/x/icccm/sec-2.html#s-2.6
@@ -37,7 +38,7 @@ use std::{
 use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use x11rb::{
     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, NONE,
-    connection::Connection,
+    connection::{Connection, RequestConnection as _},
     protocol::{
         Event,
         xproto::{
@@ -50,7 +51,7 @@ use x11rb::{
     wrapper::ConnectionExt as _,
 };
 
-use gpui::{ClipboardItem, Image, ImageFormat, hash};
+use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 use strum::IntoEnumIterator;
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -107,6 +108,10 @@ thread_local! {
 const LONG_TIMEOUT_DUR: Duration = Duration::from_millis(4000);
 const SHORT_TIMEOUT_DUR: Duration = Duration::from_millis(10);
 
+/// Room left in a request for its header and the property's fields (#2282),
+/// as the suite's own X11 clipboard leaves (`rich_clip/x11.rs`).
+const REQUEST_HEADROOM: usize = 1024;
+
 #[derive(Debug, PartialEq, Eq)]
 enum ManagerHandoverState {
     Idle,
@@ -140,13 +145,20 @@ struct Inner {
     handover_cv: Condvar,
 
     serve_stopped: AtomicBool,
+
+    /// The display every connection opens (`None`: `DISPLAY`'s), so a test
+    /// can own a private one (#2282).
+    display: Option<String>,
+    /// The largest payload one `ChangeProperty` on `server` carries (#2282):
+    /// a bigger one is neither offered nor sent (no `INCR` sending).
+    max_payload: usize,
 }
 
 impl XContext {
-    fn new() -> Result<Self> {
+    fn new(display: Option<&str>) -> Result<Self> {
         // create a new connection to an X11 server
         let (conn, screen_num): (RustConnection, _) =
-            RustConnection::connect(None).map_err(|_| {
+            RustConnection::connect(display).map_err(|_| {
                 Error::unknown("X11 server connection timed out because it was unreachable")
             })?;
         let screen = conn
@@ -211,12 +223,16 @@ enum ReadSelNotifyResult {
 }
 
 impl Inner {
-    fn new() -> Result<Self> {
-        let server = XContext::new()?;
+    fn new(display: Option<&str>) -> Result<Self> {
+        let server = XContext::new(display)?;
         let atoms = Atoms::new(&server.conn)
             .map_err(into_unknown)?
             .reply()
             .map_err(into_unknown)?;
+        let max_payload = server
+            .conn
+            .maximum_request_bytes()
+            .saturating_sub(REQUEST_HEADROOM);
 
         Ok(Self {
             server,
@@ -227,7 +243,16 @@ impl Inner {
             handover_state: Mutex::new(ManagerHandoverState::Idle),
             handover_cv: Condvar::new(),
             serve_stopped: AtomicBool::new(false),
+            display: display.map(str::to_owned),
+            max_payload,
         })
+    }
+
+    /// Whether `data` fits in one property change: one that does not is
+    /// left out of `TARGETS` and refused (#2282), since sending it would end
+    /// `serve_requests` with an error.
+    fn fits(&self, data: &ClipboardData) -> bool {
+        data.bytes.len() <= self.max_payload
     }
 
     fn write(
@@ -300,7 +325,7 @@ impl Inner {
             }
             return Err(Error::ContentNotAvailable);
         }
-        let reader = XContext::new()?;
+        let reader = XContext::new(self.display.as_deref())?;
 
         let highest_precedence_format =
             match self.read_single(&reader, selection, self.atoms.TARGETS) {
@@ -691,7 +716,7 @@ impl Inner {
             targets.push(self.atoms.SAVE_TARGETS);
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
-                for data in data_list {
+                for data in data_list.iter().filter(|data| self.fits(data)) {
                     targets.push(data.format);
                     if data.format == self.atoms.UTF8_STRING {
                         // When we are storing a UTF8 string,
@@ -719,6 +744,13 @@ impl Inner {
             let data = self.selection_of(selection).data.read();
             if let Some(data_list) = &*data {
                 success = match data_list.iter().find(|d| d.format == event.target) {
+                    Some(data) if !self.fits(data) => {
+                        log::warn!(
+                            "Refused a clipboard request for {} bytes, past one X request",
+                            data.bytes.len()
+                        );
+                        false
+                    }
                     Some(data) => {
                         self.server
                             .conn
@@ -961,7 +993,7 @@ impl Clipboard {
             });
         }
         // At this point we know that the clipboard does not exist.
-        let ctx = Arc::new(Inner::new()?);
+        let ctx = Arc::new(Inner::new(None)?);
         let join_handle = std::thread::Builder::new()
             .name("Clipboard".to_owned())
             .spawn({
@@ -993,18 +1025,20 @@ impl Clipboard {
         self.inner.write(data, selection, wait)
     }
 
+    /// Write `item` (#2282): its text and its images, each as its own mime
+    /// (`item_data`).
+    pub(crate) fn set_item(
+        &self,
+        item: &ClipboardItem,
+        selection: ClipboardKind,
+        wait: WaitConfig,
+    ) -> Result<()> {
+        self.inner
+            .write(item_data(&self.inner.atoms, item), selection, wait)
+    }
+
     fn image_format_atom(&self, format: ImageFormat) -> Atom {
-        match format {
-            ImageFormat::Png => self.inner.atoms.PNG__MIME,
-            ImageFormat::Jpeg => self.inner.atoms.JPEG_MIME,
-            ImageFormat::Webp => self.inner.atoms.WEBP_MIME,
-            ImageFormat::Gif => self.inner.atoms.GIF__MIME,
-            ImageFormat::Svg => self.inner.atoms.SVG__MIME,
-            ImageFormat::Bmp => self.inner.atoms.BMP__MIME,
-            ImageFormat::Tiff => self.inner.atoms.TIFF_MIME,
-            ImageFormat::Ico => self.inner.atoms.ICO__MIME,
-            ImageFormat::Pnm => self.inner.atoms.PNM__MIME,
-        }
+        image_format_atom(&self.inner.atoms, format)
     }
 
     #[allow(unused)]
@@ -1017,7 +1051,7 @@ impl Clipboard {
         let format = self.image_format_atom(image.format);
         let data = vec![ClipboardData {
             bytes: image.bytes,
-            format: self.inner.atoms.PNG__MIME,
+            format,
         }];
         self.inner.write(data, selection, wait)
     }
@@ -1133,6 +1167,50 @@ impl Drop for Clipboard {
             }
         }
     }
+}
+
+fn image_format_atom(atoms: &Atoms, format: ImageFormat) -> Atom {
+    match format {
+        ImageFormat::Png => atoms.PNG__MIME,
+        ImageFormat::Jpeg => atoms.JPEG_MIME,
+        ImageFormat::Webp => atoms.WEBP_MIME,
+        ImageFormat::Gif => atoms.GIF__MIME,
+        ImageFormat::Svg => atoms.SVG__MIME,
+        ImageFormat::Bmp => atoms.BMP__MIME,
+        ImageFormat::Tiff => atoms.TIFF_MIME,
+        ImageFormat::Ico => atoms.ICO__MIME,
+        ImageFormat::Pnm => atoms.PNM__MIME,
+    }
+}
+
+/// What a copy of `item` serves (#2282): its text as `UTF8_STRING` when it
+/// has text or no image (an empty string then, as gpui always wrote), and
+/// each image as its own mime, in entry order, the first of each format.
+fn item_data(atoms: &Atoms, item: &ClipboardItem) -> Vec<ClipboardData> {
+    let images = || {
+        item.entries().iter().filter_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(image),
+            _ => None,
+        })
+    };
+    let text = item.text();
+    let mut data = Vec::new();
+    if text.is_some() || images().next().is_none() {
+        data.push(ClipboardData {
+            bytes: text.unwrap_or_default().into_bytes(),
+            format: atoms.UTF8_STRING,
+        });
+    }
+    for image in images() {
+        let format = image_format_atom(atoms, image.format);
+        if !data.iter().any(|held| held.format == format) {
+            data.push(ClipboardData {
+                bytes: image.bytes.clone(),
+                format,
+            });
+        }
+    }
+    data
 }
 
 fn into_unknown<E: std::fmt::Display>(error: E) -> Error {
@@ -1256,3 +1334,6 @@ impl Error {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

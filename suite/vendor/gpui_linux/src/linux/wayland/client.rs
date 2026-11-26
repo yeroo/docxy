@@ -1,4 +1,5 @@
-// Modified for docxy (#1966): the clipboard's extra formats (`rich_clipboard`).
+// Modified for docxy (#1966): the clipboard's extra formats (`rich_clipboard`),
+// and a copy's images offered (#2282).
 
 use std::{
     cell::{RefCell, RefMut},
@@ -1131,10 +1132,11 @@ impl LinuxClient for WaylandClient {
                 return;
             };
             let data_source = data_device_manager.create_data_source(&state.globals.qh, ());
-            for mime_type in TEXT_MIME_TYPES {
-                data_source.offer(mime_type.to_string());
+            // The text mimes (when it has text), its images' and gpui's own
+            // (#2282).
+            for mime_type in state.clipboard.own_mime_types() {
+                data_source.offer(mime_type);
             }
-            data_source.offer(state.clipboard.self_mime());
             data_device.set_selection(Some(&data_source), serial.as_raw());
             state.clipboard.set_source(data_source);
         }

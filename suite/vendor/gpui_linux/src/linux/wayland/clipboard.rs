@@ -1,4 +1,5 @@
-// Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text.
+// Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text,
+// and its images (#2282).
 
 use std::{
     fs::File,
@@ -22,7 +23,7 @@ use crate::linux::{
 use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
 
 mod formats;
-pub(crate) use formats::{OwnCopy, Whose, same_text, whose};
+pub(crate) use formats::{OwnCopy, Whose, image_formats, offers_text, same_text, whose};
 
 /// Text mime types that we'll offer to other programs.
 pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
@@ -196,8 +197,10 @@ impl Clipboard {
     }
 
     pub fn set(&mut self, item: ClipboardItem) {
-        self.contents = Some(item);
         self.own.copied();
+        // Its images are served as formats, each as its own mime (#2282).
+        self.own.merge(image_formats(&item));
+        self.contents = Some(item);
     }
 
     /// `source` was just set as the selection for `contents` (#1966).
@@ -227,8 +230,14 @@ impl Clipboard {
     }
 
     /// What a source for gpui's copy offers: text, formats, `pid/<pid>` (#1966).
+    /// No text mimes for a copy of images alone (#2282).
     pub fn own_mime_types(&self) -> Vec<String> {
-        self.own.mime_types(&TEXT_MIME_TYPES, &self.self_mime)
+        let text: &[&str] = if self.contents.as_ref().is_none_or(offers_text) {
+            &TEXT_MIME_TYPES
+        } else {
+            &[]
+        };
+        self.own.mime_types(text, &self.self_mime)
     }
 
     /// Send what is queued to the compositor (#1966).
