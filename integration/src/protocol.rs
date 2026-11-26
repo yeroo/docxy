@@ -261,13 +261,25 @@ impl Accents {
 }
 
 /// `sign_in`'s answer.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, PartialEq, Eq, Default)]
 pub struct SignIn {
     pub client_id: Option<String>,
     /// A tenant id or domain.
     pub tenant: Option<String>,
     pub login_hint: Option<String>,
     pub cloud: Option<String>,
+}
+
+/// The login hint is left out, so a log of a `{:?}` never holds it.
+impl std::fmt::Debug for SignIn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignIn")
+            .field("client_id", &self.client_id)
+            .field("tenant", &self.tenant)
+            .field("login_hint", &self.login_hint.as_ref().map(|_| "<hidden>"))
+            .field("cloud", &self.cloud)
+            .finish()
+    }
 }
 
 impl SignIn {
@@ -741,6 +753,23 @@ mod tests {
         ] {
             assert_eq!(Branding::from_json(none).unwrap().accents, None, "{none}");
         }
+    }
+
+    #[test]
+    fn a_sign_ins_debug_text_holds_no_login_hint() {
+        let sign_in = SignIn {
+            client_id: Some("c".into()),
+            tenant: Some("t".into()),
+            login_hint: Some("person@example.com".into()),
+            cloud: Some("global".into()),
+        };
+        let text = format!("{sign_in:?}");
+        assert!(!text.contains("person@example.com"), "{text}");
+        assert!(
+            text.contains("<hidden>") && text.contains("\"c\"") && text.contains("\"global\""),
+            "{text}"
+        );
+        assert!(format!("{:?}", SignIn::default()).contains("login_hint: None"));
     }
 
     #[test]
