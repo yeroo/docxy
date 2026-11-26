@@ -588,6 +588,75 @@ pub(crate) const CORPUS: [&str; 8] = [
 /// they hold (`form_tests`), and in the mutation test.
 pub(crate) const UNREFERENCED: [&str; 4] = ["links", "annots-noap", "forms", "signed"];
 
+/// The slice 3 files (#2256), each with a reference rendering: encrypted,
+/// an incremental update, object and cross-reference streams, damaged.
+/// The damaged files' references are of the files before the damage.
+pub(crate) const HARD: [&str; 10] = [
+    "enc-rc4-40",
+    "enc-rc4-128",
+    "enc-aes-128",
+    "enc-aes-256",
+    "enc-owner-only",
+    "incremental",
+    "objstm",
+    "damaged-offsets",
+    "damaged-noxref",
+    "damaged-truncated",
+];
+
+/// A file nothing can be read from (#2256): a header and no objects.
+pub(crate) const UNREADABLE: &str = "damaged-unreadable";
+
+/// The encrypted files (#2256): their made-up user and owner passwords
+/// (corpus/pdf-view/README.md; the generator's `ENCRYPTED`), their cipher
+/// as the status line names it, and what their page says.
+pub(crate) const ENCRYPTED: [(&str, &str, &str, &str, &str); 5] = [
+    (
+        "enc-rc4-40",
+        "user-rc4-40",
+        "owner-rc4-40",
+        "RC4 40-bit",
+        "Encrypted with RC4 40",
+    ),
+    (
+        "enc-rc4-128",
+        "user-rc4-128",
+        "owner-rc4-128",
+        "RC4 128-bit",
+        "Encrypted with RC4 128",
+    ),
+    (
+        "enc-aes-128",
+        "user-aes-128",
+        "owner-aes-128",
+        "AES 128-bit",
+        "Encrypted with AES 128",
+    ),
+    (
+        "enc-aes-256",
+        "user-aes-256",
+        "owner-aes-256",
+        "AES 256-bit",
+        "Encrypted with AES 256",
+    ),
+    (
+        "enc-owner-only",
+        "",
+        "owner-only",
+        "AES 128-bit",
+        "Encrypted with AES 128, owner password only",
+    ),
+];
+
+/// The user password a corpus file opens with (`None`: it needs none).
+pub(crate) fn user_password(name: &str) -> Option<&'static str> {
+    ENCRYPTED
+        .iter()
+        .find(|e| e.0 == name)
+        .map(|e| e.1)
+        .filter(|p| !p.is_empty())
+}
+
 pub(crate) fn corpus_path(name: &str) -> PathBuf {
     corpus(name)
 }
@@ -596,9 +665,23 @@ fn worker(name: &str) -> Worker {
     Worker::new(&corpus(name), Spawn::InProcess, Duration::from_secs(60))
 }
 
+/// `info`, unlocked with the file's user password when it needs one.
 fn info(w: &mut Worker) -> DocMeta {
     match w.ask(&Op::Info) {
         Answer::Info(m) => m,
+        Answer::Locked { wrong: false } => {
+            let name = w
+                .path_for_tests()
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let pw = user_password(&name).unwrap_or_else(|| panic!("{name}: locked"));
+            match w.unlock(Secret::new(pw.into())) {
+                Answer::Info(m) => m,
+                other => panic!("{name}: {other:?}"),
+            }
+        }
         other => panic!("{other:?}"),
     }
 }
@@ -668,7 +751,7 @@ fn differing(ours: &[u8], reference: &image::RgbaImage, white: bool) -> f64 {
 fn every_corpus_page_matches_its_reference_rendering() {
     let refs = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../corpus/pdf-view/ref");
     let mut report = Vec::new();
-    for name in CORPUS {
+    for name in CORPUS.iter().chain(&HARD) {
         let mut w = worker(name);
         let m = info(&mut w);
         for page in 0..m.pages.len() {
@@ -754,6 +837,82 @@ fn every_corpus_file_reads_and_searches_its_text() {
             t.plain_text()
         );
     }
+}
+
+/// #2256 criteria 1, 6-8: each slice 3 file reads its text, unlocked with
+/// its password when it needs one.
+#[test]
+fn every_hard_corpus_file_reads_its_text() {
+    let label = |name: &str| ENCRYPTED.iter().find(|e| e.0 == name).map(|e| e.4);
+    for name in HARD {
+        let mut w = worker(name);
+        let m = info(&mut w);
+        let want = match name {
+            "incremental" => "Latest revision",
+            "objstm" => "Object and cross-reference streams",
+            "damaged-offsets" => "Damaged: every offset is wrong",
+            "damaged-noxref" => "Damaged: no cross-reference table",
+            "damaged-truncated" => "Damaged: the file is cut short",
+            name => label(name).expect("an encrypted file"),
+        };
+        let t = text_of(&mut w, 0).plain_text();
+        assert!(t.contains(want), "{name}: {want:?} not in {t:?}");
+        assert!(!m.pages.is_empty(), "{name}");
+    }
+}
+
+/// #2256 criterion 6: an incremental update's latest revision: the page
+/// it rewrote and the page it added. A reader of the first revision would
+/// show one page saying "First revision".
+#[test]
+fn incremental_shows_the_latest_revision() {
+    let mut w = worker("incremental");
+    let m = info(&mut w);
+    assert_eq!(m.pages.len(), 2);
+    let p1 = text_of(&mut w, 0).plain_text();
+    assert!(p1.contains("Latest revision"), "{p1:?}");
+    assert!(!p1.contains("First revision"), "{p1:?}");
+    assert!(
+        text_of(&mut w, 1)
+            .plain_text()
+            .contains("Added in the update")
+    );
+}
+
+/// #2256 criterion 8: a file whose cross-reference table was rebuilt from
+/// its objects (none left, or cut off) is saved anew, never appended to
+/// (its chain is broken): `info` says so. PdfCraft finds the objects of
+/// one whose offsets are only wrong without a rebuild, and appends to it.
+#[test]
+fn a_rebuilt_file_is_saved_in_full() {
+    for name in ["damaged-noxref", "damaged-truncated"] {
+        let mut w = worker(name);
+        assert!(!info(&mut w).form.incremental, "{name}");
+    }
+    for name in ["damaged-offsets", "objstm", "incremental"] {
+        let mut w = worker(name);
+        assert!(info(&mut w).form.incremental, "{name}");
+    }
+}
+
+/// #2256 criterion 9: a file nothing can be read from is a failed PDF tab
+/// whose body says why (`pdf_failed_reason`, what `main.rs` draws), not a
+/// blank view.
+#[test]
+fn unreadable_pdf_says_why_in_its_body() {
+    let path = corpus(UNREADABLE);
+    let tab =
+        crate::pdf_view::host::pdf_view_tab_with(&path, None, Spawn::InProcess).expect("a PDF tab");
+    assert!(tab.kind == crate::Kind::Pdf);
+    assert!(tab.load_failed);
+    assert!(matches!(tab.surface, crate::Surface::Placeholder));
+    let why = crate::pdf_view::host::pdf_failed_reason(&tab).expect("a reason");
+    assert!(why.contains("not a readable PDF"), "{why}");
+    assert!(!why.starts_with("load error"), "{why}");
+    // A tab that opened has none.
+    let tab =
+        crate::pdf_view::host::pdf_view_tab_with(&corpus("text"), None, Spawn::InProcess).unwrap();
+    assert_eq!(crate::pdf_view::host::pdf_failed_reason(&tab), None);
 }
 
 #[test]

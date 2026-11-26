@@ -49802,6 +49802,12 @@ impl Render for Docxy {
                 Surface::Project(v) => {
                     project_el(v, self.active, pal, &self.probes, cx).into_any_element()
                 }
+                // A PDF that could not be opened says why in its body (#2256).
+                Surface::Placeholder | Surface::PdfPending(_)
+                    if let Some(why) = pdf_view::host::pdf_failed_reason(tab) =>
+                {
+                    pdf_failed_body(&why, bg, dim).into_any_element()
+                }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim, cx).into_any_element(),
                 Surface::Ext(e) => div()
                     .flex_1()
@@ -54719,6 +54725,25 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla, cx: &App) -> impl IntoElement {
                 .child(name),
         )
         .child(div().text_color(dim).child(blurb))
+}
+
+/// A PDF tab whose file could not be opened (#2256): that, and why.
+fn pdf_failed_body(why: &str, bg: Hsla, dim: Hsla) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .bg(bg)
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_4()
+        .child(
+            div()
+                .text_color(rgb(BRAND))
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(20.))
+                .child(pdf_view::host::PDF_CANT_OPEN),
+        )
+        .child(div().text_color(dim).child(why.to_string()))
 }
 
 /// A built-in kind's placeholder: its name and a line under it.

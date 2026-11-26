@@ -24,6 +24,8 @@ pub(crate) enum PdfCmd {
     FindCase,
     FindWhole,
     FindClose,
+    /// Open the file with the password typed (#2256).
+    Unlock,
 }
 
 /// The selection's box colour: readable over a white page in either theme.
@@ -74,6 +76,7 @@ impl Docxy {
                 v.find.open = false;
                 v.find.field.focused = false;
             }),
+            PdfCmd::Unlock => self.pdf_unlock(cx),
         }
     }
 
@@ -84,6 +87,9 @@ impl Docxy {
         bg: Hsla,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(lock) = &v.lock {
+            return self.pdf_password_prompt(v, lock, pal, bg, cx);
+        }
         // A scroll asked for since the last frame (gpui places it now).
         if let Some((x, y)) = v.scroll_to.take() {
             v.scroll.set_offset(point(px(-x), px(-y)));
@@ -104,6 +110,78 @@ impl Docxy {
                     .when(v.outline_shown, |d| d.child(self.pdf_outline(v, pal, cx)))
                     .child(self.pdf_pages(v, pal, cx)),
             )
+            .into_any_element()
+    }
+
+    /// An encrypted PDF's password prompt (#2256), in the tab's body as a
+    /// browser's viewer asks: the file's name, a masked field, Open, and
+    /// after a password that does not open it, that it is incorrect.
+    fn pdf_password_prompt(
+        &self,
+        v: &PdfView,
+        lock: &super::PdfLock,
+        pal: Pal,
+        bg: Hsla,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Bullets, one a character: the field draws them, never the text.
+        let shown = Field {
+            text: "\u{2022}".repeat(lock.field.text.chars().count()),
+            ..lock.field.clone()
+        };
+        let field = self
+            .pdf_field(&shown, shown.text.clone(), 240., "pdf-password", pal)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _w, cx| {
+                    cx.stop_propagation();
+                    this.pdf_password_press(cx);
+                }),
+            );
+        v_flex()
+            .flex_1()
+            .min_h(px(0.))
+            .size_full()
+            .bg(bg)
+            .text_color(pal.fg)
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(px(16.))
+                    .font_weight(FontWeight::BOLD)
+                    .child(format!("\u{2018}{}\u{2019} is protected", v.file_name())),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .child("Enter the password to open this PDF."),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(field)
+                    .child(self.pdf_button(
+                        "Open".into(),
+                        "pdf-unlock",
+                        false,
+                        PdfCmd::Unlock,
+                        pal,
+                        cx,
+                    )),
+            )
+            .when(lock.wrong, |d| {
+                d.child(
+                    div()
+                        .relative()
+                        .text_size(px(12.))
+                        .text_color(rgb_u(REQUIRED))
+                        .child(super::host::PDF_WRONG_PASSWORD)
+                        .child(probe(&self.probes, "pdf-wrong-password")),
+                )
+            })
             .into_any_element()
     }
 

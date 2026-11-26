@@ -13,6 +13,12 @@
 //! it once. A save hands the working copy's bytes over (`write_incremental`:
 //! an update appended to the file as read) and changes nothing until the
 //! parent says they were written (`saved`): then they are the file.
+//!
+//! An encrypted file (#2256) opens with the password `unlock` gives: the
+//! working copy takes it as typed (user or owner), the renderer the user
+//! password, which PdfCraft's renderer alone authenticates for revisions
+//! 2-4 (owner authentication recovers it, as `pdfcraft-engine`'s
+//! `render_password_for` does).
 
 use super::*;
 use pdfcraft_render::{DocInfo, LinkTarget, PageInfo, PageRenderer, RenderConfig};
@@ -41,6 +47,10 @@ pub(super) struct Served {
     renderer: Option<PageRenderer>,
     /// The bytes the last `save` handed over, until `saved` takes them in.
     written: Option<Arc<Vec<u8>>>,
+    /// The password `unlock` gave (#2256): as typed, for the working copy,
+    /// and the one the renderer takes.
+    password: Option<Secret>,
+    render_password: Option<Secret>,
 }
 
 /// One answer: its line, the bytes after it.
@@ -58,6 +68,8 @@ impl Served {
             appearances: Default::default(),
             renderer: None,
             written: None,
+            password: None,
+            render_password: None,
         }
     }
 
@@ -67,6 +79,7 @@ impl Served {
     pub(super) fn answer(&mut self, id: u64, op: &Op) -> Answered {
         match op {
             Op::Info => self.info(id),
+            Op::Unlock { password } => self.unlock(id, password.clone()),
             Op::Pixels { page, scale } => self.pixels(id, *page, *scale),
             Op::Text { page } => self.text(id, *page),
             Op::SaveTo { .. } => (
@@ -92,12 +105,69 @@ impl Served {
 
     // ---- reading ----------------------------------------------------------------
 
+    /// Open the file with `password` (#2256): everything read so far goes,
+    /// the working copy opens with it first (a password it refuses answers
+    /// locked), and the renderer gets the user password owner
+    /// authentication recovered, or `password` itself. A file the working
+    /// copy cannot read for another reason is left to the renderer, with
+    /// `password` as typed. Then the answer is `info`'s.
+    fn unlock(&mut self, id: u64, password: Secret) -> Answered {
+        self.pages = None;
+        self.cos = None;
+        self.cos_tried = false;
+        self.display = None;
+        self.renderer = None;
+        self.comments = Default::default();
+        self.appearances = Default::default();
+        self.written = None;
+        self.password = None;
+        self.render_password = None;
+        let opened = catch_unwind(AssertUnwindSafe(|| {
+            pdfcraft_cos::Document::open_with_password(self.bytes.clone(), Some(password.as_str()))
+        }));
+        let render = match opened {
+            Ok(Err(
+                pdfcraft_cos::CosError::NeedsPassword | pdfcraft_cos::CosError::WrongPassword,
+            )) => {
+                return (locked(id, Locked::Wrong), vec![]);
+            }
+            Ok(Ok(cos)) => {
+                let recovered = render_password(&cos);
+                self.cos = Some(cos);
+                self.cos_tried = true;
+                recovered.unwrap_or_else(|| password.clone())
+            }
+            Ok(Err(_)) | Err(_) => password.clone(),
+        };
+        self.password = Some(password);
+        self.render_password = Some(render);
+        let answered = self.info(id);
+        if answered.0.locked.is_some() {
+            self.password = None;
+            self.render_password = None;
+            self.cos = None;
+            self.cos_tried = false;
+            return (locked(id, Locked::Wrong), vec![]);
+        }
+        answered
+    }
+
+    fn render_pw(&self) -> Option<&str> {
+        self.render_password.as_ref().map(Secret::as_str)
+    }
+
     fn info(&mut self, id: u64) -> Answered {
-        let info = match pdfcraft_render::inspect(self.bytes.clone(), None) {
+        let info = match pdfcraft_render::inspect(self.bytes.clone(), self.render_pw()) {
             Ok(info) if info.pages.is_empty() => {
                 return (failed(id, "the PDF has no pages".into()), vec![]);
             }
             Ok(info) => info,
+            Err(pdfcraft_render::OpenError::NeedsPassword) => {
+                return (locked(id, Locked::Needs), vec![]);
+            }
+            Err(pdfcraft_render::OpenError::WrongPassword) => {
+                return (locked(id, Locked::Wrong), vec![]);
+            }
             Err(e) => return (failed(id, e.to_string()), vec![]),
         };
         self.pages = Some(info.pages.clone());
@@ -111,6 +181,14 @@ impl Served {
         meta.form = cos
             .and_then(|cos| catch_unwind(AssertUnwindSafe(|| form_meta(cos, &info.pages))).ok())
             .unwrap_or_default();
+        meta.security = cos.and_then(|cos| {
+            catch_unwind(AssertUnwindSafe(|| security(cos)))
+                .ok()
+                .flatten()
+        });
+        if !cos.is_none_or(may_fill) {
+            read_only(&mut meta.form.fields);
+        }
         (
             Head {
                 id,
@@ -129,7 +207,9 @@ impl Served {
     fn cos_mut(&mut self) -> Option<&mut pdfcraft_cos::Document> {
         if !self.cos_tried {
             self.cos_tried = true;
-            self.cos = pdfcraft_cos::Document::open(self.bytes.clone()).ok();
+            let password = self.password.as_ref().map(Secret::as_str);
+            self.cos =
+                pdfcraft_cos::Document::open_with_password(self.bytes.clone(), password).ok();
         }
         self.cos.as_mut()
     }
@@ -138,7 +218,7 @@ impl Served {
     fn pages(&mut self) -> Vec<PageInfo> {
         if self.pages.is_none() {
             self.pages = Some(
-                pdfcraft_render::inspect(self.bytes.clone(), None)
+                pdfcraft_render::inspect(self.bytes.clone(), self.render_pw())
                     .map(|i| i.pages)
                     .unwrap_or_default(),
             );
@@ -188,8 +268,14 @@ impl Served {
 
     fn render(&mut self, req: pdfcraft_render::RenderRequest) -> pdfcraft_render::RenderedPage {
         let display = self.display();
+        // The display copy is written with the file's own encryption: it
+        // takes the same password.
+        let config = RenderConfig {
+            password: self.render_pw().map(Arc::from),
+            ..RenderConfig::default()
+        };
         self.renderer
-            .get_or_insert_with(|| PageRenderer::new(display, RenderConfig::default()))
+            .get_or_insert_with(|| PageRenderer::new(display, config))
             .render(req)
     }
 
@@ -247,6 +333,13 @@ impl Served {
 
     fn form_op(&mut self, id: u64, op: &Op) -> Answered {
         let pages = self.pages();
+        // A file whose permissions withhold filling in its form is never
+        // filled (#2256), whatever asks: the view shows its fields read-only.
+        let refused = matches!(op, Op::SetField { .. } | Op::SetFields { .. })
+            && !self.cos().is_none_or(may_fill);
+        if refused {
+            return (failed(id, NO_FILLING.into()), vec![]);
+        }
         let result = match op {
             Op::SetField { name, value } => self.fill(&pages, |cos| {
                 pdfcraft_forms::set_value(cos, name, &to_value(value)).map_err(|e| e.to_string())
@@ -264,7 +357,16 @@ impl Served {
                     .map_or(Ok(()), |e| Err(e.to_string()))
             }),
             Op::Fields => Ok(FormState {
-                fields: self.cos().map(|c| fields(c, &pages)).unwrap_or_default(),
+                fields: self
+                    .cos()
+                    .map(|c| {
+                        let mut f = fields(c, &pages);
+                        if !may_fill(c) {
+                            read_only(&mut f);
+                        }
+                        f
+                    })
+                    .unwrap_or_default(),
                 pages: Vec::new(),
             }),
             Op::Save => return self.save(id),
@@ -364,7 +466,16 @@ impl Served {
             .as_ref()
             .map(pdfcraft_forms::password_values)
             .unwrap_or_default();
-        let mut reopened = match pdfcraft_cos::Document::open(bytes.clone()) {
+        // An encrypted file's save has its encryption: the open file's key
+        // reads it, and no password is needed (#2256).
+        let reopened = match self.cos.as_ref() {
+            Some(cos) => cos.open_with_same_credentials(bytes.clone()),
+            None => pdfcraft_cos::Document::open_with_password(
+                bytes.clone(),
+                self.password.as_ref().map(Secret::as_str),
+            ),
+        };
+        let mut reopened = match reopened {
             Ok(d) => d,
             Err(e) => {
                 return (
@@ -391,6 +502,73 @@ impl Served {
             vec![],
         )
     }
+}
+
+/// What a fill of a form the file does not let be filled answers (#2256).
+pub(crate) const NO_FILLING: &str = "this PDF's permissions do not allow filling in its form";
+
+fn locked(id: u64, why: Locked) -> Head {
+    Head {
+        id,
+        locked: Some(why),
+        ..Head::default()
+    }
+}
+
+/// The password the renderer takes for a file `cos` opened (#2256): the
+/// user password owner authentication recovered for revisions 2-4, whose
+/// owner password the renderer does not authenticate. As
+/// `pdfcraft-engine`'s `recovered_render_password`: UTF-8 when it decodes,
+/// else each byte in PDFDocEncoding.
+fn render_password(cos: &pdfcraft_cos::Document) -> Option<Secret> {
+    let user = cos.security()?.recovered_user_password()?;
+    let text = match std::str::from_utf8(&user) {
+        Ok(text) => text.to_owned(),
+        Err(_) => user.iter().map(|b| pdfcraft_cos::pdfdoc_char(*b)).collect(),
+    };
+    Some(Secret::new(text))
+}
+
+/// Whether the password `cos` opened with lets its form be filled (an
+/// unencrypted file does; the owner password always does).
+fn may_fill(cos: &pdfcraft_cos::Document) -> bool {
+    cos.permissions().is_none_or(|p| p.fill_forms())
+}
+
+fn read_only(fields: &mut [FieldMeta]) {
+    for f in fields {
+        f.read_only = true;
+        for w in &mut f.widgets {
+            w.read_only = true;
+        }
+    }
+}
+
+/// An encrypted file's cipher and permissions (#2256).
+fn security(cos: &pdfcraft_cos::Document) -> Option<SecurityMeta> {
+    let handler = cos.security()?;
+    let p = handler.permissions();
+    let d = handler.dict();
+    let stream = d
+        .crypt_filters
+        .iter()
+        .find(|(name, _)| *name == d.stm_f)
+        .map(|(_, m)| *m);
+    let method = match (d.r, stream) {
+        (5.., _) | (_, Some(pdfcraft_cos::CryptMethod::Aes256)) => "AES 256-bit".to_string(),
+        (4, Some(pdfcraft_cos::CryptMethod::Aes128)) => "AES 128-bit".to_string(),
+        (2, _) => "RC4 40-bit".to_string(),
+        _ => format!("RC4 {}-bit", d.length_bits),
+    };
+    Some(SecurityMeta {
+        method,
+        owner: p.owner,
+        print: p.print(),
+        copy: p.copy(),
+        modify: p.modify(),
+        annotate: p.annotate(),
+        fill_forms: p.fill_forms(),
+    })
 }
 
 fn to_value(v: &FieldValue) -> pdfcraft_forms::FieldValue {

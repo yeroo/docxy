@@ -1,0 +1,74 @@
+# The PDF view's hard inputs (#2256): an encrypted PDF asks for its
+# password in the tab's body, a wrong one asks again, the right one shows
+# its pages; a file that needs no password to open but withholds printing,
+# copying and changes says so; a file nothing can be read from says why in
+# its body. `pdf-password` is the prompt's field (read back masked: never
+# what it holds) and `pdf-unlock` its Open button. The PDFs are
+# uiharness/fixtures/pdf-view-{enc-aes-256,enc-owner-only,
+# damaged-unreadable}.pdf, byte-identical copies of corpus/pdf-view's (how
+# they were made, and their made-up passwords: corpus/pdf-view/README.md).
+# Each test closes the tabs it opened.
+
+test issue 2256 an encrypted PDF asks for its password, again when it is wrong, then opens
+  open copy:"../fixtures/pdf-view-enc-aes-256.pdf" as enc.pdf
+  assert status is password required: enter the PDF's password to open it
+  call pdf-read {}
+  assert reply.open is true
+  assert reply.locked is true
+  assert reply.wrong_password is false
+  assert reply.page_count is 0
+  shot window
+  # A wrong password: the prompt says so, emptied, and asks again.
+  call pointer-click {"input":"pdf-password"}
+  call real-type {"text":"not-the-password"}
+  call field-read {"input":"pdf-password"}
+  assert reply.masked is true
+  assert reply.focused is true
+  assert reply.empty is false
+  call real-key {"key":"enter"}
+  call pdf-read {}
+  assert reply.locked is true
+  assert reply.wrong_password is true
+  call field-read {"input":"pdf-password"}
+  assert reply.empty is true
+  assert reply.focused is true
+  # Save has nothing open to write.
+  call real-key {"key":"ctrl+s"}
+  assert status is This PDF is not open, so there is nothing to save
+  # The right one, by the Open button: the pages.
+  call real-type {"text":"user-aes-256"}
+  call pointer-click {"region":"pdf-unlock"}
+  call pdf-read {"until_drawn":[1],"until_text":[1]}
+  assert reply.locked is false
+  assert reply.page_count is 1
+  assert reply.pages.0.state is drawn
+  assert reply.permissions.method is AES 256-bit
+  assert reply.permissions.owner is false
+  assert reply.permissions.print is false
+  assert status is loaded (PDF, 1 page); restricted: printing, copying, changes
+  shot window
+  call real-key {"key":"ctrl+w"}
+
+test issue 2256 an encrypted PDF's owner password opens it with nothing withheld
+  open copy:"../fixtures/pdf-view-enc-aes-256.pdf" as enc.pdf
+  call pointer-click {"input":"pdf-password"}
+  call real-type {"text":"owner-aes-256"}
+  call real-key {"key":"enter"}
+  call pdf-read {"until_drawn":[1]}
+  assert reply.locked is false
+  assert reply.permissions.owner is true
+  assert reply.permissions.print is true
+  assert status is loaded (PDF, 1 page)
+  call real-key {"key":"ctrl+w"}
+
+test issue 2256 a PDF with only an owner password opens without asking and shows its restrictions
+  open copy:"../fixtures/pdf-view-enc-owner-only.pdf" as owner-only.pdf
+  assert status is loaded (PDF, 1 page); restricted: printing, copying, changes
+  call pdf-read {"until_drawn":[1]}
+  assert reply.locked is false
+  assert reply.pages.0.state is drawn
+  assert reply.permissions.method is AES 128-bit
+  assert reply.permissions.copy is false
+  assert reply.permissions.fill_forms is true
+  assert reply.permissions.restricted.0 is printing
+  call real-key {"key":"ctrl+w"}

@@ -19,7 +19,9 @@
 //! box (#1855), typed into by `uiharness/cases/help-docs.uit` with the
 //! fixture manual installed. So are the PDF view's Find box and page box
 //! (#2245), typed into by `uiharness/cases/pdf-view.uit`, and the editor of
-//! a PDF form's text field (#2255), by `uiharness/cases/pdf-forms.uit`. So
+//! a PDF form's text field (#2255), by `uiharness/cases/pdf-forms.uit`, and
+//! an encrypted PDF's password prompt (#2256), by
+//! `uiharness/cases/pdf-hard.uit` (read back masked: never its text). So
 //! is the
 //! embedded document view's Find box
 //! on an extension's tab (#1887), typed into by
@@ -100,6 +102,7 @@ const EXT: u32 = 1887;
 /// The PDF view's Find box and page box (#2245).
 const PDF: u32 = 2245;
 const PDF_FORMS: u32 = 2255;
+const PDF_HARD: u32 = 2256;
 const SHEET: u32 = 1200;
 const DOC: u32 = 1201;
 const BACKSTAGE: u32 = 1202;
@@ -256,6 +259,12 @@ static REGISTRY: &[Input] = &[
         "a PDF form's text field, as typed into",
         Surface::Pdf,
         PDF_FORMS,
+    ),
+    input(
+        "pdf-password",
+        "an encrypted PDF's password prompt",
+        Surface::Pdf,
+        PDF_HARD,
     ),
     input(
         "ext-doc-find",
@@ -570,6 +579,20 @@ fn press_pdf(app: &crate::Docxy, i: &Input) -> Result<Press, String> {
 fn read_pdf(app: &crate::Docxy, i: &Input) -> Result<Json, String> {
     let v = app.active_pdf().ok_or("the active tab is not a PDF view")?;
     let none = crate::pdf_view::Field::default();
+    // The password prompt (#2256): whether it has the keys and holds
+    // anything, never what it holds, nor how much.
+    if i.id == "pdf-password" {
+        let lock = v
+            .lock
+            .as_ref()
+            .ok_or("this PDF view is not asking for a password")?;
+        return Ok(Json::obj(vec![
+            ("input", Json::Str(i.id.into())),
+            ("masked", Json::Bool(true)),
+            ("focused", Json::Bool(lock.field.focused)),
+            ("empty", Json::Bool(lock.field.text.is_empty())),
+        ]));
+    }
     let f = match i.id {
         "pdf-find" => &v.find.field,
         "pdf-form-field" => {
@@ -1073,8 +1096,8 @@ mod tests {
         for i in registry() {
             assert!(
                 (SHEET..=TERMINAL).contains(&i.covered_by)
-                    || [HELP, EXT, PDF, PDF_FORMS].contains(&i.covered_by),
-                "{} is covered by #{}, not one of #1200-#1204, #1855, #1887, #2245 or #2255",
+                    || [HELP, EXT, PDF, PDF_FORMS, PDF_HARD].contains(&i.covered_by),
+                "{} is covered by #{}, not one of #1200-#1204, #1855, #1887, #2245, #2255 or #2256",
                 i.id,
                 i.covered_by
             );
@@ -1083,6 +1106,8 @@ mod tests {
                 _ if i.id == "sheet-tab-rename" => BACKSTAGE,
                 // A PDF form's field is #2255's, the PDF view's boxes #2245's.
                 _ if i.id == "pdf-form-field" => PDF_FORMS,
+                // The password prompt is #2256's.
+                _ if i.id == "pdf-password" => PDF_HARD,
                 Surface::Sheet => SHEET,
                 Surface::Doc => DOC,
                 Surface::Backstage => BACKSTAGE,
@@ -1265,10 +1290,12 @@ mod tests {
             .iter()
             .filter(|i| i.surface == Surface::Pdf)
             .collect();
-        assert_eq!(pdf.len(), 3);
+        assert_eq!(pdf.len(), 4);
         for i in pdf {
             let case = if i.covered_by == PDF_FORMS {
                 include_str!("../../../uiharness/cases/pdf-forms.uit")
+            } else if i.covered_by == PDF_HARD {
+                include_str!("../../../uiharness/cases/pdf-hard.uit")
             } else {
                 include_str!("../../../uiharness/cases/pdf-view.uit")
             };

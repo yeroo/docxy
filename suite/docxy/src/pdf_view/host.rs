@@ -28,6 +28,12 @@ pub(crate) const SIGNED_QUESTION: &str =
 /// written anew): the signed revision is not kept at all.
 pub(crate) const SIGNED_LOST_QUESTION: &str = "This PDF is signed. Saving changes invalidates the \
      signature, and as this file has to be written anew the signature will be lost.";
+/// The status line of an encrypted PDF waiting for its password (#2256).
+pub(crate) const PDF_LOCKED: &str = "password required: enter the PDF's password to open it";
+/// What the prompt says after a password that does not open the file.
+pub(crate) const PDF_WRONG_PASSWORD: &str = "The password is incorrect. Try again.";
+/// What a failed PDF tab's body says above its reason (#2256).
+pub(crate) const PDF_CANT_OPEN: &str = "This PDF can't be opened";
 /// How often the frame looks for the worker's answers while one is due.
 const POLL: std::time::Duration = std::time::Duration::from_millis(15);
 
@@ -77,7 +83,11 @@ pub(crate) fn pdf_view_tab_with(path: &Path, at: Option<PdfAt>, spawn: Spawn) ->
     tab.path = Some(path.to_path_buf());
     match PdfView::open(path, spawn) {
         Ok(mut v) => {
-            tab.status = loaded_status(v.page_count()).into();
+            tab.status = if v.lock.is_some() {
+                PDF_LOCKED.into()
+            } else {
+                format!("{}{}", loaded_status(v.page_count()), v.restricted_note()).into()
+            };
             if let Some(at) = at {
                 v.zoom = super::clamp_zoom(at.zoom);
                 v.restore_page = Some(at.page);
@@ -91,6 +101,20 @@ pub(crate) fn pdf_view_tab_with(path: &Path, at: Option<PdfAt>, spawn: Spawn) ->
         }
     }
     Some(tab)
+}
+
+/// Why a failed PDF tab could not open it, for its body (#2256): its
+/// status line's reason, without the `load error: ` it starts with.
+pub(crate) fn pdf_failed_reason(tab: &DocTab) -> Option<String> {
+    if tab.kind != Kind::Pdf || !tab.load_failed {
+        return None;
+    }
+    let status = tab.status.to_string();
+    let why = ["load error: ", "read error: "]
+        .iter()
+        .find_map(|p| status.strip_prefix(p))
+        .unwrap_or(&status);
+    Some(why.to_string())
 }
 
 /// A PDF view's status once open: `loaded (PDF, N pages)`.
@@ -122,6 +146,10 @@ pub(crate) fn pdf_save_step(tab: &mut DocTab, target: Option<std::path::PathBuf>
     let Surface::Pdf(v) = &mut tab.surface else {
         return PdfSaveStep::Nothing(PDF_NOT_OPEN);
     };
+    // Waiting for its password (#2256): nothing is open to save.
+    if v.lock.is_some() {
+        return PdfSaveStep::Nothing(PDF_NOT_OPEN);
+    }
     let Some(path) = path else {
         return PdfSaveStep::Nothing(PDF_NOT_OPEN);
     };
@@ -369,7 +397,9 @@ impl Docxy {
         }
         self.pdf_pump_behind();
         let scale_factor = window.scale_factor();
-        let Some(v) = self.active_pdf_mut() else {
+        // A view waiting for its password has nothing to lay out or ask
+        // (#2256): where the session left it waits for its pages.
+        let Some(v) = self.active_pdf_mut().filter(|v| v.lock.is_none()) else {
             return self.pdf_settle_tabs(window, cx);
         };
         let b = v.scroll.bounds();
@@ -685,6 +715,10 @@ impl Docxy {
         if crate::field_edit::is_save_chord(ctrl, m.alt, key) {
             return self.save_active(window, cx);
         }
+        // The password prompt has every other key (#2256).
+        if self.active_pdf().is_some_and(|v| v.lock.is_some()) {
+            return self.pdf_password_key(ev, cx);
+        }
         // Ctrl+F (⌘F) opens Find, its query selected.
         if ctrl && !m.alt && key == "f" {
             return self.with_pdf(cx, |v| {
@@ -870,6 +904,65 @@ impl Docxy {
         }
     }
 
+    /// A key in the password prompt (#2256): the shared one-line keys; Enter
+    /// tries the password. Nothing typed is ever copied or cut out of it.
+    fn pdf_password_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        use crate::field_edit::FieldKey;
+        let with_lock = |this: &mut Self, cx: &mut Context<Self>, f: &dyn Fn(&mut Field)| {
+            if let Some(lock) = this.active_pdf_mut().and_then(|v| v.lock.as_mut()) {
+                lock.field.focused = true;
+                f(&mut lock.field);
+                cx.notify();
+            }
+        };
+        match field_key_of(ev) {
+            FieldKey::Enter => self.pdf_unlock(cx),
+            FieldKey::Edit(op) => with_lock(self, cx, &|f| f.edit(op)),
+            FieldKey::Paste => {
+                if let Some(line) = self.field_paste(false, cx) {
+                    with_lock(self, cx, &|f| f.edit(crate::field_edit::Op::Insert(&line)));
+                }
+            }
+            FieldKey::Escape | FieldKey::Copy | FieldKey::Cut | FieldKey::Ignore => {}
+        }
+    }
+
+    /// Try the password typed into the active tab's prompt (#2256): the
+    /// pages, where the session left them; the prompt again, saying the
+    /// password is wrong; or a failed tab that says why.
+    pub(crate) fn pdf_unlock(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return;
+        };
+        let Surface::Pdf(v) = &mut tab.surface else {
+            return;
+        };
+        if v.lock.is_none() {
+            return;
+        }
+        match v.try_unlock() {
+            super::Unlocked::Opened => {
+                tab.status =
+                    format!("{}{}", loaded_status(v.page_count()), v.restricted_note()).into();
+            }
+            super::Unlocked::Wrong => tab.status = PDF_LOCKED.into(),
+            super::Unlocked::Failed(why) => {
+                tab.status = format!("load error: {why}").into();
+                tab.load_failed = true;
+                tab.surface = Surface::Placeholder;
+            }
+        }
+        cx.notify();
+    }
+
+    /// A press on the password prompt's field (#2256).
+    pub(crate) fn pdf_password_press(&mut self, cx: &mut Context<Self>) {
+        if let Some(lock) = self.active_pdf_mut().and_then(|v| v.lock.as_mut()) {
+            lock.field.focused = true;
+            cx.notify();
+        }
+    }
+
     /// A key in the page box: the shared one-line keys; Enter goes to the
     /// page typed, Escape gives the keys back to the pages.
     fn pdf_page_box_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
@@ -911,6 +1004,11 @@ impl Docxy {
     /// the page box, then back to the pages.
     pub(crate) fn pdf_tab(&mut self, back: bool, cx: &mut Context<Self>) {
         self.with_pdf(cx, |v| {
+            // The password prompt's one field keeps the keys (#2256).
+            if let Some(lock) = v.lock.as_mut() {
+                lock.field.focused = true;
+                return;
+            }
             // In a form, Tab goes from field to field in the document's tab
             // order (#2255); from the Find box or page box it goes on there.
             let boxes = v.find.field.focused || v.page_box.focused;
