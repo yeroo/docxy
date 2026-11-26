@@ -72,7 +72,9 @@ issue number to find its notes.
   routing, session row and read-only rules, the harness's `pdf-read`, the
   corpus and its reference tolerance; links, comment pop-ups and AcroForm
   filling, the display copy, Save as an incremental update, replay in a
-  new child, the signed-PDF question and quit (#2255).
+  new child, the signed-PDF question and quit (#2255); the password
+  prompt, owner passwords through the recovered user password, `Secret`,
+  permissions, the child's memory limit, a failed tab's body (#2256).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), in cells (#1930),
   bookmarks, the Hyperlink style, relative links, titles and targets,
