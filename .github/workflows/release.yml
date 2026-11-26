@@ -56,10 +56,14 @@ jobs:
 
       # Terminal docxy draws a PDF's pages with docxy-pdf (#2259), a member of the
       # suite workspace (PdfCraft needs a newer Rust than the root's MSRV and is a
-      # git dependency); it needs none of gpui's system packages.
+      # git dependency); it needs none of gpui's system packages. Stripped: the
+      # suite's release profile keeps line tables for its crash log (79 MB on
+      # Linux), and the child writes none (10 MB).
       - name: Build docxy-pdf
         env:
           CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
+          CARGO_PROFILE_RELEASE_STRIP: "true"
         run: cargo build --release --locked --manifest-path suite/Cargo.toml -p pdfpages --bin docxy-pdf
 
       - name: Stage binaries + checksums
