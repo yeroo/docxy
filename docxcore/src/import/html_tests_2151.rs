@@ -247,3 +247,79 @@ fn a_box_with_nothing_to_carry_it_or_a_card_s_is_unchanged() {
         assert_eq!(gaps(&d, "b"), (Some(240), Some(240)), "{page}");
     }
 }
+
+// Item 3: margins through an empty block; borders separating margins.
+
+/// An empty block's top and bottom margins collapse through it into one,
+/// and that one into the margins around it: one 40px gap.
+#[test]
+fn an_empty_block_s_margins_collapse_through_it() {
+    let d = standards("<p>a</p><div style='margin:40px 0'></div><p>b</p>");
+    assert_eq!((gaps(&d, "a").1, gaps(&d, "b").0), (Some(600), Some(0)));
+    // A larger one beside: the larger stands.
+    let d =
+        standards("<p style='margin-bottom:50px'>a</p><div style='margin:40px 0'></div><p>b</p>");
+    assert_eq!((gaps(&d, "a").1, gaps(&d, "b").0), (Some(750), Some(0)));
+    // An empty list or blockquote: its user-agent 1em collapses with the
+    // paragraphs' 1em.
+    for empty in [
+        "<ul></ul>",
+        "<blockquote></blockquote>",
+        "<div style='margin:20px'></div>",
+    ] {
+        let d = standards(&format!("<p>a</p>{empty}<p>b</p>"));
+        let want = if empty.contains("20px") { 300 } else { 240 };
+        assert_eq!(
+            (gaps(&d, "a").1, gaps(&d, "b").0),
+            (Some(want), Some(0)),
+            "{empty}"
+        );
+    }
+    // At the flow's start it waits for the next paragraph.
+    let d = standards("<div style='margin:40px 0'></div><p>b</p>");
+    assert_eq!(gaps(&d, "b").0, Some(600));
+    // Nested empty blocks: one gap, the largest.
+    let d = standards(
+        "<p>a</p><div style='margin-bottom:30px'><div style='margin:40px 0'></div></div><p>b</p>",
+    );
+    assert_eq!((gaps(&d, "a").1, gaps(&d, "b").0), (Some(600), Some(0)));
+    // After a table, it goes before the next paragraph.
+    let d = standards(&format!("{CELL}<div style='margin:40px 0'></div><p>b</p>"));
+    assert_eq!(gaps(&d, "b").0, Some(600));
+}
+
+/// An empty `<p></p>` is an empty paragraph, as Word writes one; padding,
+/// a top line or `display:none` keep an empty block's margins from
+/// collapsing through it, as before.
+#[test]
+fn what_does_not_collapse_through_is_unchanged() {
+    let d = standards("<p>a</p><p></p><p>b</p>");
+    assert_eq!(all_paras(&d).len(), 3);
+    assert_eq!((gaps(&d, "a").1, gaps(&d, "b").0), (Some(240), Some(0)));
+    for empty in [
+        "<div style='margin:40px 0;padding-top:1px'></div>",
+        "<div style='margin:40px 0;border-top:1px solid #000'></div>",
+        "<div style='margin:40px 0;display:none'></div>",
+    ] {
+        let d = standards(&format!("<p>a</p>{empty}<p>b</p>"));
+        assert_eq!(
+            (gaps(&d, "a").1, gaps(&d, "b").0),
+            (Some(240), Some(0)),
+            "{empty}"
+        );
+    }
+}
+
+/// A block's bottom line separates its margin from its last child's
+/// (#1883, pinned here): x keeps p's 16px, then the div's 30px past the
+/// line, summed.
+#[test]
+fn a_bottom_line_keeps_the_margins_apart() {
+    let d = standards(
+        "<div style='margin-bottom:30px;border-bottom:1px solid #000'><p>x</p></div><div>b</div>",
+    );
+    assert_eq!(gaps(&d, "x").1, Some(240 + 450));
+    // With no line they collapse.
+    let d = standards("<div style='margin-bottom:30px'><p>x</p></div><div>b</div>");
+    assert_eq!(gaps(&d, "x").1, Some(450));
+}

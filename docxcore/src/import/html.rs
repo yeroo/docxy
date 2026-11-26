@@ -4100,6 +4100,7 @@ impl<'a> Html<'a> {
         // stack is whole.
         if self.budget.work((self.elems.len() - i) / 16 + 1) {
             for j in (i..self.elems.len()).rev() {
+                self.collapse_through(j);
                 self.apply_bottom(j);
                 // A forced break after it, or before it when nothing ended
                 // in it (an empty `div`), goes to the next paragraph
@@ -5239,6 +5240,62 @@ impl<'a> Html<'a> {
         }
         before += group - paid;
         clamp_twips(before).max(0)
+    }
+
+    /// `elems[j]`, a block or list closing with nothing ended in it (#2151):
+    /// with no top or bottom padding or line between them, its own top and
+    /// bottom margins collapse through it (CSS 2 8.3.1: the largest
+    /// positive one less the most negative), and that one margin collapses
+    /// into the group open below the paragraph above, as a bottom margin
+    /// with no padding does ([`fold_bottom`]); with no paragraph above (the
+    /// flow's start, or after a table) it waits for the next one as a
+    /// pending box. An empty `<p></p>` is never one: it ends a paragraph.
+    /// A block under `display:none` has no box. Its height is not read (a
+    /// block's `height` is not kept), nor quirks mode's dropping of a
+    /// user-agent margin at a cell's edge.
+    fn collapse_through(&mut self, j: usize) {
+        let e = &self.elems[j];
+        if !matches!(e.kind, Kind::Block | Kind::List) || !self.fresh(e) {
+            return;
+        }
+        let l = &e.look;
+        if l.display_hidden
+            || l.own_card
+            || l.pad_before != 0
+            || l.pad_after != 0
+            || l.border_before
+            || l.border_after
+        {
+            return;
+        }
+        let (a, b) = (l.margin_before, l.margin_after);
+        let margin = a.max(b).max(0) + a.min(b).min(0);
+        if margin == 0 {
+            return;
+        }
+        let in_table = self.table_depth > 0;
+        match self.out.tail(in_table) {
+            Some(tail) => {
+                let (after, open) = fold_bottom(tail.after, tail.open, margin, 0, false);
+                let bare = tail.bare.map(|(a, o)| fold_bottom(a, o, margin, 0, false));
+                if let Some(p) = self.out.flow_last_mut(in_table) {
+                    p.spacing.after = Some(after.max(0));
+                }
+                self.out.set_tail(in_table, FlowTail { after, open, bare });
+            }
+            None => {
+                let base = self.out.pending(in_table).unwrap_or_default();
+                let (after, open) = fold_bottom(base.after, base.open, margin, 0, false);
+                self.out.set_pending(
+                    in_table,
+                    FlowTail {
+                        after,
+                        open,
+                        bare: None,
+                    },
+                );
+            }
+        }
     }
 
     /// A table opens (#2151): the blocks and lists still fresh around it,
