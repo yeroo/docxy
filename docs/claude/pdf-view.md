@@ -3,7 +3,7 @@
 Notes for the suite's PDF view: opening a PDF as it looks; its links,
 comments and form, the only thing it writes back (#2255); encrypted,
 updated and damaged files (#2256); converting it to an editable document
-with its layout (#2257).
+with its layout (#2257); printing and exporting it as drawn (#2258).
 
 ## PDF view: the renderer and its patch table (#2245)
 
@@ -26,7 +26,7 @@ with its layout (#2257).
   `/Annots`, for Hidden flags), same rev; they bring `-content`, nothing to
   patch. `stream_limited` is `pub(crate)` in craft-pdf, so `incremental` in
   `info` reads the public `reconstructed`, `encryption_changed` and
-  `full_save_required` only. Not used yet: `-crypt`, `-print`.
+  `full_save_required` only. Not used yet: `-crypt` (`-print`: #2258).
 - Slice 4 (#2257) adds `-edit`, `-create` and `-export`, same rev, for the
   conversion; no patch entry (their craft-libs crates are git
   dependencies, PdfCraft's root patches crates.io only). `-edit`'s
@@ -363,3 +363,87 @@ with its layout (#2257).
   a picture past the budgets, converts without it and says nothing
   (`export_pages_within`'s `truncated` is not carried across the child);
   terminal docxy and wasm (slice 6).
+
+## PDF view: print and export (#2258)
+
+- Crates (same rev, no patch entry): `pdfcraft-print` (`impose`, `layout`,
+  `select_pages`, `PAPERS`, `matching_paper`, `paper_media_option`,
+  `add_cups_orientation`, `spool::{printers, submit, lp_args}`,
+  `printer_default_paper`; through craft-print and craft-cms at craft-libs
+  `e2dc681a3`) and `pdfcraft-organize` (`extract_pages`). craft-print has
+  an **unconditional** git dependency on storytold/winprint.rs
+  (`craft-winprint-gdi`, a source of its own in the lock even on Linux);
+  `winprint` (twice: craft-print's rev and pdfcraft-print's) and its
+  build-dependencies (reqwest, sigstore, aws-lc) are Windows only.
+  `suite/docxy/build.rs` delay-loads `windows.data.pdf.dll` and
+  `prntvpt.dll` (`rustc-link-arg`, every executable: the tests link
+  winprint too), as PdfCraft's apps do; not buildable on Linux.
+- Protocol 4 (`worker.rs`): `print {job}` (`PrintJob`, our serde mirror of
+  `Settings` and `spool::Job`: pages 0-based, paper name and size,
+  `Sizing`, `Orient`, `PrintContent`, printer, copies, title, `Spool`),
+  `png {page, dpi}` and `extract-pages {pages}` (bytes after the line);
+  the parent's `Op::ExportTo {export, path}` asks the child per page
+  (each PNG its own request and timeout) and writes every file or none
+  (`write_all_or_none`: temporary names beside them, then renames).
+  `Op::timeout`: print and extract get `JOB_FACTOR` (3) × the child's
+  timeout, in the parent's `exchange` and in the child's watchdog
+  (`Busy` holds each request's limit, twice it). A print or export goes
+  in `form_ops` (after the fills before it, before any page); the view's
+  pages wait while it runs (one question at a time).
+- The child (`worker/doc.rs` `output`): refuses pages past its own count;
+  then the permissions, as PdfCraft's engine (`NO_PRINTING` `print()`,
+  `NO_COPYING` `copy()` for a PNG, `NO_EXTRACTING` `extract_pages()`, which
+  is assembly and copying); a file only the renderer reads (no working
+  copy) refuses too (`NOT_READ`), never the raw bytes. `shown()` is the
+  display document (`with_field_appearances_cached(
+  with_missing_appearances_cached(cos))`, or `cos`): the display copy's
+  bytes are written from it, and print and extract take it, so unsaved
+  values and PdfCraft's appearances print. Print: `impose`, `layout` (the
+  pages' `display_size`, as `impose` reads them) for
+  `add_cups_orientation`, the job's options `paper_media_option` (as
+  PdfCraft's Print dialog), `Scaling::Exact`, duplex left to the printer.
+  PNG: dpi clamped 18–1200 and capped by `effective_scale` (the answer
+  says the dpi drawn; the status says so when lower). `extract_pages`
+  output is never encrypted (`Document::new_empty`).
+- The parent (`print.rs`, `output.rs`): Ctrl+P (`is_print_chord`, before
+  the PDF keys, on any `Kind::Pdf` tab) and File > Print (`bs-pdf-print`)
+  list the printers on a thread of their own (`discover`: `lpstat` and the
+  PPD take seconds), then open `pdf-print`; never on the view's worker
+  thread. The range is parsed in the parent (`select_pages` with `info`'s
+  labels, `PrintError::said(in_english)`); typing a range picks Pages, a
+  percent Custom scale (`react`, which reads the control's new value: the
+  dialog hands it the old one). Paper: the printer's default paper, else
+  the first page's `matching_paper`, else US Letter. File > Export
+  (`bs-pdf-export`, the `bs_export` page drawn by `pdf_export_page` on a
+  PDF tab) has tiles `pdf-export-png` / `pdf-export-pdf` (probes), each a
+  dialog (`pdf-export-png`: pages, 72/150/300/600 dpi; `pdf-export-pdf`)
+  then the native Save dialog (`export_target`: the extension added, any
+  other refused). PNG names: one page the name picked, several
+  `<stem>_Page_<n>.png` zero-padded to the highest page's digits
+  (`png_names`); one of those taken (but the picked one) refuses all.
+  The rail filter has `pdf_only` (`backstage_rail_items(project, doc,
+  pdf)`); a PDF tab not open refuses with `PDF_NOT_OPEN_OUTPUT`.
+- Harness: never spools. Its printers are `harness_printers` (Test
+  Printer, the default, and Second Printer), its jobs `Spool::Dir`
+  `<config root>/print-jobs` (`job-<n>.pdf`, `job-<n>.json` with the job,
+  `options` and `lp_args`); `pdf-read` adds `printed` (the last job's
+  JSON and `jobs`), `export_waiting` and `exported` (the last export's
+  file names). An export's Save dialog is the `save-as` verb: Save… keeps
+  the export on the view (`export_waiting`), and `save-as` on that tab
+  writes it instead of a Save As (one queued export, one path).
+  `uiharness/cases/pdf-print.uit`.
+- Tests (`pdf_view/print_tests.rs`): sheets' size per paper and
+  orientation, the order chosen, sizing measured on the sheet as drawn
+  (ink width), Actual size on paper the page's size against the corpus's
+  `ref/` (the block test, `text` and `rotated`), unsaved values in the
+  print and the PDF, Form fields only and Document, permissions on
+  `enc-owner-only` and `enc-aes-128` (user and owner), PNG sizes and the
+  72-dpi PNG against `ref/`, export names and all-or-none, the job file;
+  `worker/tests.rs`: a print past a page's timeout answered, a hung one
+  given up at its own deadline; the mutation test prints and exports the
+  originals and the first `OUTPUT_MUTATIONS` (7) mutations of each file.
+- Not done: print preview, pages per sheet, booklet, poster, print as
+  image, grayscale, duplex choice, printer properties; lifting an
+  owner-only file's restrictions (no UI takes its owner password);
+  printing documents, sheets or projects; terminal docxy and wasm
+  (slice 6).

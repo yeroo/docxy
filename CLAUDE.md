@@ -77,7 +77,9 @@ issue number to find its notes.
   permissions, the child's memory limit, a failed tab's body (#2256);
   Convert to editable document with the layout: PdfCraft's export, the
   text importer as fallback, running headers and footers, columns as
-  virtual pages, fonts through code colours, text-box twins (#2257).
+  virtual pages, fonts through code colours, text-box twins (#2257);
+  print and export as drawn: imposition, the spooler and its test seam,
+  PNG and page-range export (#2258).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), in cells (#1930),
   bookmarks, the Hyperlink style, relative links, titles and targets,
