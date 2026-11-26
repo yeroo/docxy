@@ -9262,6 +9262,136 @@ mod flow_view_tests {
         }
     }
 
+    /// A list item of `num_id` at `ilvl` whose mark is `mark_rpr` (a
+    /// whole `<w:rPr>`), in paragraph style `style` (#2002).
+    fn list_item_2002(num_id: i32, ilvl: i32, mark_rpr: &str, style: Option<&str>) -> Paragraph {
+        Paragraph {
+            props: ParProps {
+                num_id: Some(num_id),
+                ilvl,
+                style_id: style.map(str::to_string),
+                raw_props: vec![mark_rpr.to_string()],
+                ..ParProps::default()
+            },
+            ..Paragraph::default()
+        }
+    }
+
+    /// #2002: a list number is drawn in its numbering level's `w:rPr` over
+    /// its mark's look (bold, red, 14 pt where the mark is black 12 pt,
+    /// the mark's font kept where the level names none; an explicit bold
+    /// off clears a bold mark's); a list the numbering part does not
+    /// define, docxy's own, draws in its mark's look as before.
+    #[test]
+    fn marker_look_takes_the_level_rpr_2002() {
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            r#"<w:numbering><w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/><w:rPr><w:b/><w:color w:val="FF0000"/><w:sz w:val="28"/></w:rPr></w:lvl>
+            <w:lvl w:ilvl="1"><w:numFmt w:val="decimal"/><w:lvlText w:val="%2."/><w:rPr><w:b w:val="0"/></w:rPr></w:lvl>
+            <w:lvl w:ilvl="8"><w:numFmt w:val="decimal"/><w:rPr><w:i/></w:rPr></w:lvl>
+            </w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        );
+        let styler = run_look::RunStyler {
+            numbering: Some(&numbering),
+            ..Default::default()
+        };
+        let pal = page_pal(0xffffff, hsla_u(0x3388ff));
+        let look = |p: &Paragraph| marker_look(&marker_mark(p, styler), 14.5, 1.0, &pal);
+        let black = r#"<w:rPr><w:rFonts w:ascii="Aptos"/><w:color w:val="000000"/><w:sz w:val="24"/></w:rPr>"#;
+        let red = look(&list_item_2002(7, 0, black, None));
+        assert!(red.bold && !red.italic);
+        assert_eq!(red.ink, hsla_u(0xFF0000));
+        assert!((red.size - 18.66).abs() < 0.01, "{}", red.size);
+        assert_eq!(red.font.as_deref(), Some("Aptos"));
+        let bold_mark = r#"<w:rPr><w:b/><w:sz w:val="24"/></w:rPr>"#;
+        let off = look(&list_item_2002(7, 1, bold_mark, None));
+        assert!(!off.bold);
+        assert!((off.size - 16.0).abs() < 0.01);
+        // A huge level is the last one, as the markers count it.
+        assert!(look(&list_item_2002(7, 40, black, None)).italic);
+        // docxy's own lists (not in the part), numId 0 and a level without
+        // a w:rPr: the mark's look, as `marker_look_is_the_marks` draws it.
+        let mark = |p: &Paragraph| marker_look(&shown_mark(p, styler), 14.5, 1.0, &pal);
+        for p in [
+            list_item_2002(1, 0, black, None),
+            list_item_2002(9991, 0, black, None),
+            list_item_2002(0, 0, black, None),
+            list_item_2002(7, 2, black, None),
+        ] {
+            assert_eq!(look(&p), mark(&p));
+            assert_eq!(look(&p).ink, hsla_u(0x000000));
+        }
+        // No numbering part: the mark's.
+        let bare = run_look::RunStyler::default();
+        let p = list_item_2002(7, 0, black, None);
+        assert_eq!(marker_mark(&p, bare), shown_mark(&p, bare));
+    }
+
+    /// #2002: the `word-compare` fixture's Symbol bullet level keeps its
+    /// mark's Segoe UI (`doc-word-compare-fonts.uit` draws it in its
+    /// substitute): the view draws its own `•`, not the level's Symbol
+    /// glyph. What else the level sets is drawn.
+    #[test]
+    fn a_bullet_marker_keeps_its_marks_font_2002() {
+        let mark = r#"<w:rPr><w:rFonts w:ascii="Segoe UI" w:hAnsi="Segoe UI"/></w:rPr>"#;
+        let styles = docxcore::styles::parse_styles_xml(ext_fixture::WORD_COMPARE_STYLES);
+        let numbering =
+            docxcore::numbering::parse_numbering_xml(ext_fixture::WORD_COMPARE_NUMBERING);
+        let styler = run_look::RunStyler {
+            sheet: Some(&styles),
+            numbering: Some(&numbering),
+            ..Default::default()
+        }
+        .for_paragraph(Some("ListParagraph"));
+        let p = list_item_2002(1, 0, mark, Some("ListParagraph"));
+        assert!(numbering.level_run_props(1, 0).is_some());
+        assert_eq!(marker_mark(&p, styler).font.as_deref(), Some("Segoe UI"));
+        let coloured = ext_fixture::WORD_COMPARE_NUMBERING.replace(
+            "<w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/>",
+            "<w:rFonts w:ascii=\"Symbol\" w:hAnsi=\"Symbol\" w:hint=\"default\"/><w:b/><w:color w:val=\"C0504D\"/>",
+        );
+        assert_ne!(coloured, ext_fixture::WORD_COMPARE_NUMBERING);
+        let numbering = docxcore::numbering::parse_numbering_xml(&coloured);
+        let styler = run_look::RunStyler {
+            numbering: Some(&numbering),
+            ..styler
+        };
+        let shown = marker_mark(&p, styler);
+        assert_eq!(shown.font.as_deref(), Some("Segoe UI"));
+        assert!(shown.bold);
+        assert_eq!(shown.color.as_deref(), Some("C0504D"));
+    }
+
+    /// #2002 (#2079's): on a dark page a list number's explicit black, its
+    /// mark's or its level's, draws lightened against the ground as the
+    /// text does, never black.
+    #[test]
+    fn a_dark_pages_black_marker_is_lightened_2002() {
+        let ground = 0x1F1F1F;
+        let pal = dark_page_pal(ground, hsla_u(0x3388ff));
+        let light = hsla_u(dark_page::text(0x000000, ground));
+        assert_ne!(light, hsla_u(0x000000));
+        let numbering = docxcore::numbering::parse_numbering_xml(
+            r#"<w:numbering><w:abstractNum w:abstractNumId="0">
+            <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:rPr><w:color w:val="000000"/></w:rPr></w:lvl>
+            </w:abstractNum><w:num w:numId="7"><w:abstractNumId w:val="0"/></w:num></w:numbering>"#,
+        );
+        let styler = run_look::RunStyler {
+            numbering: Some(&numbering),
+            ..Default::default()
+        };
+        let black = r#"<w:rPr><w:color w:val="000000"/></w:rPr>"#;
+        let plain = "<w:rPr/>";
+        for p in [
+            list_item_2002(1, 0, black, None),
+            list_item_2002(7, 0, plain, None),
+        ] {
+            let mark = marker_mark(&p, styler);
+            assert_eq!(mark.color.as_deref(), Some("000000"));
+            assert_eq!(marker_look(&mark, 14.5, 1.0, &pal).ink, light);
+        }
+    }
+
     /// #1986: the flow column's 4 px stays between two blocks neither of
     /// which is a fully spaced paragraph, and goes beside one.
     #[test]
@@ -40177,7 +40307,25 @@ fn shown_mark(p: &Paragraph, styler: run_look::RunStyler) -> RunProps {
     styler.shown(&mark).into_owned()
 }
 
-/// How a list number is drawn (#1986): in its paragraph mark's look.
+/// What a list item's number is drawn in (#2002): its paragraph mark's
+/// look ([`shown_mark`]) with its numbering level's own `w:rPr` over it
+/// (`Numbering::marker_props`: bold, italic, colour, size, and a number's
+/// font; a bullet keeps the mark's). A paragraph that is no list item, or
+/// whose level has no `w:rPr` (docxy's own lists), draws it in the mark's.
+/// The line keeps the mark's size: a larger level size does not grow it.
+fn marker_mark(p: &Paragraph, styler: run_look::RunStyler) -> RunProps {
+    let mark = shown_mark(p, styler);
+    let level = p.props.ilvl.clamp(0, 8);
+    p.props
+        .num_id
+        .filter(|_| p.props.in_list())
+        .zip(styler.numbering)
+        .and_then(|(num_id, n)| n.marker_props(num_id, level, &mark))
+        .unwrap_or(mark)
+}
+
+/// How a list number is drawn (#1986): in its paragraph mark's look, with
+/// its level's `w:rPr` over it ([`marker_mark`], #2002).
 #[derive(Clone, Debug, PartialEq)]
 struct MarkerLook {
     size: f32,
@@ -41193,7 +41341,7 @@ fn paragraph_el(
     // indent and push the text to the next stop.
     let hangs = indent_layout.first_x + 0.5 < indent_layout.continuation_x;
     let marker = marker.map(|m| if hangs { m.trim_end() } else { m });
-    let look = marker_look(&mark, base, zoom, &pal);
+    let look = marker_look(&marker_mark(p, styler), base, zoom, &pal);
     let marker_width = marker.map(|s| {
         meas.map(|m| m.width_in(s, look.size, look.bold, look.italic, look.font.as_deref()))
             .unwrap_or(0.0)
