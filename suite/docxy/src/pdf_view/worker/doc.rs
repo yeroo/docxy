@@ -759,26 +759,15 @@ fn spool_to_dir(
         "lp_args": pdfcraft_print::spool::lp_args(spec),
         "pages": job.pages.iter().map(|p| p + 1).collect::<Vec<_>>(),
         "sheets": sheets,
-        "sizing": match job.sizing {
-            Sizing::Fit => "fit",
-            Sizing::Actual => "actual",
-            Sizing::Shrink => "shrink",
-            Sizing::Custom { .. } => "custom",
-        },
+        // The wire's own names (serde), so the job file and the protocol
+        // cannot drift apart.
+        "sizing": serde_json::to_value(job.sizing).ok().and_then(|v| v.get("kind").cloned()),
         "percent": match job.sizing {
             Sizing::Custom { percent } => Some(percent),
             _ => None,
         },
-        "orientation": match job.orientation {
-            Orient::Auto => "auto",
-            Orient::Portrait => "portrait",
-            Orient::Landscape => "landscape",
-        },
-        "content": match job.content {
-            PrintContent::DocumentAndMarkups => "document-and-markups",
-            PrintContent::Document => "document",
-            PrintContent::FormFieldsOnly => "form-fields-only",
-        },
+        "orientation": serde_json::to_value(job.orientation).ok(),
+        "content": serde_json::to_value(job.content).ok(),
         "paper": job.paper_name,
         "paper_size": [job.paper.0, job.paper.1],
         "pdf": pdf_path.file_name().map(|n| n.to_string_lossy().into_owned()),
@@ -798,7 +787,7 @@ fn encode_png(w: u32, h: u32, rgba: &[u8]) -> Result<Vec<u8>, String> {
     if w == 0 || h == 0 || rgba.len() != w as usize * h as usize * 4 {
         return Err("the page drew nothing".into());
     }
-    let straight = super::straight(rgba, false);
+    let straight = super::straight_rgba(rgba);
     let mut out = Vec::new();
     image::ImageEncoder::write_image(
         image::codecs::png::PngEncoder::new(&mut out),

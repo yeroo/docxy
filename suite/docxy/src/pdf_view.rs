@@ -815,7 +815,7 @@ impl PdfView {
                 self.notice = Some(print::printed_status(&job, p.sheets));
             }
             (Op::ExportTo { .. }, Answer::Exported(e)) => {
-                self.notice = Some(print::exported_status(&e.files, e.dpi_used));
+                self.notice = Some(print::exported_status(&e.files, e.dpi_used, &e.left));
                 self.exported = e.files;
             }
             (op, Answer::Failed(why)) => self.fail(&op, why),

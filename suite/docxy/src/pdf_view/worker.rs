@@ -282,6 +282,9 @@ pub(crate) struct Exported {
     /// PNG: the resolution the pages were drawn at when the renderer drew
     /// one at less than asked (its size caps), the lowest.
     pub dpi_used: Option<f64>,
+    /// Files that were at the names, moved aside, and could not be removed
+    /// after: where they are (the status says so).
+    pub left: Vec<PathBuf>,
 }
 
 /// A form field's new value on the wire (#2255).
@@ -926,12 +929,16 @@ fn flatten(items: &[pdfcraft_render::OutlineItem], depth: usize, out: &mut Vec<B
 /// Pages are drawn over white, so alpha is 255 and only red and blue swap;
 /// a pixel with less is un-premultiplied too.
 pub(crate) fn straight_bgra(rgba: &[u8]) -> Vec<u8> {
-    straight(rgba, true)
+    straight::<true>(rgba)
 }
 
-/// Premultiplied RGBA as straight RGBA (`bgr` false: a PNG's order) or
-/// straight BGRA (`bgr` true).
-pub(crate) fn straight(rgba: &[u8], bgr: bool) -> Vec<u8> {
+/// Premultiplied RGBA as straight RGBA, as a PNG takes it (#2258).
+pub(crate) fn straight_rgba(rgba: &[u8]) -> Vec<u8> {
+    straight::<false>(rgba)
+}
+
+/// Premultiplied RGBA un-premultiplied, in BGRA order when `BGR`.
+fn straight<const BGR: bool>(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
     for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
         let un = |c: u8| match a {
@@ -939,7 +946,7 @@ pub(crate) fn straight(rgba: &[u8], bgr: bool) -> Vec<u8> {
             0 => 0,
             a => ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8,
         };
-        if bgr {
+        if BGR {
             out.extend_from_slice(&[un(b), un(g), un(r), a]);
         } else {
             out.extend_from_slice(&[un(r), un(g), un(b), a]);
@@ -1260,6 +1267,19 @@ impl Worker {
         if opccore::fsio::same_file(path, &self.path) {
             return Answer::Failed(EXPORT_OVER_ITSELF.into());
         }
+        // One file (a PDF, a page's PNG): fsio's own atomic export.
+        let one = |w: &mut Worker, bytes: Vec<u8>, dpi_used| match opccore::fsio::export_atomic(
+            Some(&w.path),
+            path,
+            &bytes,
+        ) {
+            Ok(()) => Answer::Exported(Exported {
+                files: vec![path.to_path_buf()],
+                dpi_used,
+                left: Vec::new(),
+            }),
+            Err(e) => Answer::Failed(format!("the file could not be written: {e}")),
+        };
         let mut staged = Staged::default();
         let stage = |staged: &mut Staged, name: &Path, bytes: &[u8]| {
             staged
@@ -1271,20 +1291,31 @@ impl Worker {
                 let op = Op::ExtractPages {
                     pages: pages.clone(),
                 };
-                match self.ask(&op) {
-                    Answer::Bytes(pdf) => {
-                        if let Err(why) = stage(&mut staged, path, &pdf) {
-                            return Answer::Failed(why);
-                        }
+                return match self.ask(&op) {
+                    Answer::Bytes(pdf) => one(self, pdf, None),
+                    Answer::Failed(why) => Answer::Failed(why),
+                    _ => Answer::Failed(DIED.into()),
+                };
+            }
+            Export::Png { pages, dpi } if distinct(pages).len() == 1 => {
+                let page = pages[0];
+                return match self.ask(&Op::Png { page, dpi: *dpi }) {
+                    Answer::Png { png, dpi: drawn } => {
+                        one(self, png, (drawn + 0.5 < *dpi).then_some(drawn))
                     }
-                    Answer::Failed(why) => return Answer::Failed(why),
-                    _ => return Answer::Failed(DIED.into()),
-                }
-                None
+                    Answer::Failed(why) => Answer::Failed(format!("page {}: {why}", page + 1)),
+                    _ => Answer::Failed(DIED.into()),
+                };
             }
             Export::Png { pages, dpi } => {
                 let pages = distinct(pages);
                 let names = png_names(path, &pages);
+                if let Some(own) = names
+                    .iter()
+                    .find(|n| opccore::fsio::same_file(n, &self.path))
+                {
+                    return Answer::Failed(format!("{}: {EXPORT_OVER_ITSELF}", own.display()));
+                }
                 if let Some(taken) = names.iter().find(|n| n.as_path() != path && n.exists()) {
                     return Answer::Failed(format!(
                         "{} already exists, so nothing was written: choose another name",
@@ -1312,7 +1343,11 @@ impl Worker {
             }
         };
         match staged.commit() {
-            Ok(files) => Answer::Exported(Exported { files, dpi_used }),
+            Ok(Committed { files, left }) => Answer::Exported(Exported {
+                files,
+                dpi_used,
+                left,
+            }),
             Err(e) => Answer::Failed(format!("the file could not be written: {e}")),
         }
     }
@@ -1466,93 +1501,143 @@ pub(crate) fn distinct(pages: &[usize]) -> Vec<usize> {
 pub(crate) const EXPORT_OVER_ITSELF: &str =
     "an export cannot replace the PDF that is open: choose another name";
 
-/// The files an export writes, every one or none (#2258). [`Staged::add`]
-/// writes and syncs each to a temporary name beside its own (`.<name>.<pid>
-/// .part`); [`Staged::commit`] moves each into place, a file already at its
-/// name moved aside first (`.<name>.<pid>.old`), and on any failure puts
-/// back every name it had done, the files that were there included. The
-/// temporary files go when it is dropped, committed or not. A file's own
-/// permissions are not carried over to its replacement.
+/// The files a PNG export of several pages writes (#2258), every one or
+/// none as far as the file system lets it be undone, by `opccore::fsio`'s
+/// rules: a symlinked name writes its target, a read-only one is refused
+/// up front, a replaced file's permissions are kept.
+///
+/// [`Staged::add`] writes and syncs each file to a temporary sibling of its
+/// own (`fsio::temp_sibling`: exclusive, never shared with another writer)
+/// as it comes, so the suite holds paths, not pictures. [`Staged::commit`]
+/// renames them into place in order: a file already at a name is first
+/// moved aside to a sibling of its own, but at the last name, whose rename
+/// replaces it atomically (nothing after it can fail, so it never needs
+/// putting back). When a rename fails, every name done is put back, the
+/// files that were there moved back; that putting back is best effort, and
+/// the error says where a file it could not put back is now. The
+/// temporary files go when it is dropped, committed or not.
 #[derive(Default)]
 pub(crate) struct Staged {
-    /// Each file's name and its temporary one.
-    files: Vec<(PathBuf, PathBuf)>,
+    files: Vec<StagedFile>,
 }
 
-fn sibling(path: &Path, what: &str) -> PathBuf {
-    let mut name = std::ffi::OsString::from(".");
-    name.push(path.file_name().unwrap_or_default());
-    name.push(format!(".{}.{what}", std::process::id()));
-    path.with_file_name(name)
+struct StagedFile {
+    /// The name as asked, for the answer.
+    asked: PathBuf,
+    /// The file written: `asked`, or a symlink's target.
+    dest: PathBuf,
+    temp: PathBuf,
+}
+
+/// What a commit did.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Committed {
+    pub files: Vec<PathBuf>,
+    /// Files moved aside that could not be removed after: where they are.
+    pub left: Vec<PathBuf>,
 }
 
 impl Staged {
-    /// Write `bytes` for `path`, to its temporary file. The same `path` twice
-    /// is refused: the second would overwrite the first's temporary file.
+    /// Write `bytes` for `path`, to its temporary file. A name already
+    /// added (as written, a symlink followed) is refused: one file, one
+    /// picture.
     pub(crate) fn add(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        if self.files.iter().any(|(p, _)| p == path) {
+        let (dest, permissions) = opccore::fsio::write_destination(path)?;
+        let same = |f: &StagedFile| f.dest == dest || opccore::fsio::same_file(&f.dest, &dest);
+        if self.files.iter().any(same) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 format!("{} would be written twice", path.display()),
             ));
         }
-        let temp = sibling(path, "part");
+        let (temp, mut file) = opccore::fsio::temp_sibling(&dest)?;
         // Listed first, so a write that fails halfway is removed too.
-        self.files.push((path.to_path_buf(), temp.clone()));
-        let mut f = std::fs::File::create(&temp)?;
-        f.write_all(bytes)?;
-        f.sync_all()
+        self.files.push(StagedFile {
+            asked: path.to_path_buf(),
+            dest,
+            temp,
+        });
+        file.write_all(bytes)?;
+        if let Some(p) = permissions {
+            file.set_permissions(p)?;
+        }
+        file.sync_all()
     }
 
-    /// Move every file into place, or none: the names written.
-    pub(crate) fn commit(self) -> std::io::Result<Vec<PathBuf>> {
+    /// Move every file into place, or put back the ones done.
+    pub(crate) fn commit(self) -> std::io::Result<Committed> {
         // Each name done, and where the file that was there went.
         let mut done: Vec<(&Path, Option<PathBuf>)> = Vec::with_capacity(self.files.len());
-        for (path, temp) in &self.files {
+        let last = self.files.len().saturating_sub(1);
+        for (i, f) in self.files.iter().enumerate() {
             let step = (|| {
-                let aside = if path.is_file() {
-                    let old = sibling(path, "old");
-                    std::fs::rename(path, &old)?;
-                    Some(old)
+                let aside = if i < last && f.dest.is_file() {
+                    let (aside, _) = opccore::fsio::temp_sibling(&f.dest)?;
+                    if let Err(e) = std::fs::rename(&f.dest, &aside) {
+                        let _ = std::fs::remove_file(&aside);
+                        return Err(e);
+                    }
+                    Some(aside)
                 } else {
                     None
                 };
-                match std::fs::rename(temp, path) {
+                match std::fs::rename(&f.temp, &f.dest) {
                     Ok(()) => Ok(aside),
                     Err(e) => {
-                        if let Some(old) = &aside {
-                            let _ = std::fs::rename(old, path);
+                        let mut why = e.to_string();
+                        if let Some(old) = &aside
+                            && std::fs::rename(old, &f.dest).is_err()
+                        {
+                            why.push_str(&format!(
+                                "; the file that was at {} is now at {}",
+                                f.dest.display(),
+                                old.display()
+                            ));
                         }
-                        Err(e)
+                        Err(std::io::Error::new(e.kind(), why))
                     }
                 }
             })();
             match step {
-                Ok(aside) => done.push((path, aside)),
+                Ok(aside) => done.push((&f.dest, aside)),
                 Err(e) => {
-                    for (path, aside) in done.iter().rev() {
-                        let _ = std::fs::remove_file(path);
-                        if let Some(old) = aside {
-                            let _ = std::fs::rename(old, path);
+                    let mut why = e.to_string();
+                    for (dest, aside) in done.iter().rev() {
+                        let put_back = match aside {
+                            Some(old) => std::fs::rename(old, dest).map_err(|_| {
+                                format!(
+                                    "; the file that was at {} is now at {}",
+                                    dest.display(),
+                                    old.display()
+                                )
+                            }),
+                            None => std::fs::remove_file(dest)
+                                .map_err(|_| format!("; {} was written and stays", dest.display())),
+                        };
+                        if let Err(note) = put_back {
+                            why.push_str(&note);
                         }
                     }
-                    return Err(e);
+                    return Err(std::io::Error::new(e.kind(), why));
                 }
             }
         }
-        for (_, aside) in &done {
-            if let Some(old) = aside {
-                let _ = std::fs::remove_file(old);
-            }
-        }
-        Ok(self.files.iter().map(|(p, _)| p.clone()).collect())
+        let left = done
+            .into_iter()
+            .filter_map(|(_, aside)| aside)
+            .filter(|old| std::fs::remove_file(old).is_err())
+            .collect();
+        Ok(Committed {
+            files: self.files.iter().map(|f| f.asked.clone()).collect(),
+            left,
+        })
     }
 }
 
 impl Drop for Staged {
     fn drop(&mut self) {
-        for (_, temp) in &self.files {
-            let _ = std::fs::remove_file(temp);
+        for f in &self.files {
+            let _ = std::fs::remove_file(&f.temp);
         }
     }
 }

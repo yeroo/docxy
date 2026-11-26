@@ -2020,11 +2020,10 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
         // The last print job this harness instance wrote (#2258), and an
         // export waiting for its save-as.
         pairs.push(("printed".into(), last_print_job()));
-        let waiting = match &v.export_waiting {
-            Some(crate::pdf_view::worker::Export::Png { .. }) => Json::Str("png".into()),
-            Some(crate::pdf_view::worker::Export::Pdf { .. }) => Json::Str("pdf".into()),
-            None => Json::Null,
-        };
+        let waiting = v
+            .export_waiting
+            .as_ref()
+            .map_or(Json::Null, |e| Json::Str(e.extension().into()));
         pairs.push(("export_waiting".into(), waiting));
         let names = v
             .exported
@@ -8343,11 +8342,8 @@ fn dispatch_verb(
                     else {
                         return Err("the export is no longer waiting".into());
                     };
-                    let kind = match export {
-                        crate::pdf_view::worker::Export::Png { .. } => "png",
-                        crate::pdf_view::worker::Export::Pdf { .. } => "pdf",
-                    };
-                    let target = app.pdf_export_to(export, target)?;
+                    let kind = export.extension();
+                    app.pdf_export_to(export, target.clone())?;
                     cx.notify();
                     let tab = &app.tabs[app.active];
                     return Done::ok(Json::obj(vec![

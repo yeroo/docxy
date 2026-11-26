@@ -856,7 +856,9 @@ fn a_png_export_writes_exactly_its_pages_or_nothing() {
         export: export.clone(),
         path: target.clone(),
     }) {
-        Answer::Exported(Exported { files, dpi_used }) => {
+        Answer::Exported(Exported {
+            files, dpi_used, ..
+        }) => {
             assert_eq!(
                 files,
                 [dir.path("out_Page_1.png"), dir.path("out_Page_3.png")]
@@ -1031,6 +1033,7 @@ fn the_view_sends_prints_before_pages_and_says_how_they_went() {
         answer: Answer::Exported(Exported {
             files: vec!["/d/x_Page_1.png".into(), "/d/x_Page_2.png".into()],
             dpi_used: Some(491.5),
+            left: Vec::new(),
         }),
         lost: false,
     });
@@ -1100,31 +1103,37 @@ fn a_png_export_of_repeated_pages_writes_each_page_once() {
     }
 }
 
-/// r1 M1: a rename that fails partway (a directory at the second name)
-/// leaves no new file and no temporary one, and the first name keeps the
-/// file that was there.
+/// r1 M1, r2 m1: a rename that fails partway leaves no new file and no
+/// temporary one, and the names done keep the files that were there. A
+/// directory at a name is refused when the file is added; one put there
+/// after makes the last rename fail.
 #[test]
 fn a_failed_rename_puts_every_name_back() {
     let dir = Scratch::new();
     let first = dir.path("a.png");
     std::fs::write(&first, b"old").unwrap();
-    std::fs::create_dir(dir.path("b.png")).unwrap();
+    let mut staged = crate::pdf_view::worker::Staged::default();
+    std::fs::create_dir(dir.path("d.png")).unwrap();
+    assert!(staged.add(&dir.path("d.png"), b"x").is_err(), "a directory");
+    std::fs::remove_dir(dir.path("d.png")).unwrap();
     let mut staged = crate::pdf_view::worker::Staged::default();
     staged.add(&first, b"new a").unwrap();
     staged.add(&dir.path("b.png"), b"new b").unwrap();
     // The same name twice is refused, not written over.
     assert!(staged.add(&first, b"again").is_err());
+    std::fs::create_dir(dir.path("b.png")).unwrap();
     assert!(staged.commit().is_err());
     assert_eq!(std::fs::read(&first).unwrap(), b"old");
     assert!(dir.path("b.png").is_dir());
     assert_eq!(files_in(&dir.path("")), ["a.png", "b.png"]);
+    std::fs::remove_dir(dir.path("b.png")).unwrap();
     // And every name in place when all go.
     let mut staged = crate::pdf_view::worker::Staged::default();
     staged.add(&first, b"new a").unwrap();
     staged.add(&dir.path("c.png"), b"new c").unwrap();
-    assert_eq!(staged.commit().unwrap().len(), 2);
+    assert_eq!(staged.commit().unwrap().files.len(), 2);
     assert_eq!(std::fs::read(&first).unwrap(), b"new a");
-    assert_eq!(files_in(&dir.path("")), ["a.png", "b.png", "c.png"]);
+    assert_eq!(files_in(&dir.path("")), ["a.png", "c.png"]);
 }
 
 /// r1 M2: pages are written as they come, so a page that fails after one
@@ -1200,4 +1209,129 @@ fn printers_arriving_open_the_dialog_only_in_front_and_stop_looking() {
         "a dialog is open"
     );
     assert_eq!(tab.status.as_ref(), "");
+}
+
+// ---- review r2 ------------------------------------------------------------------
+
+/// r2 m1: a single file replaces the one at its name in one rename, the
+/// export's and the writer's: nothing is moved aside, nothing is left.
+#[test]
+fn a_single_file_replaces_its_name_with_nothing_left_aside() {
+    let dir = Scratch::new();
+    let target = dir.path("one.png");
+    std::fs::write(&target, b"old").unwrap();
+    let mut staged = crate::pdf_view::worker::Staged::default();
+    staged.add(&target, b"new").unwrap();
+    let done = staged.commit().unwrap();
+    assert_eq!((done.files.len(), done.left.len()), (1, 0));
+    assert_eq!(std::fs::read(&target).unwrap(), b"new");
+    assert_eq!(files_in(&dir.path("")), ["one.png"]);
+    // A one-page export over it (fsio's export_atomic): the same.
+    let mut w = worker_on(&corpus_path("slides"));
+    info_of(&mut w);
+    match w.ask(&Op::ExportTo {
+        export: Export::Png {
+            pages: vec![1, 1],
+            dpi: 72.,
+        },
+        path: target.clone(),
+    }) {
+        Answer::Exported(e) => assert_eq!(e.files, std::slice::from_ref(&target)),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        decode(&std::fs::read(&target).unwrap()).dimensions(),
+        (960, 540)
+    );
+    assert_eq!(files_in(&dir.path("")), ["one.png"]);
+    // And the status names a file left aside, when one is.
+    let s = exported_status(std::slice::from_ref(&target), None, &[dir.path(".x.tmp")]);
+    assert!(
+        s.contains("could not be removed") && s.contains(".x.tmp"),
+        "{s}"
+    );
+}
+
+/// r2 m2: the writer follows `opccore::fsio`'s rules: a symlinked name
+/// keeps its link and writes its target; a read-only file at a name is
+/// refused up front and left as it was; two writers of one name never
+/// share a temporary file.
+#[test]
+fn the_export_writer_follows_fsios_rules() {
+    let dir = Scratch::new();
+    #[cfg(unix)]
+    {
+        let real = dir.path("real.png");
+        std::fs::write(&real, b"old").unwrap();
+        let link = dir.path("link.png");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut staged = crate::pdf_view::worker::Staged::default();
+        staged.add(&link, b"through the link").unwrap();
+        staged.add(&dir.path("other.png"), b"other").unwrap();
+        staged.commit().unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&real).unwrap(), b"through the link");
+        // The same file by its link and its own name is one name.
+        let mut staged = crate::pdf_view::worker::Staged::default();
+        staged.add(&link, b"a").unwrap();
+        assert!(staged.add(&real, b"b").is_err());
+    }
+    let locked = dir.path("locked.png");
+    std::fs::write(&locked, b"keep").unwrap();
+    let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+    perms.set_readonly(true);
+    std::fs::set_permissions(&locked, perms).unwrap();
+    let mut staged = crate::pdf_view::worker::Staged::default();
+    // fsio's refusal: the open for writing (as a user) or its read-only
+    // check (as root, whom the open does not stop).
+    let e = staged.add(&locked, b"new").unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{e}");
+    drop(staged);
+    assert_eq!(std::fs::read(&locked).unwrap(), b"keep");
+    // A one-page export onto it is refused by export_atomic the same way.
+    let mut w = worker_on(&corpus_path("slides"));
+    info_of(&mut w);
+    match w.ask(&Op::ExportTo {
+        export: Export::Png {
+            pages: vec![0],
+            dpi: 72.,
+        },
+        path: locked.clone(),
+    }) {
+        Answer::Failed(why) => {
+            assert!(
+                why.contains("read-only") || why.contains("ermission denied"),
+                "{why}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(std::fs::read(&locked).unwrap(), b"keep");
+    let mut perms = std::fs::metadata(&locked).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&locked, perms).unwrap();
+    // Two writers of one name: two temporary files, both gone on drop.
+    let shared = Scratch::new();
+    let name = shared.path("same.png");
+    let (mut a, mut b) = (
+        crate::pdf_view::worker::Staged::default(),
+        crate::pdf_view::worker::Staged::default(),
+    );
+    a.add(&name, b"a").unwrap();
+    b.add(&name, b"b").unwrap();
+    assert_eq!(
+        files_in(&shared.path("")).len(),
+        2,
+        "{:?}",
+        files_in(&shared.path(""))
+    );
+    drop(a);
+    drop(b);
+    assert!(files_in(&shared.path("")).is_empty());
 }

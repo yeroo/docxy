@@ -236,23 +236,22 @@ impl Docxy {
     }
 
     /// Hand an export to the active view's worker, to `target`, which the
-    /// caller checked (`print::export_target`): the path the export writes,
-    /// or why not.
+    /// caller checked (`print::export_target`), or say why not.
     pub(crate) fn pdf_export_to(
         &mut self,
         export: Export,
         target: std::path::PathBuf,
-    ) -> Result<std::path::PathBuf, String> {
+    ) -> Result<(), String> {
         let tab = self.tabs.get_mut(self.active).ok_or(PDF_NOT_OPEN_OUTPUT)?;
         let Surface::Pdf(v) = &mut tab.surface else {
             return Err(PDF_NOT_OPEN_OUTPUT.into());
         };
         v.form_ops.push_back(Op::ExportTo {
             export,
-            path: target.clone(),
+            path: target,
         });
         tab.status = print::EXPORTING.into();
-        Ok(target)
+        Ok(())
     }
 }
 

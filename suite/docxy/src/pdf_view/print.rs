@@ -541,8 +541,25 @@ pub(crate) fn printed_status(job: &PrintJob, sheets: usize) -> String {
     format!("Sent {sheets} page{s} to {printer}{copies}")
 }
 
-/// The status line after an export.
-pub(crate) fn exported_status(files: &[PathBuf], dpi_used: Option<f64>) -> String {
+/// The status line after an export: what was written, and where any file
+/// the export replaced was left when it could not be removed (#2258 r2).
+pub(crate) fn exported_status(
+    files: &[PathBuf],
+    dpi_used: Option<f64>,
+    left: &[PathBuf],
+) -> String {
+    let saved = saved_status(files, dpi_used);
+    if left.is_empty() {
+        return saved;
+    }
+    let left: Vec<String> = left.iter().map(|p| p.display().to_string()).collect();
+    format!(
+        "{saved}; the files it replaced could not be removed: {}",
+        left.join(", ")
+    )
+}
+
+fn saved_status(files: &[PathBuf], dpi_used: Option<f64>) -> String {
     let at = dpi_used
         .map(|d| {
             format!(
