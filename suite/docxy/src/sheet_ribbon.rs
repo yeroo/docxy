@@ -78,20 +78,42 @@ pub(crate) struct SheetCmd {
     pub act: SheetAct,
 }
 
+/// The Help tab's About command, whose label is `brand::about_label` (the
+/// table's is the suite's own).
+const ABOUT_ID: &str = "about-docxy";
+
 impl SheetCmd {
     /// The label as it reads now; `toggled` is the command's state.
     pub fn label(&self, toggled: bool) -> &'static str {
-        match self.alt {
-            Some(alt) if toggled => alt,
-            _ => self.label,
-        }
+        self.label_with(toggled, crate::brand::about_label())
     }
 
     /// The text drawn on the button as it reads now.
     pub fn text(&self, toggled: bool) -> &'static str {
+        self.text_with(toggled, crate::brand::about_label())
+    }
+
+    /// [`SheetCmd::label`] with `about` for the About command's label.
+    fn label_with(&self, toggled: bool, about: &'static str) -> &'static str {
         match self.alt {
             Some(alt) if toggled => alt,
-            _ => self.text.unwrap_or(self.label),
+            _ => self.own_label(about),
+        }
+    }
+
+    /// [`SheetCmd::text`] with `about` for the About command's label.
+    fn text_with(&self, toggled: bool, about: &'static str) -> &'static str {
+        match self.alt {
+            Some(alt) if toggled => alt,
+            _ => self.text.unwrap_or(self.own_label(about)),
+        }
+    }
+
+    fn own_label(&self, about: &'static str) -> &'static str {
+        if self.id == ABOUT_ID {
+            about
+        } else {
+            self.label
         }
     }
 
@@ -1689,6 +1711,25 @@ pub(crate) fn resolve_on(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_about_command_takes_the_brands_label() {
+        let about = SHEET_RIBBON
+            .iter()
+            .flat_map(Tab::commands)
+            .find(|c| c.id == ABOUT_ID)
+            .expect("the Help tab's About command");
+        assert_eq!(about.label(false), "About docxy suite");
+        assert_eq!(about.text(false), "About docxy suite");
+        assert_eq!(about.label_with(false, "About Product"), "About Product");
+        assert_eq!(about.text_with(false, "About Product"), "About Product");
+        let other = SHEET_RIBBON
+            .iter()
+            .flat_map(Tab::commands)
+            .find(|c| c.id != ABOUT_ID)
+            .unwrap();
+        assert_eq!(other.label_with(false, "About Product"), other.label);
+    }
+
     /// The sheet's View tab has the Theme button (#1473), calling
     /// `SheetAct::Theme`.
     #[test]
