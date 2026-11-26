@@ -15,8 +15,7 @@ use buildinfo::BuildInfo;
 use ctlcore::json::Json;
 use std::sync::Arc;
 
-/// The product name `--version` and the About dialog print.
-pub(crate) const PRODUCT: &str = "docxy suite";
+use crate::brand::PRODUCT;
 
 /// This binary's build info; the suite's own `CARGO_PKG_VERSION`, not the
 /// terminal editors'.
@@ -110,13 +109,18 @@ pub(crate) fn copy_text(info: &BuildInfo, manuals: &[ManualRow]) -> String {
     s
 }
 
-/// The About docxy suite dialog: every field of the build as a labelled row,
-/// the "Manual build" marker when it is one, each editor's manual, and Copy /
-/// Close. Enter and Escape press Close.
-pub(crate) fn dialog(info: &BuildInfo, manuals: &[ManualRow]) -> Dialog {
+/// The About dialog: every field of the build as a labelled row, the
+/// "Manual build" marker when it is one, each editor's manual, the
+/// integration's rows (`brand::about_rows`), and Copy / Close. Enter and
+/// Escape press Close.
+pub(crate) fn dialog(
+    info: &BuildInfo,
+    manuals: &[ManualRow],
+    integration: &[(&'static str, &'static str, String)],
+) -> Dialog {
     let mut d = Dialog::message(
         catalog::ABOUT,
-        &format!("About {PRODUCT} {}", info.version),
+        &format!("{} {}", crate::brand::about_label(), info.version),
         String::new(),
         &[("Copy", ButtonRole::Apply), ("Close", ButtonRole::Cancel)],
         DialogOwner::About,
@@ -147,6 +151,14 @@ pub(crate) fn dialog(info: &BuildInfo, manuals: &[ManualRow]) -> Dialog {
             Value::Text(row.value.clone()),
         ));
     }
+    for (name, label, value) in integration {
+        controls.push(Field::new(
+            name,
+            label,
+            ControlKind::Label,
+            Value::Text(value.clone()),
+        ));
+    }
     d.controls = controls;
     for b in &mut d.buttons {
         b.default = b.label == "Close";
@@ -161,7 +173,8 @@ impl Docxy {
     pub(crate) fn open_about(&mut self) -> Result<(), String> {
         let manuals = manual_rows(|e| self.help_bundle(e));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
-        tab.dialogs.push(dialog(info(), &manuals));
+        tab.dialogs
+            .push(dialog(info(), &manuals, &crate::brand::about_rows()));
         Ok(())
     }
 
@@ -439,7 +452,7 @@ mod tests {
     #[test]
     fn the_dialog_lists_every_field_with_copy_and_close() {
         let i = info();
-        let d = dialog(i, &mixed());
+        let d = dialog(i, &mixed(), &[]);
         let names: Vec<&str> = d.controls.iter().map(|c| c.name).collect();
         for want in [
             "commit",

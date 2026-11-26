@@ -23,6 +23,7 @@ compile_error!(
 mod about;
 mod accent;
 mod balloons;
+mod brand;
 mod close;
 #[cfg(test)]
 mod comment_tests;
@@ -16564,7 +16565,7 @@ fn edit_anyway_tab(tab: &mut DocTab) -> bool {
 fn reopen_dialog(path: &std::path::Path, mode: OpenMode) -> dialog::Dialog {
     dialog::Dialog::message(
         catalog::REOPEN,
-        "docxy",
+        brand::short(),
         open_mode::reopen_question(&file_name(path)),
         &[
             ("Yes", dialog::ButtonRole::Accept),
@@ -18984,9 +18985,14 @@ impl Docxy {
         // the startup files are open (#1225).
         this.recovery_pending = recovered;
         // A format plugin that did not load (`main` logged each one): the
-        // first says so on the status line.
-        if let Some(error) = project_formats::global().errors.first() {
-            let notice = format!("Plugin not loaded: {error}");
+        // first says so on the status line, else the integration plugin's
+        // refusal.
+        let notice = project_formats::global()
+            .errors
+            .first()
+            .map(|error| format!("Plugin not loaded: {error}"))
+            .or_else(|| brand::startup_notice().map(str::to_string));
+        if let Some(notice) = notice {
             if this.tabs.is_empty() {
                 this.pending_status = Some(notice.into());
             } else {
@@ -28758,7 +28764,7 @@ impl Docxy {
             }
             SheetSaveStep::Confirm { ref losses, .. } => {
                 let dialog = rfd::MessageDialog::new()
-                    .set_title("docxy")
+                    .set_title(brand::short())
                     .set_level(rfd::MessageLevel::Warning)
                     .set_description(macro_free_question(losses))
                     .set_buttons(rfd::MessageButtons::YesNo);
@@ -46892,7 +46898,7 @@ impl Docxy {
                             .text_color(fg)
                             .cursor_pointer()
                             .hover(|d| d.border_color(rgb(accent::brand())))
-                            .child("About docxy suite")
+                            .child(brand::about_label())
                             .on_click(cx.listener(|this, _, _, cx| this.open_about_clicked(cx))),
                     ),
                 )
@@ -54666,6 +54672,7 @@ fn open_docxy_window(
     let handle = cx.open_window(options, {
         let view = view.clone();
         move |window, cx| {
+            brand::set_window_icon(window);
             // Attach only the selected mode's server. Normal Project control
             // never enables harness verbs or changes the UI's dialog policy.
             // The link is owned by the registry, so it — and the discovery
@@ -54859,6 +54866,12 @@ pub fn run(extensions: ext::Extensions) {
     // a dialog.
     for error in &project_formats::global().errors {
         let msg = format!("docxy: plugin not loaded: {error}");
+        eprintln!("{msg}");
+        crashlog::startup(&config_root(), &msg);
+    }
+    // The integration plugin, at the same point and said the same way.
+    if let Some(notice) = brand::start(&config_root(), want_harness) {
+        let msg = format!("docxy: {notice}");
         eprintln!("{msg}");
         crashlog::startup(&config_root(), &msg);
     }

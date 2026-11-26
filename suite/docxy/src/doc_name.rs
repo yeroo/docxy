@@ -70,17 +70,23 @@ pub(crate) fn next_project_title(next: &mut u32) -> String {
 
 /// The window title drawn for the active tab's title `tab_title`: Project's
 /// `<stem>  -  <app>` (stem = the title without its extension, two spaces
-/// either side of the hyphen). No tab draws the bare brand.
+/// either side of the hyphen), `<app>` being `brand::short`. No tab draws
+/// the bare brand.
 pub(crate) fn window_title(tab_title: Option<&str>) -> String {
+    window_title_named(tab_title, crate::brand::short())
+}
+
+/// [`window_title`] with `app` for the brand.
+pub(crate) fn window_title_named(tab_title: Option<&str>, app: &str) -> String {
     match tab_title {
         Some(t) => {
             let stem = std::path::Path::new(t)
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_else(|| t.to_string());
-            format!("{stem}  -  docxy")
+            format!("{stem}  -  {app}")
         }
-        None => "docxy".to_string(),
+        None => app.to_string(),
     }
 }
 
@@ -225,6 +231,15 @@ mod tests {
             "Untitled  -  docxy"
         );
         assert_eq!(window_title(None).as_str(), "docxy");
+    }
+
+    #[test]
+    fn window_title_names_the_given_app() {
+        assert_eq!(
+            window_title_named(Some("sample.docx"), "Product").as_str(),
+            "sample  -  Product"
+        );
+        assert_eq!(window_title_named(None, "Product").as_str(), "Product");
     }
 
     #[test]

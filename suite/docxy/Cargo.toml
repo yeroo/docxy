@@ -45,6 +45,8 @@ htmlbundle = { path = "../../htmlbundle" }
 gridcore = { path = "../../gridcore" }
 # `plugins`: Project tabs open and save the types format plugins add.
 projcore = { path = "../../projcore", features = ["plugins"] }
+# The integration plugin: product names, icon, organization (brand.rs).
+docxy-integration = { path = "../../integration" }
 mppread = { path = "../../mppread" }
 # Loopback-JSON control for normal Project tabs and the opt-in UI test harness.
 ctlcore = { path = "../../ctlcore" }
@@ -136,6 +138,11 @@ html-export = []
 # run against a build that schedules its draws differently from the shipped
 # app. Never enable it in a shipped build. Refused off macOS; see main.rs.
 harness-capture = ["gpui_platform/test-support"]
+
+[target.'cfg(windows)'.dependencies]
+# A window's HWND for the integration plugin's icon (brand.rs); gpui's
+# version, already in the lock.
+raw-window-handle = "0.6"
 
 # Embeds the Windows app icon (assets/docxy.ico) into suite.exe via docxy.rc.
 [target.'cfg(windows)'.build-dependencies]

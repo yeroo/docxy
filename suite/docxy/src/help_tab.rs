@@ -110,7 +110,15 @@ pub(crate) fn help_tab() -> rs::Tab<Act> {
                 "About",
                 10,
                 vec![Control::Large(
-                    cmd("about", "info", "About docxy suite", H::About, "", "").key("A"),
+                    cmd(
+                        "about",
+                        "info",
+                        crate::brand::about_label(),
+                        H::About,
+                        "",
+                        "",
+                    )
+                    .key("A"),
                 )],
             ),
         ],

@@ -639,6 +639,7 @@ impl Docxy {
                         "manuals".into(),
                         crate::about::manuals_json(|e| self.help_bundle(e)),
                     ));
+                    fields.push(("integration".into(), crate::brand::app_info_json()));
                 }
                 info
             }));
