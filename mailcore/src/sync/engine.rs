@@ -52539,9 +52539,12 @@ mod tests {
                 .filter(|r| bearer(r) == "Bearer BROKERED")
                 .map(|r| format!("{} {}", r.method, r.path))
                 .collect();
-            assert_eq!(
-                on_new.first().map(String::as_str),
-                Some(&*format!("GET {PROBE}"))
+            // The probe as the engine sends it (`PROBE` and its `$select`).
+            assert!(
+                on_new
+                    .first()
+                    .is_some_and(|r| r.starts_with(&format!("GET {PROBE}"))),
+                "{on_new:?}"
             );
             assert!(!on_new.iter().any(|r| r.starts_with("PATCH")), "{on_new:?}");
             assert!(engine.store.pending_ops().unwrap().is_empty());
@@ -52634,9 +52637,12 @@ mod tests {
                 .filter(|r| bearer_of(r) == "Bearer BROKERED")
                 .map(|r| format!("{} {}", r.method, r.path))
                 .collect();
-            assert_eq!(
-                on_new.first().map(String::as_str),
-                Some(&*format!("GET {PROBE}"))
+            // The probe as the engine sends it (`PROBE` and its `$select`).
+            assert!(
+                on_new
+                    .first()
+                    .is_some_and(|r| r.starts_with(&format!("GET {PROBE}"))),
+                "{on_new:?}"
             );
         }
 
