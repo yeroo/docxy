@@ -191,20 +191,28 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   `brand::about_label()` ("About" and the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
   titles use `brand::short()`. With no plugin, both are today's text.
 - The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
-  failed, the first window's status line (`brand::startup_notice`). About adds the integration's
-  rows (`brand::about_rows`) only when a plugin is configured. `app-info` carries `integration`.
+  failed, the first window's status line (`brand::startup_notice`). An accent refusal (once per
+  theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds
+  the integration's rows (`brand::about_rows`) only when a plugin is configured, and its Copy
+  names `brand::product()` and ends with those rows. `app-info` carries `integration`. The quit
+  hook calls `docxy_integration::host::shutdown()`, so a normal quit leaves no crash marker.
 - Each window gets the plugin's icon in `open_docxy_window` (`brand::set_window_icon`, Windows).
 - Accents: the brand's colour (doc, mail, no tab) has four roles in `accent.rs`: `fill` (the File
   button, washes, a checked box, the focus ring), `on_fill` (its text), `mark` (the active tab's
   underline, a selected tile's and a hover border) and `text` (accent text). `accent::drawn` gives
   them the plugin's `primary`, its text, `highlight` and `link` that `brand::accents` takes for the
   theme (`docxy_integration::accent::check`); sheet's and project's own accents stay.
+  The chrome outside the ribbon, backstage and title bar (dialogs, panes, bars, fields) draws
+  `accent::chrome()`, the brand's roles whichever tab is selected; `BRAND` itself stays only at
+  the sites `accent::tests::BRAND_KEPT` lists (carets, comments, document and grid content, the
+  Gantt bars), each with its reason.
   `brand::apply_accents_to_theme`, after every `Theme::change`, sets gpui-component's `primary`,
   `ring`, `selection` and `link` tokens. A refusal goes to stderr once per theme.
 - Every other text that names the suite takes `brand::short()` too: the macOS menu bar
   (`macos_menu::shown` fills `{app}`), messages, the Document Recovery dialog, a kind's
   placeholder, and the default author of comments and the AUTHOR field. The PDF worker, a child
-  with no plugin, names no app. Left as they are: identifiers (config folders, environment
+  with no plugin, writes `{app}` (`worker::APP_NAME`) where a link's text names the app, and the
+  view fills it (`form::named`). Left as they are: identifiers (config folders, environment
   variables, `app_id`, temp names), stderr and crash-log lines, `--version` and the title-bar
   label per tab type. `brand::tests::the_product_name_is_written_only_here` fails on any other
   product-name literal in non-test source outside `brand.rs` that `NAME_LITERALS_KEPT` and

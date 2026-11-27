@@ -166,7 +166,10 @@ pub(crate) fn set_window_icon(window: &gpui::Window) {
         if let RawWindowHandle::Win32(win32) = handle.as_raw()
             && let Err(e) = docxy_integration::win_icon::set_window_icon(win32.hwnd.get(), ico)
         {
-            eprintln!("docxy: the integration plugin's icon: {e}");
+            static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !TOLD.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                report(&format!("docxy: the integration plugin's icon: {e}"));
+            }
         }
     }
     #[cfg(not(windows))]
@@ -202,7 +205,7 @@ pub(crate) fn accents_of(set: Option<AccentSet>, background: Rgb) -> (Accents, V
 
 /// [`accents_of`] the plugin's set for the dark theme when `dark`, else the
 /// light one, on that theme's background, worked out once per theme. Each
-/// refusal goes to stderr then.
+/// refusal is reported then ([`report`]).
 pub(crate) fn accents(dark: bool) -> Accents {
     static THEMES: [OnceLock<Accents>; 2] = [OnceLock::new(), OnceLock::new()];
     *THEMES[usize::from(dark)].get_or_init(|| {
@@ -217,12 +220,25 @@ pub(crate) fn accents(dark: bool) -> Accents {
         let (accents, refused) = accents_of(set, Rgb::from_u32(crate::rgb_u(background)));
         let theme = if dark { "dark" } else { "light" };
         for why in refused {
-            eprintln!(
+            report(&format!(
                 "docxy: the integration plugin's {theme} theme: {why}; the suite keeps its own"
-            );
+            ));
         }
         accents
     })
+}
+
+/// A line about the plugin to stderr and to the crash log's startup
+/// entries: the Windows release has no console, and the plugin runs on
+/// Windows.
+fn report(line: &str) {
+    report_in(&crate::config_root(), line);
+}
+
+/// [`report`] with the crash log under `root`.
+fn report_in(root: &std::path::Path, line: &str) {
+    eprintln!("{line}");
+    crate::crashlog::startup(root, line);
 }
 
 /// The plugin's [`accents`] on the global theme's tokens, run after every
@@ -292,6 +308,19 @@ pub(crate) mod tests {
             short: short.map(str::to_string),
             ..Branding::default()
         }
+    }
+
+    /// A refusal or a failed icon reaches the crash log too.
+    #[test]
+    fn a_report_goes_to_the_crash_log() {
+        let scratch = crate::open_mode_tests::Scratch::new();
+        let root = scratch.path("config");
+        report_in(&root, "docxy: the integration plugin's light theme: why");
+        let log = std::fs::read_to_string(crate::crashlog::log_path(&root)).unwrap();
+        assert!(
+            log.contains("docxy: the integration plugin's light theme: why"),
+            "{log}"
+        );
     }
 
     #[test]
