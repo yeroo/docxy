@@ -769,7 +769,7 @@ mod native {
             // NSApplication answers hide: itself, before its delegate.
             app_menu.addItem(&item(
                 mtm,
-                &shown("Hide {app}"),
+                &super::shown("Hide {app}"),
                 sel!(hide:),
                 "h",
                 cmd,
