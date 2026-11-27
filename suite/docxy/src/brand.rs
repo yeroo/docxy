@@ -576,50 +576,139 @@ pub(crate) mod tests {
                 .any(|(f, start, _)| *f == file && literal.starts_with(start))
     }
 
-    /// `src` without the items under `#[cfg(test)]`, in rustfmt's layout: a
-    /// block item ends at the line that closes it at its attribute's
-    /// indentation.
+    /// `src` without the items under `#[cfg(test)]`: an item ends at the
+    /// first line where its brackets balance and its code ends in `,`, `;`
+    /// or `}`, so a test-only field, variant or match arm is one line and
+    /// a test module ends at its closing brace. Brackets in strings, char
+    /// literals and comments do not count.
     pub(crate) fn without_test_items(src: &str) -> String {
         let lines: Vec<&str> = src.lines().collect();
         let mut out = String::new();
         let mut i = 0;
         while i < lines.len() {
             let line = lines[i];
-            let trimmed = line.trim_start();
-            if !trimmed.starts_with("#[cfg(test)]") {
+            let Some(rest) = line.trim_start().strip_prefix("#[cfg(test)]") else {
                 out.push_str(line);
                 out.push('\n');
                 i += 1;
                 continue;
-            }
-            let indent = &line[..line.len() - trimmed.len()];
+            };
             i += 1;
+            let mut item = TestItem::default();
+            if !rest.trim().is_empty() && item.ends_after(rest) {
+                continue;
+            }
             while i < lines.len() && lines[i].trim_start().starts_with("#[") {
                 i += 1;
             }
-            while i < lines.len() && !lines[i].trim_end().ends_with(['{', ';']) {
+            while i < lines.len() {
+                let ends = item.ends_after(lines[i]);
                 i += 1;
-            }
-            if i < lines.len() && lines[i].trim_end().ends_with('{') {
-                let close = format!("{indent}}}");
-                while i < lines.len() && !lines[i].trim_end().starts_with(&close) {
-                    i += 1;
-                }
-                while i < lines.len() && !is_close(lines[i], &close) {
-                    i += 1;
+                if ends {
+                    break;
                 }
             }
-            i += 1;
         }
         out
     }
 
-    /// Whether `line` is `close` (an indentation and `}`), with a `;` or `,`
-    /// at most after it.
-    fn is_close(line: &str, close: &str) -> bool {
-        let line = line.trim_end();
-        line.strip_prefix(close)
-            .is_some_and(|rest| matches!(rest, "" | ";" | ","))
+    /// Where [`TestItem`] is in the item's text.
+    #[derive(Default, Clone, Copy, PartialEq, Eq)]
+    enum Lexed {
+        #[default]
+        Code,
+        Str,
+        /// A raw string with this many `#`s.
+        Raw(usize),
+        Block,
+    }
+
+    /// The bracket depth of a `#[cfg(test)]` item read line by line.
+    #[derive(Default)]
+    struct TestItem {
+        depth: i32,
+        at: Lexed,
+    }
+
+    impl TestItem {
+        /// Read `line`; whether the item ends with it.
+        fn ends_after(&mut self, line: &str) -> bool {
+            let b = line.as_bytes();
+            let ident = |k: usize| k > 0 && (b[k - 1].is_ascii_alphanumeric() || b[k - 1] == b'_');
+            let mut last = None;
+            let mut k = 0;
+            while k < b.len() {
+                let c = b[k];
+                match self.at {
+                    Lexed::Str => {
+                        if c == b'\\' {
+                            k += 1;
+                        } else if c == b'"' {
+                            self.at = Lexed::Code;
+                        }
+                    }
+                    Lexed::Raw(hashes) => {
+                        let mark = b.get(k + 1..k + 1 + hashes);
+                        if c == b'"' && mark.is_some_and(|m| m.iter().all(|&h| h == b'#')) {
+                            self.at = Lexed::Code;
+                            k += hashes;
+                        }
+                    }
+                    Lexed::Block => {
+                        if c == b'*' && b.get(k + 1) == Some(&b'/') {
+                            self.at = Lexed::Code;
+                            k += 1;
+                        }
+                    }
+                    Lexed::Code => match c {
+                        b'/' if b.get(k + 1) == Some(&b'/') => break,
+                        b'/' if b.get(k + 1) == Some(&b'*') => {
+                            self.at = Lexed::Block;
+                            k += 1;
+                        }
+                        b'"' => {
+                            self.at = Lexed::Str;
+                            last = Some(c);
+                        }
+                        b'r' if !ident(k) || (b[k - 1] == b'b' && !ident(k - 1)) => {
+                            let hashes = b[k + 1..].iter().take_while(|&&h| h == b'#').count();
+                            if b.get(k + 1 + hashes) == Some(&b'"') {
+                                self.at = Lexed::Raw(hashes);
+                                k += 1 + hashes;
+                            }
+                            last = Some(c);
+                        }
+                        b'\'' => {
+                            // A char literal is skipped; a lifetime is not one.
+                            if b.get(k + 1) == Some(&b'\\') {
+                                k += 2;
+                                while k < b.len() && b[k] != b'\'' {
+                                    k += 1;
+                                }
+                            } else if let Some(len) =
+                                line[k + 1..].chars().next().map(char::len_utf8)
+                                && b.get(k + 1 + len) == Some(&b'\'')
+                            {
+                                k += 1 + len;
+                            }
+                            last = Some(b'\'');
+                        }
+                        b'{' | b'[' | b'(' => {
+                            self.depth += 1;
+                            last = Some(c);
+                        }
+                        b'}' | b']' | b')' => {
+                            self.depth -= 1;
+                            last = Some(c);
+                        }
+                        c if c.is_ascii_whitespace() => {}
+                        c => last = Some(c),
+                    },
+                }
+                k += 1;
+            }
+            self.at == Lexed::Code && self.depth <= 0 && matches!(last, Some(b',' | b';' | b'}'))
+        }
     }
 
     /// The string literals of `src` outside comments, each with the source
@@ -736,8 +825,9 @@ pub(crate) mod tests {
     }
 
     /// The guard's scanner: a literal in code counts, one in a comment, a
-    /// test item or a char literal does not, and only the identifiers and
-    /// literals it names are kept.
+    /// test item (a test field, variant or match arm among them) or a char
+    /// literal does not, and only the identifiers and literals it names are
+    /// kept.
     #[test]
     fn the_guard_finds_a_name_in_code_and_not_in_comments_or_tests() {
         let src = concat!(
@@ -756,6 +846,23 @@ pub(crate) mod tests {
             "const E: &str = \"After docxy\";\n",
             "const F: &str = \"docxy\";\n",
             "const G: &str = \"Docxy\";\n",
+            "struct S {\n",
+            "    #[cfg(test)]\n",
+            "    t: &'static str,\n",
+            "}\n",
+            "const H: &str = \"After a test field docxy\";\n",
+            "enum V {\n",
+            "    #[cfg(test)]\n",
+            "    T,\n",
+            "}\n",
+            "const I: &str = \"After a test variant docxy\";\n",
+            "fn h(x: u8) -> &'static str {\n",
+            "    match x {\n",
+            "        #[cfg(test)]\n",
+            "        0 => \"a test arm docxy\",\n",
+            "        _ => \"After a test arm docxy\",\n",
+            "    }\n",
+            "}\n",
         );
         let named: Vec<String> = string_literals(&without_test_items(src))
             .into_iter()
@@ -773,7 +880,10 @@ pub(crate) mod tests {
                 "docxy-find",
                 "After docxy",
                 "docxy",
-                "Docxy"
+                "Docxy",
+                "After a test field docxy",
+                "After a test variant docxy",
+                "After a test arm docxy"
             ]
         );
     }

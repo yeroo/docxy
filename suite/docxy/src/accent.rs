@@ -588,7 +588,8 @@ mod tests {
     }
 
     /// The guard's scanner: a use in code counts, by its item; one in a
-    /// comment, a test item or a longer name does not.
+    /// comment, a test item (a test field, variant or match arm among them)
+    /// or a longer name does not.
     #[test]
     fn the_brand_scan_counts_code_by_item_and_not_comments_tests_or_longer_names() {
         let src = concat!(
@@ -603,6 +604,23 @@ mod tests {
             "mod tests {\n",
             "    fn t() { BRAND; }\n",
             "}\n",
+            "struct S {\n",
+            "    #[cfg(test)]\n",
+            "    t: u32,\n",
+            "}\n",
+            "fn d() -> u32 { BRAND }\n",
+            "enum V {\n",
+            "    #[cfg(test)]\n",
+            "    T,\n",
+            "}\n",
+            "fn e() -> u32 { BRAND }\n",
+            "fn g(x: u8) -> u32 {\n",
+            "    match x {\n",
+            "        #[cfg(test)]\n",
+            "        0 => BRAND,\n",
+            "        _ => BRAND,\n",
+            "    }\n",
+            "}\n",
             "fn c() {}\n",
         );
         assert_eq!(
@@ -611,6 +629,9 @@ mod tests {
                 ("BRAND".to_string(), 1),
                 ("a".to_string(), 2),
                 ("b".to_string(), 1),
+                ("d".to_string(), 1),
+                ("e".to_string(), 1),
+                ("g".to_string(), 1),
             ]
         );
     }
