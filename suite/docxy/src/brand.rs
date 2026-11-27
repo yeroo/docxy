@@ -44,6 +44,11 @@ pub(crate) fn short() -> &'static str {
     short_of(branding())
 }
 
+/// [`product_of`] for this run: the name About and its Copy show.
+pub(crate) fn product() -> &'static str {
+    product_of(branding())
+}
+
 /// [`about_label_of`] for this run, for the ribbon's static labels.
 pub(crate) fn about_label() -> &'static str {
     static LABEL: OnceLock<String> = OnceLock::new();
