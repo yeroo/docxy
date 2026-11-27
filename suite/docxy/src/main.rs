@@ -107,7 +107,8 @@ mod recover;
 mod ribbon_export;
 mod ribbon_fit;
 mod ribbon_layout;
-mod rich_clip;
+// Public for library callers: its HTML write and quit handover (#2303).
+pub mod rich_clip;
 mod run_look;
 #[cfg(test)]
 mod save_preserve_tests;
