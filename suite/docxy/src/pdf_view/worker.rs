@@ -332,9 +332,15 @@ pub(crate) enum LinkGo {
         fit_width: bool,
     },
     /// What the view does not do (a script, a launch, a layer change, another
-    /// file), as the status line names it.
+    /// file), as the status line names it. [`APP_NAME`] in it is the host's
+    /// name to put there.
     Other { what: String },
 }
+
+/// Where a [`LinkGo::Other`] text names the app: the worker is a child with
+/// no integration plugin, so the host that shows the text puts its own name
+/// there (`form::named`).
+pub(crate) const APP_NAME: &str = "{app}";
 
 /// A comment whose text shows in a pop-up on hover (#2255).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

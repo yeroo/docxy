@@ -7,7 +7,7 @@
 //! working document (PdfCraft's `set_value`) and names the pages whose
 //! fields changed; those are drawn again, the old raster shown until then.
 
-use super::worker::{FieldKind, FieldMeta, FieldValue, LinkGo, Op};
+use super::worker::{APP_NAME, FieldKind, FieldMeta, FieldValue, LinkGo, Op};
 use super::*;
 use crate::field_edit;
 use std::ops::Range;
@@ -40,6 +40,12 @@ pub(crate) fn opens(uri: &str) -> bool {
     matches!(scheme.as_deref(), Some("http" | "https" | "mailto"))
 }
 
+/// A worker's [`LinkGo::Other`] text with the app's name
+/// ([`crate::brand::short`]) where it names the app.
+pub(crate) fn named(what: &str) -> String {
+    what.replace(APP_NAME, crate::brand::short())
+}
+
 /// What a link says on hover.
 pub(crate) fn link_tip(go: &LinkGo, labels: &[PageMeta]) -> String {
     match go {
@@ -52,7 +58,7 @@ pub(crate) fn link_tip(go: &LinkGo, labels: &[PageMeta]) -> String {
                 .unwrap_or_else(|| (page + 1).to_string());
             format!("Go to page {label}")
         }
-        LinkGo::Other { what } => format!("Not followed here: {what}"),
+        LinkGo::Other { what } => format!("Not followed here: {}", named(what)),
     }
 }
 
@@ -238,7 +244,7 @@ impl PdfView {
                 fit_width,
             } => self.go_dest(page, x, y, zoom, fit_width),
             LinkGo::Other { what } => {
-                self.notice = Some(format!("The link was not followed: it is {what}"));
+                self.notice = Some(format!("The link was not followed: it is {}", named(what)));
             }
         }
     }
