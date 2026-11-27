@@ -413,7 +413,8 @@ mod tests {
         ("main.rs", "io.github.yeroo.docxy", "the window's `app_id`"),
         (
             "native_dialog.rs",
-            "native_modal( outside Docxy::native_dialog: {stray:?}",
+            // In two parts, so `native_dialog`'s scan for the call finds no call here.
+            concat!("native_", "modal( outside Docxy::native_dialog: {stray:?}"),
             "a panic, in the crash log",
         ),
         (
