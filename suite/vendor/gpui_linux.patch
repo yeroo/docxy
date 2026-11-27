@@ -251,16 +251,17 @@ index 0000000..bdb1be7
 +    with_state(|state| state.clipboard.read_format(mime, max)).flatten()
 +}
 diff --git a/src/linux/wayland/client.rs b/src/linux/wayland/client.rs
-index 81ed5b7..3b2fc69 100644
+index 81ed5b7..9ddd8d6 100644
 --- a/src/linux/wayland/client.rs
 +++ b/src/linux/wayland/client.rs
-@@ -1,3 +1,5 @@
-+// Modified for docxy (#1966): the clipboard's extra formats (`rich_clipboard`).
+@@ -1,3 +1,6 @@
++// Modified for docxy (#1966): the clipboard's extra formats (`rich_clipboard`),
++// and a copy's images offered (#2282).
 +
  use std::{
      cell::{RefCell, RefMut},
      hash::Hash,
-@@ -399,6 +401,9 @@ impl WaylandClientState {
+@@ -399,6 +402,9 @@ impl WaylandClientState {
      }
  }
  
@@ -270,7 +271,7 @@ index 81ed5b7..3b2fc69 100644
  /// This struct is required to conform to Rust's orphan rules, so we can dispatch on the state but hand the
  /// window to GPUI.
  #[derive(Clone)]
-@@ -850,6 +855,8 @@ impl WaylandClient {
+@@ -850,6 +856,8 @@ impl WaylandClient {
              .insert(handle)
              .unwrap();
  
@@ -279,15 +280,24 @@ index 81ed5b7..3b2fc69 100644
          Self(state)
      }
  }
-@@ -1129,6 +1136,7 @@ impl LinuxClient for WaylandClient {
+@@ -1124,11 +1132,13 @@ impl LinuxClient for WaylandClient {
+                 return;
+             };
+             let data_source = data_device_manager.create_data_source(&state.globals.qh, ());
+-            for mime_type in TEXT_MIME_TYPES {
+-                data_source.offer(mime_type.to_string());
++            // The text mimes (when it has text), its images' and gpui's own
++            // (#2282).
++            for mime_type in state.clipboard.own_mime_types() {
++                data_source.offer(mime_type);
              }
-             data_source.offer(state.clipboard.self_mime());
+-            data_source.offer(state.clipboard.self_mime());
              data_device.set_selection(Some(&data_source), serial.as_raw());
 +            state.clipboard.set_source(data_source);
          }
      }
  
-@@ -2624,13 +2632,14 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandClientStatePtr {
+@@ -2624,13 +2634,14 @@ impl Dispatch<wl_data_source::WlDataSource, ()> for WaylandClientStatePtr {
          _: &QueueHandle<Self>,
      ) {
          let client = this.get_client();
@@ -305,25 +315,29 @@ index 81ed5b7..3b2fc69 100644
              _ => {}
 diff --git b/src/linux/wayland/clipboard/formats.rs b/src/linux/wayland/clipboard/formats.rs
 new file mode 100644
-index 0000000..a809c19
+index 0000000..7c077c5
 --- /dev/null
 +++ b/src/linux/wayland/clipboard/formats.rs
-@@ -0,0 +1,330 @@
-+// Added for docxy (#1966): the formats a copy offers beside gpui's text.
+@@ -0,0 +1,474 @@
++// Added for docxy (#1966): the formats a copy offers beside gpui's text, and
++// its images (#2282).
 +
 +//! What gpui's own latest copy is on the Wayland selection, beside its text.
 +//!
-+//! gpui's clipboard offers text only. The suite adds RTF or HTML to a copy by
-+//! setting the selection again, with a source that offers the text, those
-+//! formats and gpui's `pid/<pid>` mime ([`super::super::client::rich_clipboard`]).
-+//! This keeps, without a connection (so it is testable), which source is
-+//! gpui's live copy and which bytes each extra mime serves.
++//! gpui's clipboard offers a copy's text and its images, each image as its
++//! own mime (#2282). The suite adds RTF or HTML to a copy by setting the
++//! selection again, with a source that offers the text, those formats and
++//! gpui's `pid/<pid>` mime ([`super::super::client::rich_clipboard`]). This
++//! keeps, without a connection (so it is testable), which source is gpui's
++//! live copy and which bytes each format serves, gpui's images included.
 +
 +use std::{
-+    io::{ErrorKind, Read},
++    io::{self, ErrorKind, Read},
 +    os::fd::AsRawFd,
 +    time::Duration,
 +};
++
++use gpui::{ClipboardEntry, ClipboardItem};
 +
 +/// gpui's own latest copy: the `wl_data_source` that is the selection (until
 +/// the compositor cancels it), and the formats it serves beside the text.
@@ -415,6 +429,50 @@ index 0000000..a809c19
 +            .map(<[u8]>::to_vec)
 +            .or_else(|| text.map(|text| text.as_bytes().to_vec()))
 +    }
++}
++
++/// `item`'s images as formats (mime, bytes) (#2282): entry order, the first
++/// of each mime.
++pub(crate) fn image_formats(item: &ClipboardItem) -> Vec<(String, Vec<u8>)> {
++    let mut formats: Vec<(String, Vec<u8>)> = Vec::new();
++    for entry in item.entries() {
++        if let ClipboardEntry::Image(image) = entry {
++            let mime = image.format.mime_type();
++            if !formats.iter().any(|(held, _)| held == mime) {
++                formats.push((mime.to_owned(), image.bytes.clone()));
++            }
++        }
++    }
++    formats
++}
++
++/// Whether a copy of `item` offers the text mimes (#2282): when it has text,
++/// or no image (gpui's empty answer, as before). A copy of images alone
++/// offers only theirs.
++pub(crate) fn offers_text(item: &ClipboardItem) -> bool {
++    item.text().is_some()
++        || !item
++            .entries()
++            .iter()
++            .any(|entry| matches!(entry, ClipboardEntry::Image(_)))
++}
++
++/// `fd` set non-blocking (#2282): a `send`'s pipe is the reader's, and a
++/// blocking write of a big image would hold gpui's main thread until the
++/// reader drained it all.
++pub(crate) fn set_non_blocking(fd: &impl AsRawFd) -> io::Result<()> {
++    let fd = fd.as_raw_fd();
++    // SAFETY: `fcntl` on a descriptor the caller holds open; no memory is
++    // passed.
++    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
++    if flags < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    // SAFETY: as above.
++    if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(())
 +}
 +
 +/// Who answers a read of the selection.
@@ -626,6 +684,15 @@ index 0000000..a809c19
 +    }
 +
 +    #[test]
++    fn a_send_pipe_is_made_non_blocking() {
++        let pipe = filedescriptor::Pipe::new().unwrap();
++        let flags = || unsafe { libc::fcntl(pipe.write.as_raw_fd(), libc::F_GETFL) };
++        assert_eq!(flags() & libc::O_NONBLOCK, 0);
++        set_non_blocking(&pipe.write).unwrap();
++        assert_ne!(flags() & libc::O_NONBLOCK, 0);
++    }
++
++    #[test]
 +    fn a_bounded_read_stops_past_max() {
 +        let timeout = Duration::from_secs(1);
 +        assert_eq!(
@@ -638,18 +705,106 @@ index 0000000..a809c19
 +            Some(Vec::new())
 +        );
 +    }
++
++    const TEXT: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
++
++    fn image(format: gpui::ImageFormat, bytes: &[u8]) -> ClipboardEntry {
++        ClipboardEntry::Image(gpui::Image::from_bytes(format, bytes.to_vec()))
++    }
++
++    fn text(text: &str) -> ClipboardEntry {
++        ClipboardEntry::String(gpui::ClipboardString::new(text.to_owned()))
++    }
++
++    #[test]
++    fn an_items_images_are_formats_in_order_the_first_of_a_mime() {
++        use gpui::ImageFormat::{Gif, Jpeg, Png};
++        let item = ClipboardItem {
++            entries: vec![
++                image(Jpeg, b"jpeg"),
++                text("caption"),
++                image(Png, b"png one"),
++                image(Png, b"png two"),
++                image(Gif, b"gif"),
++            ],
++        };
++        assert_eq!(
++            image_formats(&item),
++            [
++                ("image/jpeg".to_owned(), b"jpeg".to_vec()),
++                ("image/png".to_owned(), b"png one".to_vec()),
++                ("image/gif".to_owned(), b"gif".to_vec()),
++            ]
++        );
++        assert!(image_formats(&ClipboardItem::new_string("t".into())).is_empty());
++    }
++
++    #[test]
++    fn text_mimes_are_offered_with_text_or_without_an_image() {
++        let png = || image(gpui::ImageFormat::Png, b"png");
++        assert!(offers_text(&ClipboardItem::new_string("t".into())));
++        assert!(offers_text(&ClipboardItem { entries: vec![] }));
++        assert!(!offers_text(&ClipboardItem {
++            entries: vec![png()]
++        }));
++        assert!(offers_text(&ClipboardItem {
++            entries: vec![text("t"), png()]
++        }));
++    }
++
++    /// A copy of an image offers its mime and gpui's own, no text; with text
++    /// both. The suite's RTF merged after keeps the image beside it.
++    #[test]
++    fn an_images_copy_offers_and_sends_its_mime() {
++        let png = image(gpui::ImageFormat::Png, b"png");
++        let alone = ClipboardItem {
++            entries: vec![png.clone()],
++        };
++        let mut copy: OwnCopy<u32> = OwnCopy::new();
++        copy.merge(image_formats(&alone));
++        assert!(!offers_text(&alone));
++        assert_eq!(copy.mime_types(&[], "pid/1"), ["image/png", "pid/1"]);
++        assert_eq!(copy.send_bytes("image/png", None), Some(b"png".to_vec()));
++
++        let both = ClipboardItem {
++            entries: vec![text("t"), png],
++        };
++        copy.copied();
++        copy.merge(image_formats(&both));
++        copy.merge(vec![("text/rtf".into(), b"{\\rtf1 t}".to_vec())]);
++        assert_eq!(
++            copy.mime_types(&TEXT, "pid/1"),
++            [
++                "text/plain;charset=utf-8",
++                "UTF8_STRING",
++                "text/plain",
++                "image/png",
++                "text/rtf",
++                "pid/1",
++            ]
++        );
++        assert_eq!(
++            copy.send_bytes("image/png", Some("t")),
++            Some(b"png".to_vec())
++        );
++        assert_eq!(
++            copy.send_bytes("text/plain", Some("t")),
++            Some(b"t".to_vec())
++        );
++    }
 +}
 diff --git a/src/linux/wayland/clipboard.rs b/src/linux/wayland/clipboard.rs
-index dfedf53..57fa893 100644
+index dfedf53..343b678 100644
 --- a/src/linux/wayland/clipboard.rs
 +++ b/src/linux/wayland/clipboard.rs
-@@ -1,3 +1,5 @@
-+// Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text.
+@@ -1,3 +1,6 @@
++// Modified for docxy (#1966): a copy's extra formats (RTF/HTML) beside its text,
++// and its images (#2282), written to the pipe without blocking.
 +
  use std::{
      fs::File,
      io::{ErrorKind, Write},
-@@ -7,7 +9,10 @@ use std::{
+@@ -7,7 +10,10 @@ use std::{
  use calloop::{LoopHandle, PostAction};
  use filedescriptor::Pipe;
  use strum::IntoEnumIterator;
@@ -661,17 +816,19 @@ index dfedf53..57fa893 100644
  use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::ZwpPrimarySelectionOfferV1;
  
  use crate::linux::{
-@@ -16,6 +21,9 @@ use crate::linux::{
+@@ -16,6 +22,11 @@ use crate::linux::{
  };
  use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
  
 +mod formats;
-+pub(crate) use formats::{OwnCopy, Whose, same_text, whose};
++pub(crate) use formats::{
++    OwnCopy, Whose, image_formats, offers_text, same_text, set_non_blocking, whose,
++};
 +
  /// Text mime types that we'll offer to other programs.
  pub(crate) const TEXT_MIME_TYPES: [&str; 3] =
      ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
-@@ -38,6 +46,10 @@ pub(crate) struct Clipboard {
+@@ -38,6 +49,10 @@ pub(crate) struct Clipboard {
      current_offer: Option<DataOffer<WlDataOffer>>,
      cached_primary_read: Option<ClipboardItem>,
      current_primary_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
@@ -682,7 +839,7 @@ index dfedf53..57fa893 100644
  }
  
  pub(crate) trait ReceiveData {
-@@ -98,6 +110,29 @@ impl<T: ReceiveData> DataOffer<T> {
+@@ -98,6 +113,29 @@ impl<T: ReceiveData> DataOffer<T> {
          }
      }
  
@@ -712,7 +869,7 @@ index dfedf53..57fa893 100644
      fn read_text(&self, connection: &Connection) -> Option<ClipboardItem> {
          let mime_type = self.mime_types.iter().find(|&mime_type| {
              ALLOWED_TEXT_MIME_TYPES
-@@ -155,11 +190,92 @@ impl Clipboard {
+@@ -155,13 +193,102 @@ impl Clipboard {
              current_offer: None,
              cached_primary_read: None,
              current_primary_offer: None,
@@ -722,10 +879,12 @@ index dfedf53..57fa893 100644
      }
  
      pub fn set(&mut self, item: ClipboardItem) {
-         self.contents = Some(item);
 +        self.own.copied();
-+    }
-+
++        // Its images are served as formats, each as its own mime (#2282).
++        self.own.merge(image_formats(&item));
+         self.contents = Some(item);
+     }
+ 
 +    /// `source` was just set as the selection for `contents` (#1966).
 +    pub fn set_source(&mut self, source: WlDataSource) {
 +        self.own.set_source(source);
@@ -753,8 +912,14 @@ index dfedf53..57fa893 100644
 +    }
 +
 +    /// What a source for gpui's copy offers: text, formats, `pid/<pid>` (#1966).
++    /// No text mimes for a copy of images alone (#2282).
 +    pub fn own_mime_types(&self) -> Vec<String> {
-+        self.own.mime_types(&TEXT_MIME_TYPES, &self.self_mime)
++        let text: &[&str] = if self.contents.as_ref().is_none_or(offers_text) {
++            &TEXT_MIME_TYPES
++        } else {
++            &[]
++        };
++        self.own.mime_types(text, &self.self_mime)
 +    }
 +
 +    /// Send what is queued to the compositor (#1966).
@@ -802,10 +967,12 @@ index dfedf53..57fa893 100644
 +            }
 +            Whose::Nothing => None,
 +        }
-     }
- 
++    }
++
      pub fn set_primary(&mut self, item: ClipboardItem) {
-@@ -169,6 +285,13 @@ impl Clipboard {
+         self.primary_contents = Some(item);
+     }
+@@ -169,6 +296,13 @@ impl Clipboard {
      pub fn set_offer(&mut self, data_offer: Option<DataOffer<WlDataOffer>>) {
          self.cached_read = None;
          self.current_offer = data_offer;
@@ -819,7 +986,7 @@ index dfedf53..57fa893 100644
      }
  
      pub fn set_primary_offer(&mut self, data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>) {
-@@ -180,9 +303,10 @@ impl Clipboard {
+@@ -180,9 +314,10 @@ impl Clipboard {
          self.self_mime.clone()
      }
  
@@ -833,7 +1000,7 @@ index dfedf53..57fa893 100644
          }
      }
  
-@@ -197,6 +321,13 @@ impl Clipboard {
+@@ -197,6 +332,13 @@ impl Clipboard {
      }
  
      pub fn read(&mut self) -> Option<ClipboardItem> {
@@ -847,6 +1014,18 @@ index dfedf53..57fa893 100644
          let offer = self.current_offer.as_ref()?;
          if let Some(cached) = self.cached_read.clone() {
              return Some(cached);
+@@ -233,6 +375,11 @@ impl Clipboard {
+     }
+ 
+     fn send_internal(&self, fd: OwnedFd, bytes: Vec<u8>) {
++        // Written as the reader takes it, never blocking the main thread
++        // (#2282): an image can be megabytes.
++        if let Err(err) = set_non_blocking(&fd) {
++            log::warn!("Wayland clipboard pipe stays blocking: {err}");
++        }
+         let mut written = 0;
+         self.loop_handle
+             .insert_source(
 diff --git a/src/linux/wayland.rs b/src/linux/wayland.rs
 index cbc962b..3c99149 100644
 --- a/src/linux/wayland.rs
@@ -866,11 +1045,377 @@ index cbc962b..3c99149 100644
  
  use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::Shape;
  
+diff --git a/src/linux/x11/client.rs b/src/linux/x11/client.rs
+index 0c8c9b4..c174714 100644
+--- a/src/linux/x11/client.rs
++++ b/src/linux/x11/client.rs
+@@ -1,3 +1,4 @@
++// Modified for docxy (#2282): a copy's images written, not only its text.
+ use anyhow::{Context as _, anyhow};
+ use ashpd::WindowIdentifier;
+ use calloop::{
+@@ -1744,10 +1745,11 @@ impl LinuxClient for X11Client {
+ 
+     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
+         let mut state = self.0.borrow_mut();
++        // Its images too, each as its own mime (#2282).
+         state
+             .clipboard
+-            .set_text(
+-                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
++            .set_item(
++                &item,
+                 clipboard::ClipboardKind::Clipboard,
+                 clipboard::WaitConfig::None,
+             )
+diff --git b/src/linux/x11/clipboard/tests.rs b/src/linux/x11/clipboard/tests.rs
+new file mode 100644
+index 0000000..66593d7
+--- /dev/null
++++ b/src/linux/x11/clipboard/tests.rs
+@@ -0,0 +1,337 @@
++// Added for docxy (#2282): a copy's images on the X11 clipboard.
++
++//! gpui's X11 clipboard against another X client, each test on its own
++//! private Xvfb: never the developer's `DISPLAY`, whose clipboard an owner
++//! would take, and never one display for two tests, which run in parallel
++//! and would race on one `CLIPBOARD`. The owner is a `Clipboard` on its own
++//! `Inner`, never the global one.
++
++use super::*;
++use gpui::ClipboardString;
++use std::io::{BufRead, BufReader};
++use std::process::{Child, Command, Stdio};
++
++/// A private X server, killed on drop.
++struct Xvfb {
++    child: Child,
++    display: String,
++}
++
++impl Xvfb {
++    /// A fresh Xvfb on a free display it picks (`-displayfd`). `None`, with
++    /// a note, where there is no Xvfb, except under CI, which always has it:
++    /// there, a missing one fails the test.
++    fn start() -> Option<Self> {
++        let spawned = Command::new("Xvfb")
++            .args([
++                "-displayfd",
++                "1",
++                "-nolisten",
++                "tcp",
++                "-screen",
++                "0",
++                "64x64x24",
++            ])
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::null())
++            .spawn();
++        let mut child = match spawned {
++            Ok(child) => child,
++            Err(e) => {
++                assert!(
++                    std::env::var_os("CI").is_none(),
++                    "Xvfb is needed under CI: {e}"
++                );
++                eprintln!("skipped: no Xvfb ({e})");
++                return None;
++            }
++        };
++        let mut line = String::new();
++        BufReader::new(child.stdout.take()?)
++            .read_line(&mut line)
++            .ok()?;
++        let n: u32 = line.trim().parse().expect("Xvfb printed its display");
++        Some(Xvfb {
++            child,
++            display: format!(":{n}"),
++        })
++    }
++}
++
++impl Drop for Xvfb {
++    fn drop(&mut self) {
++        let _ = self.child.kill();
++        let _ = self.child.wait();
++    }
++}
++
++/// gpui's clipboard on a private display, serving on its own thread. Only
++/// the `Clipboard` and the thread hold its `Inner`, so `Clipboard::drop`
++/// (which acts at three owners) does nothing.
++struct Owner {
++    clipboard: Clipboard,
++    serving: Option<JoinHandle<()>>,
++}
++
++impl Owner {
++    fn new(display: &str) -> Owner {
++        let inner = Arc::new(Inner::new(Some(display)).expect("the private display opens"));
++        let serving = std::thread::spawn({
++            let inner = Arc::clone(&inner);
++            move || {
++                if let Err(error) = serve_requests(inner) {
++                    eprintln!("serve_requests ended: {error}");
++                }
++            }
++        });
++        Owner {
++            clipboard: Clipboard { inner },
++            serving: Some(serving),
++        }
++    }
++
++    fn inner(&self) -> &Inner {
++        &self.clipboard.inner
++    }
++
++    /// `item` written to `CLIPBOARD`, its ownership through the server
++    /// before another client asks.
++    fn copy(&self, item: &ClipboardItem) {
++        self.clipboard
++            .set_item(item, ClipboardKind::Clipboard, WaitConfig::None)
++            .expect("the write takes");
++        assert!(self.clipboard.is_owner(ClipboardKind::Clipboard));
++    }
++
++    fn serving(&self) -> bool {
++        !self.inner().serve_stopped.load(Ordering::Relaxed)
++    }
++}
++
++impl Drop for Owner {
++    fn drop(&mut self) {
++        let inner = self.inner();
++        let _ = inner.server.conn.destroy_window(inner.server.win_id);
++        let _ = inner.server.conn.flush();
++        if let Some(serving) = self.serving.take() {
++            let _ = serving.join();
++        }
++    }
++}
++
++/// Another app on the same display, reading `CLIPBOARD` through the server.
++struct Reader {
++    inner: Inner,
++    display: String,
++}
++
++impl Reader {
++    fn new(display: &str) -> Reader {
++        Reader {
++            inner: Inner::new(Some(display)).expect("the private display opens"),
++            display: display.to_owned(),
++        }
++    }
++
++    fn atom(&self, name: &str) -> Atom {
++        self.inner
++            .server
++            .conn
++            .intern_atom(false, name.as_bytes())
++            .expect("intern_atom")
++            .reply()
++            .expect("an atom")
++            .atom
++    }
++
++    fn context(&self) -> XContext {
++        XContext::new(Some(&self.display)).expect("the private display opens")
++    }
++
++    /// The owner's `TARGETS`, by name.
++    fn targets(&self) -> Vec<String> {
++        let data = self
++            .inner
++            .read_single(
++                &self.context(),
++                ClipboardKind::Clipboard,
++                self.inner.atoms.TARGETS,
++            )
++            .expect("TARGETS answered");
++        assert_eq!(data.format, self.inner.atoms.ATOM);
++        Inner::parse_formats(&data.bytes)
++            .into_iter()
++            .map(|atom| self.inner.query_atom_name(atom).expect("an atom name"))
++            .collect()
++    }
++
++    /// The selection converted to `target`, `None` when refused.
++    fn fetch(&self, target: &str) -> Option<Vec<u8>> {
++        let target = self.atom(target);
++        match self
++            .inner
++            .read_single(&self.context(), ClipboardKind::Clipboard, target)
++        {
++            Ok(data) => {
++                assert_eq!(data.format, target);
++                Some(data.bytes)
++            }
++            Err(Error::ContentNotAvailable) => None,
++            Err(error) => panic!("the read failed: {error}"),
++        }
++    }
++}
++
++fn image(format: ImageFormat, bytes: &[u8]) -> Image {
++    Image::from_bytes(format, bytes.to_vec())
++}
++
++fn item(text: Option<&str>, images: &[Image]) -> ClipboardItem {
++    let mut entries = Vec::new();
++    if let Some(text) = text {
++        entries.push(ClipboardEntry::String(ClipboardString::new(
++            text.to_owned(),
++        )));
++    }
++    entries.extend(images.iter().cloned().map(ClipboardEntry::Image));
++    ClipboardItem { entries }
++}
++
++const JPEG: &[u8] = b"\xff\xd8\xff\xe0 a jpeg";
++const PNG: &[u8] = b"\x89PNG\r\n\x1a\n a png";
++
++#[test]
++fn an_image_item_is_served_as_its_own_mime() {
++    let Some(x) = Xvfb::start() else { return };
++    let owner = Owner::new(&x.display);
++    let reader = Reader::new(&x.display);
++    owner.copy(&ClipboardItem::new_image(&image(ImageFormat::Jpeg, JPEG)));
++
++    let targets = reader.targets();
++    assert_eq!(targets, ["TARGETS", "SAVE_TARGETS", "image/jpeg"]);
++    assert_eq!(reader.fetch("image/jpeg").as_deref(), Some(JPEG));
++    assert_eq!(reader.fetch("UTF8_STRING"), None);
++}
++
++#[test]
++fn text_and_image_are_both_offered() {
++    let Some(x) = Xvfb::start() else { return };
++    let owner = Owner::new(&x.display);
++    let reader = Reader::new(&x.display);
++    owner.copy(&item(Some("caption"), &[image(ImageFormat::Png, PNG)]));
++
++    let targets = reader.targets();
++    assert_eq!(
++        targets,
++        [
++            "TARGETS",
++            "SAVE_TARGETS",
++            "UTF8_STRING",
++            "text/plain;charset=utf-8",
++            "text/plain;charset=UTF-8",
++            "image/png",
++        ]
++    );
++    assert_eq!(
++        reader.fetch("UTF8_STRING").as_deref(),
++        Some(&b"caption"[..])
++    );
++    assert_eq!(reader.fetch("image/png").as_deref(), Some(PNG));
++    // The two names `TARGETS` lists beside `UTF8_STRING` serve its text.
++    for name in ["text/plain;charset=utf-8", "text/plain;charset=UTF-8"] {
++        assert_eq!(
++            reader.fetch(name).as_deref(),
++            Some(&b"caption"[..]),
++            "{name}"
++        );
++    }
++}
++
++/// A text item serves what gpui always wrote, and so does an item with
++/// neither text nor image (an empty `UTF8_STRING`). Images keep their entry
++/// order, the first of a format.
++#[test]
++fn item_data_is_the_text_then_each_format_once() {
++    let Some(x) = Xvfb::start() else { return };
++    let reader = Reader::new(&x.display);
++    let atoms = &reader.inner.atoms;
++    let summary = |item: &ClipboardItem| {
++        item_data(atoms, item)
++            .into_iter()
++            .map(|data| {
++                (
++                    reader.inner.query_atom_name(data.format).unwrap(),
++                    data.bytes,
++                )
++            })
++            .collect::<Vec<_>>()
++    };
++
++    assert_eq!(
++        summary(&ClipboardItem::new_string("plain".into())),
++        [("UTF8_STRING".to_owned(), b"plain".to_vec())]
++    );
++    assert_eq!(
++        summary(&ClipboardItem { entries: vec![] }),
++        [("UTF8_STRING".to_owned(), Vec::new())]
++    );
++    assert_eq!(
++        summary(&item(
++            None,
++            &[
++                image(ImageFormat::Gif, b"gif one"),
++                image(ImageFormat::Png, PNG),
++                image(ImageFormat::Gif, b"gif two"),
++            ]
++        )),
++        [
++            ("image/gif".to_owned(), b"gif one".to_vec()),
++            ("image/png".to_owned(), PNG.to_vec()),
++        ]
++    );
++}
++
++#[test]
++fn set_image_uses_the_images_format() {
++    let Some(x) = Xvfb::start() else { return };
++    let owner = Owner::new(&x.display);
++    let reader = Reader::new(&x.display);
++    owner
++        .clipboard
++        .set_image(
++            image(ImageFormat::Gif, b"GIF89a"),
++            ClipboardKind::Clipboard,
++            WaitConfig::None,
++        )
++        .expect("the write takes");
++    assert!(owner.clipboard.is_owner(ClipboardKind::Clipboard));
++
++    assert_eq!(reader.targets(), ["TARGETS", "SAVE_TARGETS", "image/gif"]);
++    assert_eq!(reader.fetch("image/gif").as_deref(), Some(&b"GIF89a"[..]));
++    assert_eq!(reader.fetch("image/png"), None);
++}
++
++/// A payload one `ChangeProperty` cannot carry is neither offered nor sent:
++/// sending it would fail and end `serve_requests`, and with it every later
++/// copy of the process.
++#[test]
++fn a_payload_past_one_request_is_refused_not_fatal() {
++    let Some(x) = Xvfb::start() else { return };
++    let owner = Owner::new(&x.display);
++    let reader = Reader::new(&x.display);
++    let past = owner.inner().server.conn.maximum_request_bytes() + 1;
++    owner.copy(&item(
++        Some("small"),
++        &[Image::from_bytes(ImageFormat::Png, vec![0; past])],
++    ));
++
++    assert!(!reader.targets().iter().any(|target| target == "image/png"));
++    assert_eq!(reader.fetch("image/png"), None);
++    assert_eq!(reader.fetch("UTF8_STRING").as_deref(), Some(&b"small"[..]));
++    assert!(owner.serving());
++
++    owner.copy(&ClipboardItem::new_string("next".into()));
++    assert_eq!(reader.fetch("UTF8_STRING").as_deref(), Some(&b"next"[..]));
++    assert!(owner.serving());
++}
 diff --git a/src/linux/x11/clipboard.rs b/src/linux/x11/clipboard.rs
-index 706e7b0..56d60b4 100644
+index 706e7b0..1289794 100644
 --- a/src/linux/x11/clipboard.rs
 +++ b/src/linux/x11/clipboard.rs
-@@ -12,7 +12,10 @@
+@@ -12,7 +12,12 @@
   * The project to which this file belongs is licensed under either of
   * the Apache 2.0 or the MIT license at the licensee's choice. The terms
   * and conditions of the chosen license apply to this file.
@@ -878,10 +1423,254 @@ index 706e7b0..56d60b4 100644
 + */
 +
 +// Modified for docxy (#1966): the header's closing `*/` indented one space, as
-+// rustfmt on Windows wants it (Linux rustfmt takes either).
++// rustfmt on Windows wants it (Linux rustfmt takes either). (#2282): a copy's
++// images served as their own mime, a payload past one request refused, the
++// `text/plain;charset=` names `TARGETS` lists served.
  
  // More info about using the clipboard on X11:
  // https://tronche.com/gui/x/icccm/sec-2.html#s-2.6
+@@ -34,7 +39,7 @@ use std::{
+ use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
+ use x11rb::{
+     COPY_DEPTH_FROM_PARENT, COPY_FROM_PARENT, NONE,
+-    connection::Connection,
++    connection::{Connection, RequestConnection as _},
+     protocol::{
+         Event,
+         xproto::{
+@@ -47,7 +52,7 @@ use x11rb::{
+     wrapper::ConnectionExt as _,
+ };
+ 
+-use gpui::{ClipboardItem, Image, ImageFormat, hash};
++use gpui::{ClipboardEntry, ClipboardItem, Image, ImageFormat, hash};
+ use strum::IntoEnumIterator;
+ 
+ type Result<T, E = Error> = std::result::Result<T, E>;
+@@ -104,6 +109,10 @@ thread_local! {
+ const LONG_TIMEOUT_DUR: Duration = Duration::from_millis(4000);
+ const SHORT_TIMEOUT_DUR: Duration = Duration::from_millis(10);
+ 
++/// Room left in a request for its header and the property's fields (#2282),
++/// as the suite's own X11 clipboard leaves (`rich_clip/x11.rs`).
++const REQUEST_HEADROOM: usize = 1024;
++
+ #[derive(Debug, PartialEq, Eq)]
+ enum ManagerHandoverState {
+     Idle,
+@@ -137,13 +146,20 @@ struct Inner {
+     handover_cv: Condvar,
+ 
+     serve_stopped: AtomicBool,
++
++    /// The display every connection opens (`None`: `DISPLAY`'s), so a test
++    /// can own a private one (#2282).
++    display: Option<String>,
++    /// The largest payload one `ChangeProperty` on `server` carries (#2282):
++    /// a bigger one is neither offered nor sent (no `INCR` sending).
++    max_payload: usize,
+ }
+ 
+ impl XContext {
+-    fn new() -> Result<Self> {
++    fn new(display: Option<&str>) -> Result<Self> {
+         // create a new connection to an X11 server
+         let (conn, screen_num): (RustConnection, _) =
+-            RustConnection::connect(None).map_err(|_| {
++            RustConnection::connect(display).map_err(|_| {
+                 Error::unknown("X11 server connection timed out because it was unreachable")
+             })?;
+         let screen = conn
+@@ -208,12 +224,16 @@ enum ReadSelNotifyResult {
+ }
+ 
+ impl Inner {
+-    fn new() -> Result<Self> {
+-        let server = XContext::new()?;
++    fn new(display: Option<&str>) -> Result<Self> {
++        let server = XContext::new(display)?;
+         let atoms = Atoms::new(&server.conn)
+             .map_err(into_unknown)?
+             .reply()
+             .map_err(into_unknown)?;
++        let max_payload = server
++            .conn
++            .maximum_request_bytes()
++            .saturating_sub(REQUEST_HEADROOM);
+ 
+         Ok(Self {
+             server,
+@@ -224,9 +244,18 @@ impl Inner {
+             handover_state: Mutex::new(ManagerHandoverState::Idle),
+             handover_cv: Condvar::new(),
+             serve_stopped: AtomicBool::new(false),
++            display: display.map(str::to_owned),
++            max_payload,
+         })
+     }
+ 
++    /// Whether `data` fits in one property change: one that does not is
++    /// left out of `TARGETS` and refused (#2282), since sending it would end
++    /// `serve_requests` with an error.
++    fn fits(&self, data: &ClipboardData) -> bool {
++        data.bytes.len() <= self.max_payload
++    }
++
+     fn write(
+         &self,
+         data: Vec<ClipboardData>,
+@@ -297,7 +326,7 @@ impl Inner {
+             }
+             return Err(Error::ContentNotAvailable);
+         }
+-        let reader = XContext::new()?;
++        let reader = XContext::new(self.display.as_deref())?;
+ 
+         let highest_precedence_format =
+             match self.read_single(&reader, selection, self.atoms.TARGETS) {
+@@ -688,7 +717,7 @@ impl Inner {
+             targets.push(self.atoms.SAVE_TARGETS);
+             let data = self.selection_of(selection).data.read();
+             if let Some(data_list) = &*data {
+-                for data in data_list {
++                for data in data_list.iter().filter(|data| self.fits(data)) {
+                     targets.push(data.format);
+                     if data.format == self.atoms.UTF8_STRING {
+                         // When we are storing a UTF8 string,
+@@ -714,8 +743,24 @@ impl Inner {
+         } else {
+             log::trace!("Handling request for (probably) the clipboard contents.");
+             let data = self.selection_of(selection).data.read();
++            // `TARGETS` lists the two `text/plain;charset=` names beside
++            // `UTF8_STRING`: they serve its bytes (#2282).
++            let stored = if event.target == self.atoms.UTF8_MIME_0
++                || event.target == self.atoms.UTF8_MIME_1
++            {
++                self.atoms.UTF8_STRING
++            } else {
++                event.target
++            };
+             if let Some(data_list) = &*data {
+-                success = match data_list.iter().find(|d| d.format == event.target) {
++                success = match data_list.iter().find(|d| d.format == stored) {
++                    Some(data) if !self.fits(data) => {
++                        log::warn!(
++                            "Refused a clipboard request for {} bytes, past one X request",
++                            data.bytes.len()
++                        );
++                        false
++                    }
+                     Some(data) => {
+                         self.server
+                             .conn
+@@ -958,7 +1003,7 @@ impl Clipboard {
+             });
+         }
+         // At this point we know that the clipboard does not exist.
+-        let ctx = Arc::new(Inner::new()?);
++        let ctx = Arc::new(Inner::new(None)?);
+         let join_handle = std::thread::Builder::new()
+             .name("Clipboard".to_owned())
+             .spawn({
+@@ -990,18 +1035,20 @@ impl Clipboard {
+         self.inner.write(data, selection, wait)
+     }
+ 
++    /// Write `item` (#2282): its text and its images, each as its own mime
++    /// (`item_data`).
++    pub(crate) fn set_item(
++        &self,
++        item: &ClipboardItem,
++        selection: ClipboardKind,
++        wait: WaitConfig,
++    ) -> Result<()> {
++        self.inner
++            .write(item_data(&self.inner.atoms, item), selection, wait)
++    }
++
+     fn image_format_atom(&self, format: ImageFormat) -> Atom {
+-        match format {
+-            ImageFormat::Png => self.inner.atoms.PNG__MIME,
+-            ImageFormat::Jpeg => self.inner.atoms.JPEG_MIME,
+-            ImageFormat::Webp => self.inner.atoms.WEBP_MIME,
+-            ImageFormat::Gif => self.inner.atoms.GIF__MIME,
+-            ImageFormat::Svg => self.inner.atoms.SVG__MIME,
+-            ImageFormat::Bmp => self.inner.atoms.BMP__MIME,
+-            ImageFormat::Tiff => self.inner.atoms.TIFF_MIME,
+-            ImageFormat::Ico => self.inner.atoms.ICO__MIME,
+-            ImageFormat::Pnm => self.inner.atoms.PNM__MIME,
+-        }
++        image_format_atom(&self.inner.atoms, format)
+     }
+ 
+     #[allow(unused)]
+@@ -1014,7 +1061,7 @@ impl Clipboard {
+         let format = self.image_format_atom(image.format);
+         let data = vec![ClipboardData {
+             bytes: image.bytes,
+-            format: self.inner.atoms.PNG__MIME,
++            format,
+         }];
+         self.inner.write(data, selection, wait)
+     }
+@@ -1132,6 +1179,50 @@ impl Drop for Clipboard {
+     }
+ }
+ 
++fn image_format_atom(atoms: &Atoms, format: ImageFormat) -> Atom {
++    match format {
++        ImageFormat::Png => atoms.PNG__MIME,
++        ImageFormat::Jpeg => atoms.JPEG_MIME,
++        ImageFormat::Webp => atoms.WEBP_MIME,
++        ImageFormat::Gif => atoms.GIF__MIME,
++        ImageFormat::Svg => atoms.SVG__MIME,
++        ImageFormat::Bmp => atoms.BMP__MIME,
++        ImageFormat::Tiff => atoms.TIFF_MIME,
++        ImageFormat::Ico => atoms.ICO__MIME,
++        ImageFormat::Pnm => atoms.PNM__MIME,
++    }
++}
++
++/// What a copy of `item` serves (#2282): its text as `UTF8_STRING` when it
++/// has text or no image (an empty string then, as gpui always wrote), and
++/// each image as its own mime, in entry order, the first of each format.
++fn item_data(atoms: &Atoms, item: &ClipboardItem) -> Vec<ClipboardData> {
++    let images = || {
++        item.entries().iter().filter_map(|entry| match entry {
++            ClipboardEntry::Image(image) => Some(image),
++            _ => None,
++        })
++    };
++    let text = item.text();
++    let mut data = Vec::new();
++    if text.is_some() || images().next().is_none() {
++        data.push(ClipboardData {
++            bytes: text.unwrap_or_default().into_bytes(),
++            format: atoms.UTF8_STRING,
++        });
++    }
++    for image in images() {
++        let format = image_format_atom(atoms, image.format);
++        if !data.iter().any(|held| held.format == format) {
++            data.push(ClipboardData {
++                bytes: image.bytes.clone(),
++                format,
++            });
++        }
++    }
++    data
++}
++
+ fn into_unknown<E: std::fmt::Display>(error: E) -> Error {
+     Error::Unknown {
+         description: error.to_string(),
+@@ -1253,3 +1344,6 @@ impl Error {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests;
 diff --git a/src/linux.rs b/src/linux.rs
 index 33393f7..3e80300 100644
 --- a/src/linux.rs
