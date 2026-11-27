@@ -202,3 +202,39 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   owner, so its `Drop` does nothing); Wayland's `formats.rs` rules and
   `set_non_blocking` on a real pipe. The two clients' write calls and
   `send_internal`'s use of it are untested: neither client builds headless.
+
+## The rich clipboard for library callers (#2303)
+
+- `suite/docxy/src/rich_clip.rs` is `pub mod rich_clip` of the `docxy_suite`
+  library, with two public entries for an extension tab kind or a binary on
+  the library that copies from its own view: `write_html(fragment, text)`
+  and `hand_over()`. Everything else in it (`write_rtf`, the readers,
+  `cf_html`, `html_page`, `html_fragment`, the `x11` module) stays
+  `pub(crate)` or private. Its docs link only public items, so
+  `cargo doc` raises no `private_intra_doc_links`.
+- A caller's rules, in `write_html`'s doc: write the text through gpui first
+  in this process (`cx.write_to_clipboard(ClipboardItem::new_string(text))`),
+  then call `write_html` with the same text, synchronously in the same
+  handler, on gpui's main thread. On Wayland, gpui_linux's client is a
+  main-thread `thread_local` (`wayland/client/rich_clipboard.rs`), so off
+  that thread, or while gpui's state is borrowed, the call does nothing. The
+  gate there is gpui's own latest copy, and going back to the event loop
+  first lets the compositor and a clipboard manager take the text-only
+  source. `fragment` is a fragment: the module wraps it in a page and CF_HTML
+  itself. On X11 the call blocks while it reads the selection back (up to
+  `WAIT`, 2 s, for each answer).
+- `hand_over` goes once at quit (`cx.on_app_quit`). Inside `docxy_suite::run`
+  it needn't, since `run` already calls it, and a second call only waits
+  again (100 ms at most). It does something only when the suite's X11
+  clipboard owns `CLIPBOARD`.
+- Under the UI harness the suite's own copies go to its private clipboard
+  (`main.rs` `Clipboard`, `if harness`), but an extension's
+  `write_to_clipboard` plus `write_html` reach the OS clipboard, so the
+  harness's `clipboard` reads never see them.
+- `suite/docxy/tests/rich_clip_api.rs` is a crate of its own that calls both
+  entries, so a `pub(crate)` slip fails to compile there. In CI (`xvfb-run`,
+  no `WAYLAND_DISPLAY`) it goes through the real X11 path with a text no
+  clipboard holds. Locally `guess_compositor` prefers a set
+  `WAYLAND_DISPLAY`, and `xvfb-run` keeps it, so run the X11 path with
+  `env -u WAYLAND_DISPLAY xvfb-run -a cargo test --manifest-path
+  suite/Cargo.toml --locked -p docxy-suite --test rich_clip_api`.

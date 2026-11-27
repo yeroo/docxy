@@ -114,7 +114,8 @@ issue number to find its notes.
   paste of HTML (#1950), a test X client's last request (#2008), HTML and RTF on
   Wayland through the suite's patched gpui_linux (#1966), another app's lists
   kept by a document paste (#1967), in the document's own lists (#2087),
-  gpui's image copies served as their own mime on X11 and Wayland (#2282).
+  gpui's image copies served as their own mime on X11 and Wayland (#2282),
+  the HTML write and quit handover public for library callers (#2303).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
   text navigation (#1073).
 - `docs/claude/suite-shell.md`: before changing the suite's window chrome: the start
