@@ -1,0 +1,28 @@
+# A table's w:tblInd moves it right of the text (#2151): an imported
+# page's table in an indented block (a margin-left div, a blockquote) gets
+# a w:tblInd that Word, with no compatibilityMode, measures to the first
+# cell's text, and the view takes that cell's left margin off, so each
+# lands at its block's 40 px whatever its padding. `doc`'s
+# `flow.tables.N.inset` is a table's left edge less the text column's, in
+# px; Print Layout's column rect sits a px in from the column its blocks
+# are drawn in (the page's border), so there the two are compared. Its own
+# script: table-jc.uit leaves Print Layout on.
+
+test issue 2151 a table's w:tblInd moves it right of the text, in Web and Print Layout
+  open copy:../fixtures/table-ind.html
+  call window-size {"w":1100,"h":900}
+  shot window
+  call doc {}
+  assert reply.view.layout is web
+  assert reply.flow.tables.0.inset is 0
+  assert reply.flow.tables.0.place is left
+  assert reply.flow.tables.1.inset is 40
+  assert reply.flow.tables.2.inset is 40
+  call ribbon-click {"tab":"View","command":"Print Layout"}
+  shot window
+  call doc {}
+  assert reply.view.layout is print
+  assert reply.flow.tables.0.place is left
+  assert reply.flow.tables.1.place is other
+  assert reply.flow.tables.1.inset is {doc.flow.tables.2.inset}
+  assert reply.flow.tables.1.inset is not 0

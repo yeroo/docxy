@@ -7,7 +7,7 @@
 //! Neither write clears the clipboard, so the text stays; gpui's next write
 //! of anything clears both. On X11 the suite takes the `CLIPBOARD` selection
 //! over from gpui and serves the text beside `text/rtf` (or `text/html`) on
-//! its own connection ([`x11`], #1950); gpui's next copy takes it back. On
+//! its own connection (`x11`, #1950); gpui's next copy takes it back. On
 //! Wayland the suite's patched gpui_linux sets the selection again, through
 //! gpui's own data device, to a source offering the text beside `text/rtf`
 //! (or `text/html`) (`gpui_linux::wayland_clipboard`, #1966); gpui's next
@@ -25,7 +25,13 @@
 //! the RTF.
 //!
 //! A failed write leaves the copy as plain text; a failed read pastes the
-//! plain text, and so does an RTF past [`MAX_RTF`], read no further.
+//! plain text, and so does an RTF past `MAX_RTF`, read no further.
+//!
+//! Two entries are public, for an extension tab kind or a binary built on
+//! the `docxy_suite` library that copies from its own view (#2303):
+//! [`write_html`] adds an HTML fragment beside a copy's text, and
+//! [`hand_over`] lets the last copy outlive the process on X11. Their docs
+//! say what such a caller must do. The rest stays the suite's own.
 
 /// The largest RTF a paste reads off the clipboard. Word's RTF carries its
 /// pictures as hex, so a page or two of them is megabytes; past this the
@@ -68,17 +74,44 @@ pub(crate) fn read_rtf() -> Option<Vec<u8>> {
     imp::read_rtf()
 }
 
-/// Add `html` (a fragment: the table) to the copy on the clipboard, if it
-/// still holds `text` (#1248).
-pub(crate) fn write_html(html: String, text: &str) {
-    imp::write_html(&html, text);
+/// Add `fragment` (HTML, such as a sheet copy's table) to the copy on the
+/// clipboard, if it still holds `text` (#1248): macOS `public.html`, Windows
+/// "HTML Format" (CF_HTML), X11 `text/html` served by the suite's own
+/// connection, Wayland `text/html` through the patched gpui_linux. Headless
+/// it does nothing, and so does a clipboard that no longer holds `text`.
+///
+/// A caller outside the suite (#2303) must:
+///
+/// - write the text first, through gpui, in this process:
+///   `cx.write_to_clipboard(ClipboardItem::new_string(text))`
+///   ([`gpui::App::write_to_clipboard`]), then call this with the same
+///   `text`, synchronously in the same handler. On Wayland the gate is
+///   gpui's own latest copy, and going back to the event loop first lets the
+///   compositor and a clipboard manager take the text-only source.
+/// - call it on gpui's main thread, from an `App` or `Context` callback. On
+///   Wayland gpui's client is held per thread, so off that thread, or while
+///   gpui's state is borrowed, the call does nothing.
+/// - pass a fragment, not a whole page: this wraps it in a UTF-8 page (and
+///   CF_HTML on Windows) itself, so a page would nest.
+///
+/// On X11 it blocks the calling thread while it reads the selection back:
+/// milliseconds as a rule, up to 2 s for each answer. Call it once per copy,
+/// not on every keystroke.
+pub fn write_html(fragment: String, text: &str) {
+    imp::write_html(&fragment, text);
 }
 
 /// At quit: hand what the suite serves to the clipboard manager, so its
 /// last copy (text, RTF, HTML) outlives it (X11, #1950: the suite owns the
 /// selection then, so gpui's own handover finds nothing of its own to hand
-/// over). Waits 100 ms at most; nothing elsewhere.
-pub(crate) fn hand_over() {
+/// over). Waits 100 ms at most.
+///
+/// It does something only when an earlier [`write_html`] (or the suite's
+/// RTF) on X11 took the selection; on macOS, Windows, Wayland and headless
+/// it does nothing. A caller outside the suite that quits by itself calls it
+/// once, from [`gpui::App::on_app_quit`] (#2303). Inside [`crate::run`] it
+/// needn't: `run` already does, and a second call only waits again.
+pub fn hand_over() {
     imp::hand_over();
 }
 
@@ -642,8 +675,9 @@ mod imp {
     static CLIP: OnceLock<Option<X11Clip>> = OnceLock::new();
 
     /// The app's one X11 clipboard on `DISPLAY`, opened on first use, and
-    /// only when gpui runs on X11. Tests never open it: they own a private
-    /// display's.
+    /// only when gpui runs on X11. Unit tests never open it: they own a
+    /// private display's. Only the `rich_clip_api` integration test does
+    /// (#2303), with a text no clipboard holds.
     fn clip() -> Option<&'static X11Clip> {
         CLIP.get_or_init(|| {
             (gpui::guess_compositor() == "X11")

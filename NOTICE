@@ -3,18 +3,30 @@ Copyright (c) yeroo. Licensed under the MIT License (LICENSE).
 
 Third-party material
 
-The desktop suite's PDF view (#2245) draws, reads and searches PDF pages
-with the following crates and the data they embed. Each is used under its
+The desktop suite's PDF view (#2245) draws, reads, searches and fills PDF
+pages, converts a PDF to an editable document with its layout (#2257), and
+prints and exports it as drawn (#2258), with the following crates and the data they embed.
+Terminal docxy's `docxy-pdf` and the VS Code extension's `pdfpages.wasm`
+(#2259) draw and read pages with the same renderer (pdfcraft-render and what
+it brings: PdfCraft, hayro, Vello, lopdf and their embedded data below). Each is used under its
 own licence; the crates' licence texts are in their sources, at the revisions
 suite/Cargo.toml and suite/Cargo.lock pin.
 
-- PdfCraft (pdfcraft-render, pdfcraft-cos, pdfcraft-fonts, pdfcraft-geom),
+- PdfCraft (pdfcraft-render, pdfcraft-cos, pdfcraft-fonts, pdfcraft-geom,
+  pdfcraft-annot, pdfcraft-content, pdfcraft-forms, pdfcraft-model,
+  pdfcraft-edit, pdfcraft-create, pdfcraft-export, pdfcraft-filters,
+  pdfcraft-xfa, pdfcraft-print, pdfcraft-organize),
   https://github.com/storytold/pdfcraft
   Copyright (c) 2026 ArtCraft Team and the PdfCraft contributors.
   MIT OR Apache-2.0.
 
 - craft-libs (craft-pdf, craft-stream-codecs, hayro-postscript, and its
-  own copy of hayro-jbig2 0.3.0 that craft-stream-codecs uses),
+  own copy of hayro-jbig2 0.3.0 that craft-stream-codecs uses; for the
+  conversion, craft-docx, craft-wordmodel, craft-opc, craft-xml, craft-zip,
+  craft-drawingml, craft-pptx, craft-rtf, craft-markdown, craft-html,
+  craft-flow, craft-math, craft-mime, craft-metafile, craft-cfb,
+  craft-codepage, craft-offcrypto, craft-xfa, craft-image-codecs,
+  craft-jpeg, craft-tiff; for printing, craft-print and craft-cms),
   https://github.com/storytold/craft-libs
   Copyright (c) 2026 ArtCraft Team and the craft-libs contributors;
   hayro-jbig2 Copyright (c) The Hayro Authors.
@@ -32,6 +44,16 @@ suite/Cargo.toml and suite/Cargo.lock pin.
 
 - lopdf, https://github.com/J-F-Liu/lopdf, in PdfCraft's patched copy.
   MIT.
+
+- winprint.rs, https://github.com/storytold/winprint.rs (printing, #2258):
+  craft-winprint-gdi, on every platform (craft-print's GDI types),
+  MIT OR Apache-2.0; and on Windows only, winprint (the printer list and the
+  job through Windows.Data.Pdf and the XPS print API), BSD-3-Clause,
+  Copyright (c) 2021 - 2024, alampy.com.
+
+- jpeg-encoder 0.6.1 (through craft-image-codecs), the crates.io release.
+  (MIT OR Apache-2.0) AND IJG. This software is based in part on the work
+  of the Independent JPEG Group.
 
 Data embedded by those crates:
 

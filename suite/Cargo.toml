@@ -6,7 +6,7 @@
 # (../docxcore, ../gridcore, ...) which remain owned by the root workspace.
 [workspace]
 resolver = "2"
-members = ["docxy"]
+members = ["docxy", "pdfpages"]
 # The patched gpui_linux (#1966) is a path dependency, not a member: its own
 # lints and tests are upstream's, and `cargo test --workspace` stays ours.
 exclude = ["vendor/gpui_linux"]
@@ -114,3 +114,17 @@ opt-level = 2
 # installer ships next to suite.exe; on Linux they are in the binary.
 [profile.release]
 debug = "line-tables-only"
+
+# The PDF engine for the wasm editors (#2259): `pdfpages.wasm`, built with
+# `cargo build -p pdfpages --lib --target wasm32-unknown-unknown --profile wasm`
+# (offxy-vscode's `build:wasm`). Its own profile so the suite's release keeps its
+# line tables and unwinding: wasm32 cannot unwind anyway, and the webview
+# replaces an instance that trapped.
+[profile.wasm]
+inherits = "release"
+opt-level = "s"
+lto = true
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"

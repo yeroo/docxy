@@ -108,7 +108,8 @@ mod recover;
 mod ribbon_export;
 mod ribbon_fit;
 mod ribbon_layout;
-mod rich_clip;
+// Public for library callers: its HTML write and quit handover (#2303).
+pub mod rich_clip;
 mod run_look;
 #[cfg(test)]
 mod save_preserve_tests;
@@ -659,6 +660,10 @@ enum BackstageRailAction {
     Export,
     /// A document's Export page, Change File Type (#635).
     ExportDoc,
+    /// A PDF view's Print (#2258).
+    PdfPrint,
+    /// A PDF view's Export page: pages as PNG pictures or as a PDF (#2258).
+    PdfExport,
     /// Build info and the About dialog (#1023); on every tab kind.
     Account,
     Close,
@@ -671,6 +676,8 @@ struct BackstageRailItem {
     project_only: bool,
     /// Shown only for a document tab (Word's Info page, #627).
     doc_only: bool,
+    /// Shown only for a PDF tab, open or not (#2258).
+    pdf_only: bool,
 }
 
 const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
@@ -680,6 +687,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Back,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-info",
@@ -687,6 +695,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Info,
         project_only: false,
         doc_only: true,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-new",
@@ -694,6 +703,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::New,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-open",
@@ -701,6 +711,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Open,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-save",
@@ -708,6 +719,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Save,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-saveas",
@@ -715,6 +727,23 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::SaveAs,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
+    },
+    BackstageRailItem {
+        id: "bs-pdf-print",
+        display: "Print",
+        action: BackstageRailAction::PdfPrint,
+        project_only: false,
+        doc_only: false,
+        pdf_only: true,
+    },
+    BackstageRailItem {
+        id: "bs-pdf-export",
+        display: "Export",
+        action: BackstageRailAction::PdfExport,
+        project_only: false,
+        doc_only: false,
+        pdf_only: true,
     },
     BackstageRailItem {
         id: "bs-export",
@@ -722,6 +751,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Export,
         project_only: true,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-export-doc",
@@ -729,6 +759,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::ExportDoc,
         project_only: false,
         doc_only: true,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-account",
@@ -736,6 +767,7 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Account,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
     BackstageRailItem {
         id: "bs-close",
@@ -743,18 +775,20 @@ const BACKSTAGE_RAIL: &[BackstageRailItem] = &[
         action: BackstageRailAction::Close,
         project_only: false,
         doc_only: false,
+        pdf_only: false,
     },
 ];
 
-/// The rail for the active tab: `project` and `doc` say whether it is a
-/// project or a document tab.
+/// The rail for the active tab: `project`, `doc` and `pdf` say whether it
+/// is a project, a document or a PDF tab (open, failed or not opened yet).
 fn backstage_rail_items(
     project: bool,
     doc: bool,
+    pdf: bool,
 ) -> impl Iterator<Item = &'static BackstageRailItem> {
-    BACKSTAGE_RAIL
-        .iter()
-        .filter(move |item| (!item.project_only || project) && (!item.doc_only || doc))
+    BACKSTAGE_RAIL.iter().filter(move |item| {
+        (!item.project_only || project) && (!item.doc_only || doc) && (!item.pdf_only || pdf)
+    })
 }
 
 /// An extension page's rail entry (#1923), as [`backstage_rail`] takes it:
@@ -801,7 +835,7 @@ impl RailEntry {
 /// Account, the `Bottom` entries, then Close. An entry with an empty id, or
 /// an id an earlier entry used, is left out. With no entries it is exactly
 /// [`backstage_rail_items`].
-fn backstage_rail(project: bool, doc: bool, ext: &[ExtRailEntry]) -> Vec<RailEntry> {
+fn backstage_rail(project: bool, doc: bool, pdf: bool, ext: &[ExtRailEntry]) -> Vec<RailEntry> {
     let mut seen = std::collections::HashSet::new();
     let ext: Vec<&ExtRailEntry> = ext
         .iter()
@@ -813,7 +847,7 @@ fn backstage_rail(project: bool, doc: bool, ext: &[ExtRailEntry]) -> Vec<RailEnt
             .map(|e| RailEntry::Ext((*e).clone()))
     };
     let mut rail = Vec::new();
-    for item in backstage_rail_items(project, doc) {
+    for item in backstage_rail_items(project, doc, pdf) {
         match item.action {
             BackstageRailAction::Account => {
                 rail.push(RailEntry::Suite(item));
@@ -851,10 +885,16 @@ mod backstage_rail_tests {
     fn with_no_extension_pages_the_rail_is_the_suites_own() {
         for project in [false, true] {
             for doc in [false, true] {
-                let suite: Vec<RailEntry> = backstage_rail_items(project, doc)
-                    .map(RailEntry::Suite)
-                    .collect();
-                assert_eq!(backstage_rail(project, doc, &[]), suite, "{project} {doc}");
+                for pdf in [false, true] {
+                    let suite: Vec<RailEntry> = backstage_rail_items(project, doc, pdf)
+                        .map(RailEntry::Suite)
+                        .collect();
+                    assert_eq!(
+                        backstage_rail(project, doc, pdf, &[]),
+                        suite,
+                        "{project} {doc} {pdf}"
+                    );
+                }
             }
         }
     }
@@ -869,7 +909,7 @@ mod backstage_rail_tests {
             entry("p", Bottom),
         ];
         assert_eq!(
-            labels(&backstage_rail(false, false, &ext)),
+            labels(&backstage_rail(false, false, false, &ext)),
             [
                 "← Back",
                 "L a",
@@ -885,7 +925,7 @@ mod backstage_rail_tests {
             ]
         );
         // A document's own Info comes after the extension's top pages.
-        let doc = backstage_rail(false, true, &ext);
+        let doc = backstage_rail(false, true, false, &ext);
         let doc = labels(&doc);
         assert_eq!(doc[..4], ["← Back", "L a", "L b", "Info"]);
         assert_eq!(doc[doc.len() - 4..], ["Account", "L o", "L p", "Close"]);
@@ -903,7 +943,7 @@ mod backstage_rail_tests {
             entry("b", Bottom),
         ];
         assert_eq!(
-            labels(&backstage_rail(false, false, &ext)),
+            labels(&backstage_rail(false, false, false, &ext)),
             [
                 "← Back",
                 "First",
@@ -6768,6 +6808,12 @@ fn ext_cmd_probe(id: &str) -> String {
     format!("ext-ribbon-cmd:{id}")
 }
 
+/// Ctrl+P, or ⌘P: Print (#2258).
+fn is_print_chord(k: &gpui::Keystroke) -> bool {
+    let m = k.modifiers;
+    (m.control || m.platform) && !m.alt && !m.shift && k.key == "p"
+}
+
 /// The probe a suite File rail item draws (#2195), the harness's
 /// `bs-rail:<name>` region: the item's id without its `bs-` (`bs-open` is
 /// `bs-rail:open`).
@@ -11874,6 +11920,8 @@ fn bounds_probe(cell: UnitCell) -> AnyElement {
 /// where it sits across the text `column` it is drawn in (its x and width,
 /// window coordinates): `left` (at the column's left, as a table wider
 /// than it is), `center`, `right`, else `other`; `null` with no column.
+/// `inset` (#2151) is its left edge less the column's left, in px: where a
+/// `w:tblInd` put it (`null` with no column).
 fn painted_tables_json(
     tables: &PaintedTables,
     text_w: Option<f32>,
@@ -11925,6 +11973,10 @@ fn painted_tables_json(
                         Json::Bool(view.is_some() && right > 0. && right <= view_w + 1.),
                     ),
                     ("place", place),
+                    (
+                        "inset",
+                        column.map_or(Json::Null, |(cx, _)| round(f32::from(b.origin.x) - cx)),
+                    ),
                 ])
             })
             .collect(),
@@ -11950,6 +12002,10 @@ struct TableCtx<'a> {
     /// While a table pen is on (#763): where the tables and top-level
     /// paragraphs this frame lays out are recorded.
     draw: Option<std::rc::Rc<std::cell::RefCell<table_draw::DrawGeom>>>,
+    /// The package's `compatibilityMode` (#2151): below 15, or none, Word
+    /// measures a table's `w:tblInd` to its first cell's text
+    /// ([`docxcore::table::left_edge`]).
+    compat_mode: Option<u32>,
 }
 
 impl<'a> TableCtx<'a> {
@@ -11964,6 +12020,7 @@ impl<'a> TableCtx<'a> {
             cache: Default::default(),
             gridlines,
             draw: None,
+            compat_mode: pkg.and_then(Package::compatibility_mode),
         }
     }
 
@@ -13067,7 +13124,7 @@ fn convert_doc_with(
     let kind = match what {
         What::Rtf => open_mode::Converted::Rtf,
         What::Html => open_mode::Converted::Html,
-        What::Pdf => open_mode::Converted::Pdf,
+        What::Pdf | What::PdfText => open_mode::Converted::Pdf,
         What::Recover => open_mode::Converted::Recovered,
         What::RecoverText => open_mode::Converted::RecoveredText,
     };
@@ -19580,7 +19637,12 @@ impl Docxy {
                 group: p.group,
             })
             .collect();
-        backstage_rail(self.active_is_project(), self.active_is_doc(), &ext)
+        backstage_rail(
+            self.active_is_project(),
+            self.active_is_doc(),
+            self.active_kind_is_pdf(),
+            &ext,
+        )
     }
 
     /// The extension page File shows now (#1923): `bs_ext` while the active
@@ -19633,6 +19695,8 @@ impl Docxy {
             BackstageRailAction::SaveAs => self.save_as(window, cx),
             BackstageRailAction::Export => self.project_act(ProjectAct::ExportGantt, window, cx),
             BackstageRailAction::ExportDoc => self.open_export(cx),
+            BackstageRailAction::PdfPrint => self.pdf_print(window, cx),
+            BackstageRailAction::PdfExport => self.open_export(cx),
             BackstageRailAction::Close => self.backstage_close(window, cx),
         }
     }
@@ -32199,6 +32263,11 @@ impl Docxy {
             self.keytips = KeyTip::Off;
             return self.help_key(ev, window, cx);
         }
+        // Ctrl+P (⌘P) prints a PDF tab (#2258), or says it is not open.
+        if self.active_kind_is_pdf() && is_print_chord(&ev.keystroke) {
+            self.keytips = KeyTip::Off;
+            return self.pdf_print(window, cx);
+        }
         // Nor has a PDF view (#2245): its own keys, which edit only its
         // form's fields (#2255).
         if self.active_is_pdf() {
@@ -36493,6 +36562,132 @@ mod repeat_tests {
         );
     }
 
+    /// An item's unnumbered continuation (#2151): a paragraph, or a table,
+    /// at its item's text indent, as an HTML import writes `<li>a<p>b</p>`,
+    /// keeps the count going, as a browser and Word number the next item.
+    #[test]
+    fn imported_html_list_continuations_keep_the_count_2151() {
+        let drawn = |html: &str| {
+            let pkg = docxcore::import::html::import_html_with(html.as_bytes(), &mut |_, _| None)
+                .unwrap()
+                .package();
+            let numbering = docxcore::numbering::parse_numbering_xml(
+                &pkg.part_text("word/numbering.xml").unwrap(),
+            );
+            list_markers_in(
+                &pkg.document.body,
+                Some(&numbering),
+                pkg.compatibility_mode(),
+            )
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+        };
+        let table = "<table><tr><td>t</td></tr></table>";
+        assert_eq!(
+            drawn("<ol><li>a<p>b</p></li><li>c</li></ol>"),
+            ["1. ", "2. "]
+        );
+        assert_eq!(
+            drawn("<ol><li><div>a</div><div>b</div></li><li>c</li></ol>"),
+            ["1. ", "2. "]
+        );
+        assert_eq!(
+            drawn("<ol><li>a<ul><li>x</li></ul>c</li><li>d</li></ol>"),
+            ["1. ", "\u{25E6} ", "2. "]
+        );
+        assert_eq!(
+            drawn(&format!("<ol><li>a{table}</li><li>c</li></ol>")),
+            ["1. ", "2. "]
+        );
+        // Separate lists still count on their own, a paragraph between or not.
+        assert_eq!(
+            drawn("<ol><li>a</ol><p>t</p><ol><li>b</ol>"),
+            ["1. ", "1. "]
+        );
+    }
+
+    /// A block between items continues their count only when it reaches
+    /// the shallowest one's text (#2151): an unindented paragraph or table,
+    /// or one less indented, restarts it as before, and so does any block
+    /// after an item whose text indent is unknown.
+    #[test]
+    fn list_markers_continue_across_an_items_continuation_2151() {
+        use docxcore::model::{Block, ParProps, Paragraph};
+        let item = |indent: i32| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    num_id: Some(NUM_DECIMAL),
+                    indent,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let text = |indent: i32| {
+            Block::Paragraph(Paragraph {
+                props: ParProps {
+                    indent,
+                    ..ParProps::default()
+                },
+                content: Vec::new(),
+            })
+        };
+        let table = |ind: i32| {
+            let mut t = docxcore::table::new_table(1, 1, 4000, docxcore::table::AutoFit::Default);
+            t.raw_tblpr = Some(format!(
+                "<w:tblPr><w:tblInd w:w=\"{ind}\" w:type=\"dxa\"/></w:tblPr>"
+            ));
+            Block::Table(t)
+        };
+        let s = |m: &str| Some(m.to_string());
+        let shown = |body: &[Block], compat: Option<u32>| list_markers_in(body, None, compat);
+        assert_eq!(
+            shown(&[item(720), text(720), item(720)], None),
+            [s("1. "), None, s("2. ")]
+        );
+        assert_eq!(
+            shown(&[item(720), text(1440), item(720)], None),
+            [s("1. "), None, s("2. ")]
+        );
+        for restart in [text(0), text(360), table(0)] {
+            assert_eq!(
+                shown(&[item(720), restart, item(720)], None),
+                [s("1. "), None, s("1. ")]
+            );
+        }
+        // An unknown text indent (no direct one, no numbering part).
+        assert_eq!(
+            shown(&[item(0), text(720), item(0)], None),
+            [s("1. "), None, s("1. ")]
+        );
+        // A table by its drawn edge: 828 less the 108 cell margin reaches
+        // 720 in the older layout; in Word 2013's it is at 828 already.
+        for compat in [None, Some(15)] {
+            assert_eq!(
+                shown(&[item(720), table(828), item(720)], compat),
+                [s("1. "), None, s("2. ")]
+            );
+        }
+        assert_eq!(
+            shown(&[item(720), table(720), item(720)], None),
+            [s("1. "), None, s("1. ")]
+        );
+        assert_eq!(
+            shown(&[item(720), table(720), item(720)], Some(15)),
+            [s("1. "), None, s("2. ")]
+        );
+        // A restart forgets the items before it: the next run's own indent
+        // decides.
+        assert_eq!(
+            shown(
+                &[item(360), text(0), item(1440), text(720), item(1440)],
+                None
+            ),
+            [s("1. "), None, s("1. "), None, s("1. ")]
+        );
+    }
+
     /// A table's list counts on from cell to cell (#2087): an item per row
     /// beside a cell of other text is 1., 2., 3., as Word draws it; a
     /// paragraph after an item in the same cell restarts it.
@@ -40770,13 +40965,26 @@ fn has_page_break(b: &Block) -> bool {
 /// from its `w:start` where the numbering defines the list (#1989: an HTML
 /// `<ol start>`), else from 1. The view's own rule, not Word's: every count
 /// restarts (to its start) after a paragraph that is not a list item
-/// (docxy's own lists share numId 1 and 2). Not done: `w:lvlOverride` /
-/// `w:startOverride` restarts.
+/// (docxy's own lists share numId 1 and 2), unless it is indented as far as
+/// the items' text, an item's continuation (#2151, [`ListRun`]). Not done:
+/// `w:lvlOverride` / `w:startOverride` restarts.
+#[cfg(test)]
 fn list_markers(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
 ) -> Vec<Option<String>> {
-    list_markers_counting(body, numbering, &mut ListCounts::new(), true)
+    list_markers_in(body, numbering, None)
+}
+
+/// [`list_markers`] in a package whose `compatibilityMode` is `compat`
+/// (#2151): a table between items is placed by its `w:tblInd` as
+/// [`docxcore::table::left_edge`] measures it there.
+fn list_markers_in(
+    body: &[Block],
+    numbering: Option<&docxcore::numbering::Numbering>,
+    compat: Option<u32>,
+) -> Vec<Option<String>> {
+    list_markers_counting(body, numbering, compat, &mut ListCounts::new(), true)
 }
 
 /// Each list's count per level, for [`list_markers`], keyed by
@@ -40941,11 +41149,24 @@ fn list_level_numbered(
 /// numbers a list with an item per row 1, 2, 3. Within a cell a paragraph
 /// that is not a list item restarts the count only after an item of that
 /// cell, so a cell of other text beside the items keeps the count going.
-struct TableListCounts(ListCounts);
+struct TableListCounts {
+    counts: ListCounts,
+    /// The package's `compatibilityMode`, for [`list_markers_in`].
+    compat: Option<u32>,
+}
 
 impl TableListCounts {
+    #[cfg(test)]
     fn new() -> Self {
-        TableListCounts(ListCounts::new())
+        TableListCounts::in_package(None)
+    }
+
+    /// A table's counts in a package whose `compatibilityMode` is `compat`.
+    fn in_package(compat: Option<u32>) -> Self {
+        TableListCounts {
+            counts: ListCounts::new(),
+            compat,
+        }
     }
 
     /// The markers of the next cell's `blocks`.
@@ -40954,16 +41175,62 @@ impl TableListCounts {
         blocks: &[Block],
         numbering: Option<&docxcore::numbering::Numbering>,
     ) -> Vec<Option<String>> {
-        list_markers_counting(blocks, numbering, &mut self.0, false)
+        list_markers_counting(blocks, numbering, self.compat, &mut self.counts, false)
     }
 }
 
-/// [`list_markers`] from `counts` on, left as the last block leaves them. A
-/// block that is not a list item restarts every count when `restart_any`,
-/// or else only after a list item of `blocks`.
+/// The items counted since the counts last restarted (#2151): how far in
+/// the shallowest one's text starts, which a block between items must
+/// reach to be one's continuation (an HTML import writes `<li>a<p>b</p>`'s
+/// `b` at its item's text indent, and an `<li>`'s table indented to it).
+/// An item whose text indent is unknown (no direct one, and none its
+/// numbering level gives) lets no block continue it.
+#[derive(Default)]
+struct ListRun {
+    /// The least text indent of those items, in twips; `None` before one.
+    least: Option<i32>,
+    unknown: bool,
+}
+
+impl ListRun {
+    /// An item at `text` twips (`None`, unknown) is counted.
+    fn item(&mut self, text: Option<i32>) {
+        match text {
+            Some(t) => self.least = Some(self.least.map_or(t, |l| l.min(t))),
+            None => self.unknown = true,
+        }
+    }
+
+    /// Whether a block whose left edge is at `indent` twips continues the
+    /// items before it rather than restarting their counts.
+    fn continued_by(&self, indent: i32) -> bool {
+        !self.unknown && indent > 0 && self.least.is_some_and(|l| indent >= l)
+    }
+}
+
+/// How far in list item `p`'s text starts, in twips: its direct left
+/// indent, else its numbering level's; `None` when neither says (or says 0).
+fn item_text_indent(
+    p: &docxcore::model::Paragraph,
+    numbering: Option<&docxcore::numbering::Numbering>,
+) -> Option<i32> {
+    if p.props.has_direct_left_indent() {
+        return Some(p.props.indent).filter(|&i| i > 0);
+    }
+    numbering
+        .and_then(|n| n.level_indent(p.props.num_id?, p.props.ilvl.clamp(0, 8)))
+        .and_then(|i| i.left)
+        .filter(|&i| i > 0)
+}
+
+/// [`list_markers_in`] from `counts` on, left as the last block leaves
+/// them. A block that is not a list item restarts every count when
+/// `restart_any`, or else only after a list item of `blocks`, unless it
+/// continues the items before it ([`ListRun`]).
 fn list_markers_counting(
     body: &[Block],
     numbering: Option<&docxcore::numbering::Numbering>,
+    compat: Option<u32>,
     counts: &mut ListCounts,
     restart_any: bool,
 ) -> Vec<Option<String>> {
@@ -40976,10 +41243,12 @@ fn list_markers_counting(
     };
     let mut out = Vec::with_capacity(body.len());
     let mut had_item = false;
+    let mut run = ListRun::default();
     for b in body {
         let marker = match b {
             Block::Paragraph(p) if p.props.in_list() => {
                 had_item = true;
+                run.item(item_text_indent(p, numbering));
                 // OOXML's nine levels, as `Numbering::count` clamps them
                 // (#2087 r3): a negative or huge `w:ilvl` must not index or
                 // grow the counts.
@@ -41008,8 +41277,15 @@ fn list_markers_counting(
                 }
             }
             _ => {
-                if restart_any || had_item {
+                let indent = match b {
+                    Block::Paragraph(p) => Some(p.props.indent),
+                    Block::Table(t) => Some(docxcore::table::left_edge(t, compat)),
+                    _ => None,
+                };
+                let continues = indent.is_some_and(|i| run.continued_by(i));
+                if !continues && (restart_any || had_item) {
                     counts.clear();
+                    run = ListRun::default();
                 }
                 None
             }
@@ -42164,7 +42440,7 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     let margin_rows = ctx.active && !hf && path.len() == 1 && ctx.ent.is_suite();
     let mut rows = Vec::new();
     // The cells' list numbers count on from cell to cell (#2087).
-    let mut list_counts = TableListCounts::new();
+    let mut list_counts = TableListCounts::in_package(ctx.tbl.compat_mode);
     for (ri, rb) in boxes.iter().enumerate() {
         let row = &t.rows[ri];
         let mut cells: Vec<AnyElement> = Vec::new();
@@ -42469,6 +42745,22 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
     // unknown, the table stays at the left.
     let room = ctx.fit_width.or(ctx.line_width).or(ctx.hf_width);
     let fits = room.is_some_and(|r| tw_px(widest.min(i32::MAX as u32) as i32, zoom) <= r + 0.5);
+    let align = table_view::h_align(t);
+    // A left table's `w:tblInd` moves it right of the text's left (#2151),
+    // whether or not it fits: Word keeps the indent on a wider one, and a
+    // left margin (unlike gpui's auto ones) never pushes it past the left,
+    // so the sideways scroll still reaches its right edge. A view that
+    // fits this table to its width (`fit`, not while a pen is on, and only
+    // a table it scales) cuts it to what the table leaves (r1, r2).
+    let indent = match align {
+        table_view::HAlign::Left => table_view::table_indent(
+            t,
+            tw_px(docxcore::table::left_edge(t, ctx.tbl.compat_mode), zoom),
+            tw_px(widest.min(i32::MAX as u32) as i32, zoom),
+            ctx.fit_width.filter(|_| fit.is_some()),
+        ),
+        _ => 0.0,
+    };
     v_flex()
         .relative()
         .flex_none()
@@ -42477,7 +42769,8 @@ fn table_el(t: &Table, path: &[usize], ctx: RenderCtx) -> AnyElement {
         // The flow column's 4 px below a top-level table (#1986), past its
         // own 8 px: a later `mb` replaces the bottom margin.
         .when(ctx.gap_below && path.len() == 1, |d| d.mb(px(8. + 4.)))
-        .when(fits, |d| match table_view::h_align(t) {
+        .when(indent > 0.0, |d| d.ml(px(indent)))
+        .when(fits, |d| match align {
             table_view::HAlign::Left => d,
             table_view::HAlign::Center => d.mx_auto(),
             table_view::HAlign::Right => d.ml_auto(),
@@ -47306,6 +47599,8 @@ impl Docxy {
             page
         } else if let Some(page) = self.export_page(bg, fg, dim, cx) {
             page
+        } else if let Some(page) = self.pdf_export_page(bg, fg, dim, cx) {
+            page
         } else if let Some(page) = self.info_page(bg, fg, dim, cx) {
             page
         } else {
@@ -48647,7 +48942,8 @@ impl Render for Docxy {
                     if self.draw_tool().is_some() {
                         tbl.draw = Some(self.draw_geom.clone());
                     }
-                    let markers = list_markers(&shown.body, tbl.numbering.as_deref());
+                    let markers =
+                        list_markers_in(&shown.body, tbl.numbering.as_deref(), tbl.compat_mode);
                     let body_range = editor.cell_range();
                     // Inline pictures (#1432), kept across frames in the tab.
                     let pictures = tab
@@ -49580,6 +49876,12 @@ impl Render for Docxy {
                 .into_any_element(),
                 Surface::Project(v) => {
                     project_el(v, self.active, pal, &self.probes, cx).into_any_element()
+                }
+                // A PDF that could not be opened says why in its body (#2256).
+                Surface::Placeholder | Surface::PdfPending(_)
+                    if let Some(why) = pdf_view::host::pdf_failed_reason(tab) =>
+                {
+                    pdf_failed_body(&why, bg, dim).into_any_element()
                 }
                 Surface::Placeholder => placeholder(tab.kind, bg, dim, cx).into_any_element(),
                 Surface::Ext(e) => div()
@@ -54498,6 +54800,25 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla, cx: &App) -> impl IntoElement {
                 .child(name),
         )
         .child(div().text_color(dim).child(blurb))
+}
+
+/// A PDF tab whose file could not be opened (#2256): that, and why.
+fn pdf_failed_body(why: &str, bg: Hsla, dim: Hsla) -> impl IntoElement {
+    v_flex()
+        .flex_1()
+        .bg(bg)
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_4()
+        .child(
+            div()
+                .text_color(rgb(accent::text()))
+                .font_weight(FontWeight::BOLD)
+                .text_size(px(20.))
+                .child(pdf_view::host::PDF_CANT_OPEN),
+        )
+        .child(div().text_color(dim).child(why.to_string()))
 }
 
 /// A built-in kind's placeholder: its name and a line under it.

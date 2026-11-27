@@ -27,6 +27,24 @@ fn info_of(w: &mut Worker) -> DocMeta {
     }
 }
 
+/// `src` encrypted with AES-128 at `dst` (#2256), with these passwords and
+/// `/P` permissions: PdfCraft's own writer, a file rewritten in full.
+pub(crate) fn encrypted_copy(src: &Path, dst: &Path, user: &str, owner: &str, permissions: i32) {
+    let bytes = Arc::new(std::fs::read(src).unwrap());
+    let mut doc = pdfcraft_cos::Document::open(bytes).unwrap();
+    doc.set_encryption(&pdfcraft_cos::NewEncryption {
+        algorithm: pdfcraft_cos::Algorithm::Aes128,
+        user_password: user,
+        owner_password: owner,
+        permissions,
+        encrypt_metadata: true,
+        seed: [0x56; 32],
+    })
+    .unwrap();
+    let out = pdfcraft_cos::write_incremental(&doc, &pdfcraft_cos::SaveOptions::default()).unwrap();
+    std::fs::write(dst, out).unwrap();
+}
+
 /// A copy of corpus file `name` in `dir`, to fill and save.
 fn copy(dir: &Scratch, name: &str) -> PathBuf {
     let p = dir.path(&format!("{name}.pdf"));
@@ -1461,4 +1479,117 @@ fn quick_repeats_build_on_the_fills_on_their_way() {
         ],
         "two steps, not the same one twice"
     );
+}
+
+// ---- encrypted forms (#2256) --------------------------------------------------------
+
+fn unlock(w: &mut Worker, password: &str) -> DocMeta {
+    match w.unlock(worker::Secret::new(password.into())) {
+        Answer::Info(m) => m,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The value of field `name` as `pdfcraft-forms` reads it in `bytes`,
+/// opened with `password`.
+fn cos_value(bytes: &Arc<Vec<u8>>, password: &str, name: &str) -> String {
+    let cos = pdfcraft_cos::Document::open_with_password(bytes.clone(), Some(password)).unwrap();
+    pdfcraft_forms::fields(&cos)
+        .into_iter()
+        .find(|f| f.name == name)
+        .map(|f| f.value.join(""))
+        .unwrap_or_default()
+}
+
+/// #2256 criterion 10: a filled field of an encrypted form saves; the
+/// saved file still needs its password (to PdfCraft's renderer too), and
+/// opened with it has the value, drawn. A second fill and save after it
+/// (the child reopened the saved bytes with the file's own key) keeps both.
+#[test]
+fn an_encrypted_form_saves_and_still_needs_its_password() {
+    let dir = Scratch::new();
+    let path = dir.path("enc-forms.pdf");
+    encrypted_copy(&corpus("forms"), &path, "user-form", "owner-form", -4);
+    let mut w = worker_on(&path);
+    assert!(matches!(w.ask(&Op::Info), Answer::Locked { wrong: false }));
+    let m = unlock(&mut w, "user-form");
+    assert!(
+        m.form
+            .fields
+            .iter()
+            .any(|f| f.name == "name" && f.fillable())
+    );
+    set(&mut w, "name", text("Ada"));
+    assert!(matches!(
+        w.ask(&Op::SaveTo { path: path.clone() }),
+        Answer::Saved(_)
+    ));
+    let saved = Arc::new(std::fs::read(&path).unwrap());
+    assert!(matches!(
+        pdfcraft_render::inspect(saved.clone(), None),
+        Err(pdfcraft_render::OpenError::NeedsPassword)
+    ));
+    assert!(pdfcraft_render::inspect(saved.clone(), Some("user-form")).is_ok());
+    assert_eq!(cos_value(&saved, "user-form", "name"), "Ada");
+    assert!(
+        pdfcraft_cos::Document::open(saved.clone()).is_err(),
+        "no password, no file"
+    );
+    // A second fill and save, then a new reader.
+    set(&mut w, "email", text("ada@example.org"));
+    assert!(matches!(
+        w.ask(&Op::SaveTo { path: path.clone() }),
+        Answer::Saved(_)
+    ));
+    let mut fresh = worker_on(&path);
+    assert!(matches!(
+        fresh.ask(&Op::Info),
+        Answer::Locked { wrong: false }
+    ));
+    let m = unlock(&mut fresh, "user-form");
+    assert_eq!(value(&m.form.fields, "name"), "Ada");
+    assert_eq!(value(&m.form.fields, "email"), "ada@example.org");
+    match fresh.ask(&Op::Pixels {
+        page: 0,
+        scale: 0.5,
+    }) {
+        Answer::Pixels(r) => assert!(r.w > 0),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// #2256: a form the file's permissions do not let be filled is read-only,
+/// and a fill is refused by the reader whatever sends it; its owner
+/// password lets it be filled.
+#[test]
+fn a_form_its_permissions_do_not_let_be_filled_is_read_only() {
+    let dir = Scratch::new();
+    let path = dir.path("no-fill.pdf");
+    // Neither annotate (bit 6) nor fill forms (bit 9); no user password.
+    encrypted_copy(&corpus("forms"), &path, "", "owner-form", -4 & !(32 | 256));
+    let mut w = worker_on(&path);
+    let m = info_of(&mut w);
+    let sec = m.security.expect("encrypted");
+    assert!(!sec.fill_forms && !sec.owner);
+    assert!(m.form.fields.iter().all(|f| !f.fillable()));
+    match w.ask(&Op::SetField {
+        name: "name".into(),
+        value: text("Ada"),
+    }) {
+        Answer::Failed(why) => assert_eq!(why, worker::doc_no_filling()),
+        other => panic!("{other:?}"),
+    }
+    match w.ask(&Op::Fields) {
+        Answer::Form(st) => assert!(st.fields.iter().all(|f| f.read_only)),
+        other => panic!("{other:?}"),
+    }
+    let m = unlock(&mut w, "owner-form");
+    assert!(m.security.unwrap().owner);
+    assert!(
+        m.form
+            .fields
+            .iter()
+            .any(|f| f.name == "name" && f.fillable())
+    );
+    set(&mut w, "name", text("Ada"));
 }

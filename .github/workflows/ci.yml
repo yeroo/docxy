@@ -205,9 +205,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          # The PDF engine of the wasm editors (#2259).
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
-          workspaces: suite
+          # The root for terminal docxy's PDF viewer test below (#2259).
+          workspaces: |
+            suite
+            .
       - name: System packages gpui needs on Linux
         run: |
           sudo apt-get update
@@ -216,14 +221,32 @@ jobs:
         run: cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test
         run: xvfb-run -a cargo test --manifest-path suite/Cargo.toml --locked
+      # Terminal docxy's PDF viewer against the real child (#2259): the root
+      # workspace's docxy and the suite workspace's docxy-pdf (built by the Test
+      # step for pdfpages' tests) speak one protocol in two workspaces, and only
+      # these ignored tests run the two together.
+      - name: Terminal docxy's PDF viewer with docxy-pdf
+        run: |
+          DOCXY_PDF="$GITHUB_WORKSPACE/suite/target/debug/docxy-pdf" cargo test -p docxy --locked -- --ignored pdf_view::
+      # The VS Code PDF viewer's engine (#2259): pdfpages.wasm built as the
+      # extension builds it, then its imports, the corpus, the memory cap and the
+      # webview's worker host checked in Node.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: The PDF engine for the wasm editors
+        run: |
+          cargo build --manifest-path suite/Cargo.toml -p pdfpages --lib --target wasm32-unknown-unknown --profile wasm --locked
+          node offxy-vscode/media/pdf.test.mjs
       # The suite's patched gpui_linux (#1966): the vendored tree is upstream (cargo's
       # zed checkout, which the steps above made) plus suite/vendor/gpui_linux.patch,
-      # and the patch's Wayland clipboard tests pass. A path dependency outside the
-      # workspace, so the Test step above does not run them.
+      # and the patch's Wayland and X11 clipboard tests pass (#2282: the X11 ones each
+      # start a private Xvfb). A path dependency outside the workspace, so the Test
+      # step above does not run them.
       - name: Vendored gpui_linux
         run: |
           python3 scripts/vendor-gpui-linux.py --check
-          cargo test --manifest-path suite/Cargo.toml --locked -p gpui_linux --lib wayland::
+          cargo test --manifest-path suite/Cargo.toml --locked -p gpui_linux --lib -- wayland:: x11::clipboard::
       # window_close (#1226) closes the suite's window through X11 and drives the
       # debug suite the Test step left in suite/target/debug (docxy's integration
       # tests build the binary).

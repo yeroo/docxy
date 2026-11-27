@@ -9,8 +9,10 @@
 //! writes the document as the tab would save it (the Markdown package, which
 //! defines its styles). The parent waits at most [`TIMEOUT`], polling, and
 //! kills the child past it; on Windows the child runs in a Job object with a
-//! [`MEMORY_LIMIT`] and kill-on-close. A child that fails, dies or runs out
-//! of time is a load error; the suite carries on.
+//! [`MEMORY_LIMIT`] and kill-on-close, and on Linux a PDF conversion's child
+//! sets the same limit on itself (`RLIMIT_DATA`, #2257). A child that fails,
+//! dies or runs out of time is a load error; the suite carries on (a PDF
+//! whose child died is tried once more by its text, [`convert`]).
 //!
 //! A Web Page's images (#1880) come along: a `data:` src from the page, a
 //! part of a single-file Web Page (MHTML, #1898), an SVG or WebP as PNG
@@ -38,7 +40,9 @@ pub(crate) const FLAG: &str = "--convert-import";
 /// the budgets make a real conversion take seconds (the Word fixture PDF
 /// converts in well under one), and this leaves room for a slow machine.
 pub(crate) const TIMEOUT: Duration = Duration::from_secs(20);
-/// The most memory a converting child may commit (Windows only).
+/// The most memory a converting child may commit: every child on Windows
+/// (its Job), a PDF conversion's on Linux too (`RLIMIT_DATA`, #2257,
+/// `pdf_view::worker::limit_memory`).
 pub(crate) const MEMORY_LIMIT: usize = 2 << 30;
 /// Set to `1` to convert in the suite's own process instead.
 pub(crate) const IN_PROCESS_ENV: &str = "DOCXY_CONVERT_IN_PROCESS";
@@ -58,6 +62,10 @@ pub(crate) enum What {
     Rtf,
     Html,
     Pdf,
+    /// A PDF's text only, by the text importer (#951): what a PDF child
+    /// that died is retried as (#2257), the layout step being what a bad
+    /// file can abort.
+    PdfText,
     /// The text of a damaged Word package (nothing when it has none).
     Recover,
     /// Recover Text from Any File: a package's text, else any text.
@@ -70,6 +78,7 @@ impl What {
             Self::Rtf => "rtf",
             Self::Html => "html",
             Self::Pdf => "pdf",
+            Self::PdfText => "pdf-text",
             Self::Recover => "recover",
             Self::RecoverText => "recover-text",
         }
@@ -80,6 +89,7 @@ impl What {
             "rtf" => Self::Rtf,
             "html" => Self::Html,
             "pdf" => Self::Pdf,
+            "pdf-text" => Self::PdfText,
             "recover" => Self::Recover,
             "recover-text" => Self::RecoverText,
             _ => return None,
@@ -149,9 +159,14 @@ pub(crate) fn child_main(args: &[OsString]) -> Option<i32> {
         args.get(3),
         args.get(4),
     ) else {
-        eprintln!("docxy: {FLAG} <rtf|html|pdf|recover|recover-text> <in> <out.docx>");
+        eprintln!("docxy: {FLAG} <rtf|html|pdf|pdf-text|recover|recover-text> <in> <out.docx>");
         return Some(EXIT_FAILED);
     };
+    // A PDF is read by PdfCraft here (#2257): on Linux under the PDF
+    // view's worker's own memory limit, which only a child may set.
+    if what == What::Pdf {
+        crate::pdf_view::worker::limit_memory();
+    }
     Some(run(what, Path::new(input), Path::new(output)))
 }
 
@@ -191,7 +206,7 @@ pub(crate) struct ConvertedDoc {
 }
 
 impl ConvertedDoc {
-    fn plain(doc: docxcore::model::Document) -> Self {
+    pub(crate) fn plain(doc: docxcore::model::Document) -> Self {
         ConvertedDoc { doc, base: None }
     }
 
@@ -231,7 +246,10 @@ pub(crate) fn convert_bytes(
                 base: Some(pkg),
             }))
         }
-        What::Pdf => plain(import::import_pdf(bytes)),
+        // With the layout, through PdfCraft (#2257); the text importer
+        // when that fails or keeps nothing.
+        What::Pdf => crate::pdf_view::convert::convert(bytes).map(Some),
+        What::PdfText => plain(import::import_pdf(bytes)),
         What::Recover => Ok(import::recover_docx_text(bytes)?.map(ConvertedDoc::plain)),
         What::RecoverText => match import::recover_docx_text(bytes)? {
             Some(doc) => Ok(Some(ConvertedDoc::plain(doc))),
@@ -384,8 +402,43 @@ fn decoded_path(src: &str) -> Option<String> {
     (!path.is_empty()).then_some(path)
 }
 
-/// The parent's side: convert `path` as `what` in a child process.
+/// The parent's side: convert `path` as `what` in a child process, within
+/// [`TIMEOUT`] in all. A PDF whose child died ([`DIED`]: an abort, out of
+/// memory past the limit) is tried once more by its text alone
+/// ([`What::PdfText`]), as it converted before the layout conversion
+/// (#2257), in what is left of the same [`TIMEOUT`]: the suite waits on its
+/// UI thread, so a retry never makes the wait longer. One that ran out of
+/// time is not retried; the layout step bounds itself
+/// (`pdf_view::convert::Limits`) and falls back in its own child.
 pub(crate) fn convert(what: What, path: &Path) -> Outcome {
+    retrying(what, TIMEOUT, |what, timeout| {
+        convert_once(what, path, timeout)
+    })
+}
+
+/// The least time worth a retry.
+const RETRY_MIN: Duration = Duration::from_secs(1);
+
+/// `run(what, total)`, and for a PDF whose child died, `run(What::PdfText,
+/// what is left of total)` when that is at least [`RETRY_MIN`].
+fn retrying(what: What, total: Duration, run: impl Fn(What, Duration) -> Outcome) -> Outcome {
+    let start = Instant::now();
+    let first = run(what, total);
+    match first {
+        Outcome::Failed(ref why) if what == What::Pdf && why == DIED => {
+            let left = total.saturating_sub(start.elapsed());
+            if left >= RETRY_MIN {
+                run(What::PdfText, left)
+            } else {
+                first
+            }
+        }
+        first => first,
+    }
+}
+
+/// [`convert`] without the retry, waiting at most `timeout`.
+fn convert_once(what: What, path: &Path, timeout: Duration) -> Outcome {
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(e) => return cannot_start(e),
@@ -397,7 +450,7 @@ pub(crate) fn convert(what: What, path: &Path) -> Outcome {
     let out = dir.0.join("converted.docx");
     let mut cmd = Command::new(exe);
     cmd.arg(FLAG).arg(what.arg()).arg(path).arg(&out);
-    run_child(cmd, &dir.0, &out, TIMEOUT, MEMORY_LIMIT)
+    run_child(cmd, &dir.0, &out, timeout, MEMORY_LIMIT)
 }
 
 /// Run a converting child: wait at most `timeout` (killing it past that),
@@ -642,8 +695,11 @@ pub(crate) mod tests {
         let Some(spec) = std::env::var_os(CHILD_ENV) else {
             return;
         };
+        let layout = spec.to_string_lossy().starts_with("pdf|");
         match std::env::var(MODE_ENV).as_deref() {
             Ok("abort") => std::process::abort(),
+            // A PDF's layout step aborting (#2257): the text-only retry runs.
+            Ok("abort-layout") if layout => std::process::abort(),
             Ok("hang") => loop {
                 std::thread::sleep(Duration::from_secs(1));
             },
@@ -773,6 +829,94 @@ pub(crate) mod tests {
             Outcome::Failed(why) => assert_eq!(why, DIED),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// #2257: a PDF child that dies (the layout step aborted: out of memory
+    /// past `limit_memory`, which no `catch_unwind` reaches) is tried again
+    /// by the text importer alone; any other conversion that dies, and one
+    /// that dies again, is a load error.
+    #[test]
+    fn a_pdf_child_that_dies_is_retried_by_its_text() {
+        let dir = TempDir::new().unwrap();
+        let md = docxcore::markdown::from_markdown("Text the retry reads.\n");
+        let pdf = write(
+            &dir,
+            "in.pdf",
+            &docxcore::export::to_pdf(&md, &docxcore::export::PdfOptions::default()),
+        );
+        let tried = std::cell::RefCell::new(Vec::new());
+        let got = retrying(What::Pdf, TIMEOUT, |what, timeout| {
+            tried.borrow_mut().push(what);
+            convert_by_test_child(what, &pdf, Some("abort-layout"), timeout, MEMORY_LIMIT)
+        });
+        assert_eq!(*tried.borrow(), vec![What::Pdf, What::PdfText]);
+        let Outcome::Converted(docx) = got else {
+            panic!("{got:?}")
+        };
+        let doc = docxcore::package::load_package(&docx).unwrap().document;
+        let text: String = doc.body.iter().map(|b| b.plain_text()).collect();
+        assert!(text.contains("Text the retry reads."), "{text}");
+        // Dying again, or another kind dying, is not retried further.
+        let again = retrying(What::Pdf, TIMEOUT, |what, timeout| {
+            convert_by_test_child(what, &pdf, Some("abort"), timeout, MEMORY_LIMIT)
+        });
+        assert!(
+            matches!(again, Outcome::Failed(ref why) if why == DIED),
+            "{again:?}"
+        );
+        let rtf = write(&dir, "in.rtf", br"{\rtf1 x\par}");
+        let tried = std::cell::Cell::new(0);
+        let rtf_died = retrying(What::Rtf, TIMEOUT, |what, timeout| {
+            tried.set(tried.get() + 1);
+            convert_by_test_child(what, &rtf, Some("abort"), timeout, MEMORY_LIMIT)
+        });
+        assert!(matches!(rtf_died, Outcome::Failed(_)));
+        assert_eq!(tried.get(), 1);
+        assert_eq!(What::parse(What::PdfText.arg()), Some(What::PdfText));
+    }
+
+    /// #2257 r2: the retry has only what is left of the one timeout, and
+    /// none when too little is left: the suite never waits longer than
+    /// [`TIMEOUT`].
+    #[test]
+    fn a_retry_shares_the_one_timeout() {
+        let total = Duration::from_millis(1500);
+        let given = std::cell::RefCell::new(Vec::new());
+        let got = retrying(What::Pdf, total, |what, timeout| {
+            given.borrow_mut().push((what, timeout));
+            if what == What::Pdf {
+                std::thread::sleep(Duration::from_millis(200));
+                Outcome::Failed(DIED.into())
+            } else {
+                Outcome::NothingRecovered
+            }
+        });
+        assert!(matches!(got, Outcome::NothingRecovered), "{got:?}");
+        let given = given.into_inner();
+        assert_eq!(given.len(), 2);
+        assert_eq!(given[0], (What::Pdf, total));
+        assert_eq!(given[1].0, What::PdfText);
+        assert!(
+            given[1].1 <= total - Duration::from_millis(200),
+            "{:?}",
+            given[1]
+        );
+        // Less than RETRY_MIN left: the death stands.
+        let tried = std::cell::Cell::new(0);
+        let got = retrying(What::Pdf, Duration::from_millis(900), |_, _| {
+            tried.set(tried.get() + 1);
+            Outcome::Failed(DIED.into())
+        });
+        assert!(matches!(got, Outcome::Failed(ref why) if why == DIED));
+        assert_eq!(tried.get(), 1);
+        // A first child that ran out of time is never retried.
+        let tried = std::cell::Cell::new(0);
+        let got = retrying(What::Pdf, TIMEOUT, |_, _| {
+            tried.set(tried.get() + 1);
+            Outcome::Failed(TOO_LONG.into())
+        });
+        assert!(matches!(got, Outcome::Failed(ref why) if why == TOO_LONG));
+        assert_eq!(tried.get(), 1);
     }
 
     #[test]

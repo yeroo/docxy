@@ -2,13 +2,17 @@
 ;
 ; Per-user (no UAC): installs the console editors and adds their folder to the
 ; user PATH so `docxy file.docx` / `xlsxy file.xlsx` work from any shell.
-; Compile:  iscc /DAppVersion=%VER% /DSrcDir=<staging> packaging\inno\tui.iss
+; Compile:  iscc /DAppVersion=%VER% /DSrcDir=<staging> /DPdfSrcDir=<suite staging> packaging\inno\tui.iss
 
 #ifndef AppVersion
   #define AppVersion "0.0.0"
 #endif
 #ifndef SrcDir
   #define SrcDir "..\..\target\release"
+#endif
+; docxy-pdf draws a PDF's pages for docxy (#2259); the suite workspace builds it.
+#ifndef PdfSrcDir
+  #define PdfSrcDir "..\..\suite\target\release"
 #endif
 #define Publisher "yeroo"
 
@@ -35,6 +39,7 @@ VersionInfoDescription=docxy terminal editors installer
 [Files]
 Source: "{#SrcDir}\docxy.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcDir}\xlsxy.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#PdfSrcDir}\docxy-pdf.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Tasks]
 Name: "addtopath"; Description: "Add docxy + xlsxy to my PATH (recommended)"; GroupDescription: "Command line:"

@@ -45,7 +45,8 @@ issue number to find its notes.
   pasted with only the characters XML can hold, `\u{0B}` a line break (#1993),
   an alignment tab deleted out of a field marker's run (#1463), a
   tracked clear of table cells keeping equations, Reject All (#1471),
-  the suite's markers from each level's `w:start` (#1989).
+  the suite's markers from each level's `w:start` (#1989), an item's
+  continuation keeping the count (#2151).
 - `docs/claude/suite-document.md`: before changing the suite's document tab: save-as
   names (#807), Home Font / Font Size boxes (#1361), File > Info Properties (#1364), the
   comment editor and its draft per tab (#1362, #1329), inline pictures (#1432), run
@@ -61,7 +62,7 @@ issue number to find its notes.
   list numbers, All caps and Small caps drawn, Table Styles tiles on a
   dark page, Switch Modes not persisted (#2087), a pasted picture in a
   link or a tracked change bringing its media (#1853), a placeholder
-  picture's Alt Text drawn in its frame (#1898).
+  picture's Alt Text drawn in its frame (#1898), `w:tblInd` drawn (#2151).
 - `docs/claude/pdf-export.md`: before changing PDF export: embedded fonts (#1508),
   borders, picture watermarks and unequal columns (#797), tables placed by
   their `w:jc` (#1930).
@@ -71,7 +72,16 @@ issue number to find its notes.
   routing, session row and read-only rules, the harness's `pdf-read`, the
   corpus and its reference tolerance; links, comment pop-ups and AcroForm
   filling, the display copy, Save as an incremental update, replay in a
-  new child, the signed-PDF question and quit (#2255).
+  new child, the signed-PDF question and quit (#2255); the password
+  prompt, owner passwords through the recovered user password, `Secret`,
+  permissions, the child's memory limit, a failed tab's body (#2256);
+  Convert to editable document with the layout: PdfCraft's export, the
+  text importer as fallback, running headers and footers, columns as
+  virtual pages, fonts through code colours, text-box twins (#2257);
+  print and export as drawn: imposition, the spooler and its test seam,
+  PNG and page-range export (#2258); terminal docxy and VS Code: the
+  `docxy-pdf` child and `pdfpages.wasm` in a worker, the text fallback,
+  the wasm profile and imports (#2259).
 - `docs/claude/html-import.md`: before changing HTML import: tables (#1878), CSS (#1872),
   images (#1880), links (#1879), centring (#1922), in cells (#1930),
   bookmarks, the Hyperlink style, relative links, titles and targets,
@@ -93,7 +103,9 @@ issue number to find its notes.
   `<picture>`, MHTML, SVG and WebP through a converter (#1898),
   whitespace-only paragraphs keeping a look drawn on spaces, an empty
   line's size on its mark (#1973), each `<ol>` its own count, `start`
-  and `value` (#1989).
+  and `value` (#1989), a block's box beside a child table, margins
+  through empty blocks, tables in indented blocks, a padding-less card's
+  quirky edges (#2151).
 - `docs/claude/email-html.md`: before changing `docxcore::export_email` (a `Document` as an
   e-mail body): inline styles only, lists and their `start`, safe links, `cid:` pictures and
   their media, the import round trip (#1948).
@@ -101,7 +113,9 @@ issue number to find its notes.
   document copy (#1074), sheet HTML tables (#1248), the X11 clipboard and a document
   paste of HTML (#1950), a test X client's last request (#2008), HTML and RTF on
   Wayland through the suite's patched gpui_linux (#1966), another app's lists
-  kept by a document paste (#1967), in the document's own lists (#2087).
+  kept by a document paste (#1967), in the document's own lists (#2087),
+  gpui's image copies served as their own mime on X11 and Wayland (#2282),
+  the HTML write and quit handover public for library callers (#2303).
 - `docs/claude/macos.md`: before changing macOS-only behaviour: the menu bar (#1071), ⌘/⌥
   text navigation (#1073).
 - `docs/claude/suite-shell.md`: before changing the suite's window chrome: the start
@@ -198,7 +212,7 @@ issue number to find its notes.
 - `docs/claude/terminal-editors.md`: before changing terminal `docxy`, `xlsxy` or
   `yppxy`, or `backstagecore`'s Save As name field: docxy's Layout tab (#1274), prompts
   editing at a caret (#1372, #1373, #1374, #1375, #1379), Ctrl+C/X/V (#1377, #1378),
-  Ctrl+A (#1376), the F1 help reader (#1856).
+  Ctrl+A (#1376), the F1 help reader (#1856), the PDF viewer (#2259).
 - `docs/claude/mail.md`: before changing `mailcore` or Mail: drafts keep their `local:`
   id (#1884, #1881), the body format (#1901), sync one folder, the fast cycle and Sent
   Items after a send (#1885), folders and counts on every tick, deleted folders (#1886),
@@ -313,6 +327,11 @@ What CI runs (`.github/workflows/ci.yml`):
   `cargo fmt --all --check --manifest-path suite/Cargo.toml`,
   `cargo clippy --manifest-path suite/Cargo.toml --all-targets --locked -- -D warnings`,
   `cargo test --manifest-path suite/Cargo.toml --locked` (on Linux under `xvfb-run -a`).
+- The PDF viewers outside the suite (#2259), in `suite-linux`: terminal docxy against
+  the real child, `DOCXY_PDF=$PWD/suite/target/debug/docxy-pdf cargo test -p docxy
+  --locked -- --ignored pdf_view::`; the wasm engine, `cargo build --manifest-path
+  suite/Cargo.toml -p pdfpages --lib --target wasm32-unknown-unknown --profile wasm
+  --locked`, then `node offxy-vscode/media/pdf.test.mjs`.
 - The UI sweep runs every `uiharness/cases/*.uit` against release builds
   (`cargo build --release --locked --manifest-path suite/Cargo.toml`, then
   `cargo build --release --locked -p uiharness -p docxy -p xlsxy -p yppxy -p plugin_fixture`):
@@ -321,7 +340,7 @@ What CI runs (`.github/workflows/ci.yml`):
 - `python3 scripts/check-claude-md.py`: this file's budget and the area-note index.
 - `suite/vendor/gpui_linux` is gpui_linux plus `suite/vendor/gpui_linux.patch` (#1966):
   `python3 scripts/vendor-gpui-linux.py --check`, then `cargo test --manifest-path
-  suite/Cargo.toml --locked -p gpui_linux --lib wayland::`. A gpui bump re-vendors
+  suite/Cargo.toml --locked -p gpui_linux --lib -- wayland:: x11::clipboard::`. A gpui bump re-vendors
   (`--update`; `suite/vendor/README.md`).
 
 ## Cross-crate invariants

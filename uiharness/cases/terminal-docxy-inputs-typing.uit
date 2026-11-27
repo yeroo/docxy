@@ -915,3 +915,55 @@ test docxy docxy-save-as: Escape cancels
   call real-type {"text":"saved-copy.docx"}
   call real-key {"key":"escape"}
   call-error doc.open {"path":"saved-copy.docx"} => saved-copy.docx
+
+# ---- The PDF viewer's Go to page prompt (#2259): `g` opens it on the status
+# line, empty and focused, on a PDF of more than one page; it takes digits
+# only. Enter goes to that page and closes it; Escape closes it where the
+# viewer was. The pages come from docxy-pdf, which the sweep finds beside
+# the suite's build (DOCXY_PDF); pdf-read says which page is shown.
+test docxy docxy-pdf-page: focus
+  open copy:../fixtures/pdf-view-slides.pdf
+  call real-key {"key":"g"}
+  call field-read {"input":"docxy-pdf-page"}
+  assert reply.focused is true
+  assert reply.at is not null
+  assert reply.value is exactly ""
+  assert reply.caret is 0
+
+test docxy docxy-pdf-page: types
+  open copy:../fixtures/pdf-view-slides.pdf
+  call real-key {"key":"g"}
+  call real-type {"text":"2x3"}
+  call field-read {"input":"docxy-pdf-page"}
+  assert reply.value is exactly 23
+  assert reply.caret is 2
+
+test docxy docxy-pdf-page: edits
+  open copy:../fixtures/pdf-view-slides.pdf
+  call real-key {"key":"g"}
+  call real-type {"text":"31"}
+  call real-key {"key":"backspace"}
+  call field-read {"input":"docxy-pdf-page"}
+  assert reply.value is exactly 3
+  assert reply.caret is 1
+
+test docxy docxy-pdf-page: Enter commits
+  open copy:../fixtures/pdf-view-slides.pdf
+  call real-key {"key":"g"}
+  call real-type {"text":"3"}
+  call real-key {"key":"enter"}
+  call field-read {"input":"docxy-pdf-page"}
+  assert reply.value is null
+  assert reply.focused is false
+  call pdf-read {}
+  assert reply.page is 3
+
+test docxy docxy-pdf-page: Escape cancels
+  open copy:../fixtures/pdf-view-slides.pdf
+  call real-key {"key":"g"}
+  call real-type {"text":"3"}
+  call real-key {"key":"escape"}
+  call field-read {"input":"docxy-pdf-page"}
+  assert reply.value is null
+  call pdf-read {}
+  assert reply.page is 1

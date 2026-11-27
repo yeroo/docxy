@@ -61,8 +61,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   with sync) keeps only the formats it copied.
 - The X11 tests each start their own `Xvfb -displayfd` (never `DISPLAY`, and
   never one display for two tests); with no Xvfb they skip with a note,
-  except under `CI`, where they fail. The app's global clipboard is never
-  opened by a test.
+  except under `CI`, where they fail. No unit test opens the app's global
+  clipboard. Only the `rich_clip_api` integration test does (#2303), with a
+  text no clipboard holds.
 - Wayland is #1966's (below); headless does nothing.
 - A document paste takes our clip, else the RTF, else the HTML, else the text
   (`doc_paste_from`, on every platform): a browser's copy has HTML and no
@@ -172,3 +173,69 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   and `cargo test -p gpui_linux --lib wayland::` (a path dependency outside
   the suite's workspace, which `exclude`s it; the vendored manifest has an
   empty `[workspace]`, so `cargo fmt --all` does not climb to the root one).
+
+## Images on the Linux clipboard (#2282)
+
+- gpui's `write_to_clipboard` of an item with a `ClipboardEntry::Image`
+  serves each image as its own mime (`ImageFormat::mime_type`), in entry
+  order, the first of each mime kept, in the vendored gpui_linux
+  (`suite/vendor/README.md`). The text mimes come only with text, or when
+  there is no image: an item of images alone offers no text (another app's
+  paste gets the image, not an empty string). A text item, and one with
+  neither text nor image (an empty `UTF8_STRING`), are written as before.
+  PRIMARY stays text only.
+- X11 (`x11/clipboard.rs`): `Clipboard::set_item` writes `item_data`'s list:
+  `UTF8_STRING` (`TARGETS` adds its two `text/plain;charset=` names, and a
+  request for either now gets its bytes, not a refusal) and the images'
+  atoms. `set_image` stores its own format, not always PNG. A
+  payload past one `ChangeProperty` (`maximum_request_bytes` less 1024, as
+  `rich_clip/x11.rs`) is left out of `TARGETS` and refused: sending it would
+  end `serve_requests` and every later copy with it. No `INCR` sending.
+- Wayland (`wayland/clipboard.rs`): `Clipboard::set` merges the images into
+  `OwnCopy`'s formats, so `send`, `mime_types`, `read_format` and
+  `add_formats`' merge serve them like RTF; `own_mime_types` leaves the text
+  mimes out for an item of images alone (`offers_text`), and gpui's write
+  offers that list. `send_internal` sets the reader's pipe non-blocking
+  (`set_non_blocking`) before writing: a blocking write of a big image held
+  gpui's main thread until the reader drained it.
+- Tests: X11's `x11/clipboard/tests.rs` against a reader on a private Xvfb
+  (`Inner::new(Some(display))`, the `Clipboard` built on it with no third
+  owner, so its `Drop` does nothing); Wayland's `formats.rs` rules and
+  `set_non_blocking` on a real pipe. The two clients' write calls and
+  `send_internal`'s use of it are untested: neither client builds headless.
+
+## The rich clipboard for library callers (#2303)
+
+- `suite/docxy/src/rich_clip.rs` is `pub mod rich_clip` of the `docxy_suite`
+  library, with two public entries for an extension tab kind or a binary on
+  the library that copies from its own view: `write_html(fragment, text)`
+  and `hand_over()`. Everything else in it (`write_rtf`, the readers,
+  `cf_html`, `html_page`, `html_fragment`, the `x11` module) stays
+  `pub(crate)` or private. Its docs link only public items, so
+  `cargo doc` raises no `private_intra_doc_links`.
+- A caller's rules, in `write_html`'s doc: write the text through gpui first
+  in this process (`cx.write_to_clipboard(ClipboardItem::new_string(text))`),
+  then call `write_html` with the same text, synchronously in the same
+  handler, on gpui's main thread. On Wayland, gpui_linux's client is a
+  main-thread `thread_local` (`wayland/client/rich_clipboard.rs`), so off
+  that thread, or while gpui's state is borrowed, the call does nothing. The
+  gate there is gpui's own latest copy, and going back to the event loop
+  first lets the compositor and a clipboard manager take the text-only
+  source. `fragment` is a fragment: the module wraps it in a page and CF_HTML
+  itself. On X11 the call blocks while it reads the selection back (up to
+  `WAIT`, 2 s, for each answer).
+- `hand_over` goes once at quit (`cx.on_app_quit`). Inside `docxy_suite::run`
+  it needn't, since `run` already calls it, and a second call only waits
+  again (100 ms at most). It does something only when the suite's X11
+  clipboard owns `CLIPBOARD`.
+- Under the UI harness the suite's own copies go to its private clipboard
+  (`main.rs` `ClipboardStore`, `if harness`), but an extension's
+  `write_to_clipboard` plus `write_html` reach the OS clipboard, so the
+  harness's `clipboard` reads never see them.
+- `suite/docxy/tests/rich_clip_api.rs` is a crate of its own that calls both
+  entries, so a `pub(crate)` slip fails to compile there. In CI (`xvfb-run`,
+  no `WAYLAND_DISPLAY`) it goes through the real X11 path with a text no
+  clipboard holds. Locally `guess_compositor` prefers a set
+  `WAYLAND_DISPLAY`, and `xvfb-run` keeps it, so run the X11 path with
+  `env -u WAYLAND_DISPLAY xvfb-run -a cargo test --manifest-path
+  suite/Cargo.toml --locked -p docxy-suite --test rich_clip_api`.

@@ -83,6 +83,24 @@ pdfcraft-annot = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51f
 pdfcraft-cos = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 pdfcraft-forms = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
 pdfcraft-model = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+# Convert to editable document with the layout (#2257), in the converting
+# child only (pdf_view/convert.rs): a page's paragraphs, pictures, ruled
+# lines and background (`-edit`), a picture's PNG or JPEG bytes (`-create`)
+# and the Word document made of them (`-export`). Same rev.
+pdfcraft-create = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-edit = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-export = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+# Print and export as drawn (#2258): the sheets a print job is made of
+# (`impose`, `layout`), page ranges and the papers, and the system's spooler
+# (CUPS, Windows) through craft-print (`-print`); a page range as a PDF of
+# its own (`-organize`'s `extract_pages`). Imposing, spooling and extracting
+# run in the PDF worker child; the parent only parses a typed range and
+# lists the printers. Same rev.
+pdfcraft-organize = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+pdfcraft-print = { git = "https://github.com/storytold/pdfcraft", rev = "eeee51ff7b805b52652a7e00305cc8cf91748239" }
+# A PDF's password (#2256), cleared from memory when the view lets go of
+# it (pdf_view/worker.rs `Secret`). In the lock through craft-pdf.
+zeroize = "1.9"
 
 # The plain AppKit menu bar a native dialog runs under (#1071, macos_menu.rs),
 # and the RTF a copy adds to the pasteboard (#1074, rich_clip.rs).

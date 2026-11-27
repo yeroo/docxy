@@ -165,13 +165,14 @@ test issue 2245 the PDF view writes nothing it did not change, and converts on r
   call real-key {"key":"backspace"}
   call pdf-read {}
   assert reply.page_count is 2
-  # Every File page a PDF view has opens; Info and Export are a document's.
+  # Every File page a PDF view has opens; Info is a document's. Its
+  # Export is its own (#2258: pages as PNG pictures or as a PDF).
   call backstage {"action":"open"}
   call backstage-page {"page":"new"}
   call backstage-page {"page":"open"}
   call backstage-page {"page":"account"}
   call-error backstage-page {"page":"info"} => the Info page is for a document tab
-  call-error backstage-page {"page":"export"} => the Export page is for a document tab
+  call backstage-page {"page":"export"}
   call backstage {"action":"close"}
   # Convert to editable document: the conversion a PDF opened as before.
   call pointer-click {"region":"pdf-convert"}

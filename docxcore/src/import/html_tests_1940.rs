@@ -201,7 +201,9 @@ fn a_body_card_is_laid_out_in_the_room_around_it_1940() {
         tp.contains(&format!(r#"<w:tblW w:w="{room}" w:type="dxa"/>"#)),
         "{tp}"
     );
-    assert!(tp.contains(r#"<w:tblInd w:w="360" w:type="dxa"/>"#), "{tp}");
+    // Word (no compatibilityMode) measures the indent to the cell's text:
+    // its 8px padding (120) is added, so the box lands at 24px (#2151).
+    assert!(tp.contains(r#"<w:tblInd w:w="480" w:type="dxa"/>"#), "{tp}");
     assert!(!tp.contains("<w:jc"), "{tp}");
     // In a centred `max-width` wrapper with no background (#2114).
     let d = doc("<div style='max-width:600px;margin:0 auto'>\

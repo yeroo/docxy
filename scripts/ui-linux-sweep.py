@@ -20,6 +20,7 @@ import argparse
 from dataclasses import dataclass, field
 import datetime
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -88,6 +89,28 @@ def script_editor(text):
             return words[1]
         return None
     return None
+
+
+def opens_pdf(text):
+    """Whether a terminal docxy script opens a PDF (#2259).
+
+    Terminal docxy draws a PDF's pages with docxy-pdf, the suite workspace's
+    child; such a script needs it built (`DOCXY_PDF`, see `pdf_child`).
+    """
+    if script_editor(text) != 'docxy':
+        return False
+    for raw in text.splitlines():
+        words = strip_comment(raw).split()
+        if len(words) >= 2 and words[0] == 'open' and words[-1].lower().endswith('.pdf'):
+            return True
+    return False
+
+
+def pdf_child(environ, suite, exe_suffix):
+    """The docxy-pdf terminal docxy's PDF viewer runs (#2259): `DOCXY_PDF`
+    when set, else the one the suite's workspace builds beside the suite."""
+    named = environ.get('DOCXY_PDF')
+    return Path(named) if named else suite.parent / f'docxy-pdf{exe_suffix}'
 
 
 def script_plugins(text):
@@ -389,7 +412,7 @@ def script_command(platform, script, uiharness, suite, term_bin, out):
     return [sys.executable, str(UI_LINUX), '--logs', str(out / 'x11'), '--'] + run
 
 
-def run_one(cmd, transcript_path, timeout):
+def run_one(cmd, transcript_path, timeout, env=None):
     """Run cmd with its output in transcript_path; return (exit code, timed out).
 
     ui-linux.py stays in our process group, so a Ctrl-C reaches it directly,
@@ -397,7 +420,7 @@ def run_one(cmd, transcript_path, timeout):
     cmd is uiharness itself, whose suite child `stop` ends with it.
     """
     with transcript_path.open('wb') as out:
-        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, cwd=REPO)
+        proc = subprocess.Popen(cmd, stdout=out, stderr=subprocess.STDOUT, cwd=REPO, env=env)
         try:
             return proc.wait(timeout=timeout), False
         except subprocess.TimeoutExpired:
@@ -504,6 +527,14 @@ def main(argv=None):
     for app in sorted(e for e in editors if e):
         needed.append((term_bin / f'{app}{exe_suffix}',
                        'cargo build --release -p docxy -p xlsxy -p yppxy'))
+    # Terminal docxy's PDF viewer draws in docxy-pdf (#2259), built by the
+    # suite's workspace; the harness's editor finds it through DOCXY_PDF.
+    env = dict(os.environ)
+    child = pdf_child(env, suite, exe_suffix).resolve()
+    env['DOCXY_PDF'] = str(child)
+    if any(opens_pdf(texts[p]) for p in here):
+        needed.append((child, 'cargo build --release --manifest-path suite/Cargo.toml '
+                              '-p pdfpages --bin docxy-pdf'))
     # A suite script's format plugins are built beside uiharness.
     plugins = {n for p in here for n in script_plugins(texts[p])}
     for name in sorted(plugins):
@@ -534,7 +565,7 @@ def main(argv=None):
         cmd = script_command(sys.platform, path, uiharness, suite, term_bin, out)
         began = time.monotonic()
         try:
-            code, timed_out = run_one(cmd, out / 'transcript.txt', args.timeout)
+            code, timed_out = run_one(cmd, out / 'transcript.txt', args.timeout, env)
         except KeyboardInterrupt:
             # Keep the scripts that finished: their summary is still written.
             print('interrupted')

@@ -1976,6 +1976,12 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
                 "pdf_tab",
                 Json::Bool(tab.is_some_and(|t| t.kind == crate::Kind::Pdf)),
             ),
+            // A PDF that could not be opened: why, as its body says (#2256).
+            (
+                "failed",
+                tab.and_then(crate::pdf_view::host::pdf_failed_reason)
+                    .map_or(Json::Null, Json::Str),
+            ),
         ]));
     };
     let pages = |key: &str| -> Result<Vec<usize>, String> {
@@ -2009,9 +2015,55 @@ fn pdf_read(app: &crate::Docxy, args: &Json) -> Result<Done, String> {
                 && !v.copy_waits()
                 && v.pending_save.is_none()
                 && (v.find.field.text.is_empty() && !v.want_all_text || v.unread_pages() == 0)));
-    let mut done = Done::ok(v.read_json())?;
+    let mut json = v.read_json();
+    if let Json::Obj(pairs) = &mut json {
+        // The last print job this harness instance wrote (#2258), and an
+        // export waiting for its save-as.
+        pairs.push(("printed".into(), last_print_job()));
+        let waiting = v
+            .export_waiting
+            .as_ref()
+            .map_or(Json::Null, |e| Json::Str(e.extension().into()));
+        pairs.push(("export_waiting".into(), waiting));
+        let names = v
+            .exported
+            .iter()
+            .map(|p| {
+                Json::Str(
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        pairs.push(("exported".into(), Json::Arr(names)));
+    }
+    let mut done = Done::ok(json)?;
     done.retry = (!settled).then(|| std::time::Duration::from_millis(within as u64));
     Ok(done)
+}
+
+/// The last job a harness instance printed (#2258): its `job-<n>.json`, as
+/// the worker wrote it, with `jobs`, how many there are; `null` before the
+/// first.
+fn last_print_job() -> Json {
+    let dir = crate::pdf_view::print::harness_spool(&crate::config_root());
+    let jobs = (1..)
+        .take_while(|n| dir.join(format!("job-{n}.json")).exists())
+        .count();
+    if jobs == 0 {
+        return Json::Null;
+    }
+    let read = std::fs::read_to_string(dir.join(format!("job-{jobs}.json")))
+        .ok()
+        .and_then(|t| Json::parse(&t).ok());
+    match read {
+        Some(Json::Obj(mut pairs)) => {
+            pairs.push(("jobs".into(), Json::Num(jobs as f64)));
+            Json::Obj(pairs)
+        }
+        _ => Json::Null,
+    }
 }
 
 /// The test extension's view on the active tab (#1873): refused unless the
@@ -5473,6 +5525,11 @@ fn sheet_editing_json(o: &gridcore::options::EditOptions) -> Json {
 /// not.
 fn load_failure(app: &crate::Docxy) -> Option<String> {
     let t = app.tabs.get(app.active)?;
+    // An encrypted PDF that asks for its password (#2256) opened as far as
+    // it can without it: its prompt is the tab.
+    if matches!(&t.surface, crate::Surface::Pdf(v) if v.lock.is_some()) {
+        return None;
+    }
     load_failed(&t.status).then(|| t.status.to_string())
 }
 
@@ -8036,10 +8093,13 @@ fn dispatch_verb(
                 }
                 "account" => app.open_account(cx),
                 "export" => {
-                    if !app.active_is_doc() {
-                        return Err("the Export page is for a document tab".into());
+                    if app.active_kind_is_pdf() {
+                        app.backstage_rail_action(crate::BackstageRailAction::PdfExport, window, cx)
+                    } else if !app.active_is_doc() {
+                        return Err("the Export page is for a document or PDF tab".into());
+                    } else {
+                        app.backstage_rail_action(crate::BackstageRailAction::ExportDoc, window, cx)
                     }
-                    app.backstage_rail_action(crate::BackstageRailAction::ExportDoc, window, cx)
                 }
                 "open" => app.show_backstage_open_page(),
                 // The rail's Close item (#806: with no tab it does nothing).
@@ -8266,6 +8326,33 @@ fn dispatch_verb(
                         return Err("this tab has never been saved, so a relative 'path' has no folder: give an absolute path".into());
                     }
                 };
+                // An export waiting for its file (#2258): this names it, as
+                // the Save dialog would.
+                // The name is checked before the export is taken: a refusal
+                // keeps it waiting (#2258 r1).
+                if let Some(waiting) = app.active_pdf().and_then(|v| v.export_waiting.clone()) {
+                    let (target, _) = crate::pdf_view::print::export_target(target, &waiting)?;
+                    if target.exists() && !overwrite {
+                        return Err(format!(
+                            "{} already exists; pass \"overwrite\": true to replace it",
+                            target.display()
+                        ));
+                    }
+                    let Some(export) = app.active_pdf_mut().and_then(|v| v.export_waiting.take())
+                    else {
+                        return Err("the export is no longer waiting".into());
+                    };
+                    let kind = export.extension();
+                    app.pdf_export_to(export, target.clone())?;
+                    cx.notify();
+                    let tab = &app.tabs[app.active];
+                    return Done::ok(Json::obj(vec![
+                        ("path", Json::Str(target.display().to_string())),
+                        ("queued", Json::Bool(true)),
+                        ("export", Json::Str(kind.into())),
+                        ("status", Json::Str(tab.status.to_string())),
+                    ]));
+                }
                 let target = crate::pdf_view::host::pdf_save_as_target(target)?;
                 if target.exists() && !overwrite {
                     return Err(format!(

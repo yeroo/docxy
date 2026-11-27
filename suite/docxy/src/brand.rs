@@ -533,6 +533,16 @@ mod tests {
             "docxy's Backstage Save As file name",
             "a terminal docxy editor's input",
         ),
+        (
+            "inputs.rs",
+            "docxy-pdf-page",
+            "a terminal docxy editor's input id",
+        ),
+        (
+            "inputs.rs",
+            "docxy's PDF viewer: Go to page",
+            "a terminal docxy editor's input",
+        ),
     ];
 
     /// Generated files' headers the guard lets through, by file and the

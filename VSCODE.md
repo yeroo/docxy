@@ -57,6 +57,8 @@ into the editor tab unchanged, for both formats.
 | [`offxy-vscode/src/extension.ts`](offxy-vscode) | TypeScript | the extension host: a registration table of binary `CustomEditorProvider`s (`offxy.docxEditor`, `offxy.gridEditor`) |
 | [`offxy-vscode/media/webview.js`](offxy-vscode) | JavaScript | the Word webview: `docxwasm` loader, grid painter, input handling |
 | [`offxy-vscode/media/grid.js`](offxy-vscode) | JavaScript | the Excel webview: `gridwasm` loader, virtualized spreadsheet grid, formula bar, sheet tabs |
+| [`suite/pdfpages`](suite/pdfpages) | Rust `cdylib` | `pdfpages.wasm`: the desktop suite's PDF renderer (PdfCraft's `pdfcraft-render`) behind a hand-written ABI (#2259) |
+| [`offxy-vscode/media/pdf.js`](offxy-vscode) | JavaScript | the PDF webview (`offxy.pdfViewer`, read-only): pages drawn by `pdfpages.wasm` in a worker (`pdfhost.js`, `pdfworker.js`, `pdfengine.js`) |
 
 ## The wasm ABI
 
@@ -184,6 +186,22 @@ Word next steps, roughly in order:
 
 1. **Color / font pickers** over the `color` and `fontsize` bridge commands.
 2. **Table structure editing** (add/delete rows and columns).
+
+### PDF (`offxy.pdfViewer`, #2259)
+
+A `.pdf` opens read-only: its pages stacked at their own size, drawn near
+the viewport at the zoom times the device pixel ratio (within the suite's
+4096 px / 16 MP caps), zoom in and out, fit width, and a page box. The engine
+is `pdfpages.wasm` (`suite/pdfpages`, built with the suite workspace's `wasm`
+profile by `npm run build:wasm`), the desktop suite's renderer. WebAssembly
+cannot unwind, so a panic, the engine's 1 GiB memory cap or a stack overflow
+traps its instance: it runs in one worker per view, and a page that traps or
+takes longer than 20 s ends that worker, says why in its frame, and a new
+worker opens the file again. The module imports only wasm-bindgen's
+placeholders (getrandom's browser backend, which only writing an encrypted
+file would call); each is a stub that throws. `npm run test:pdf` checks the
+module and the worker host in Node. No password prompt, links, select, Find
+or print yet: those are the desktop suite's.
 
 ### Excel (`offxy.gridEditor`)
 

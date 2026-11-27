@@ -1,7 +1,10 @@
 # PDF view
 
 Notes for the suite's PDF view: opening a PDF as it looks; its links,
-comments and form, the only thing it writes back (#2255).
+comments and form, the only thing it writes back (#2255); encrypted,
+updated and damaged files (#2256); converting it to an editable document
+with its layout (#2257); printing and exporting it as drawn (#2258); and
+the same renderer for terminal docxy and the VS Code extension (#2259).
 
 ## PDF view: the renderer and its patch table (#2245)
 
@@ -24,7 +27,13 @@ comments and form, the only thing it writes back (#2255).
   `/Annots`, for Hidden flags), same rev; they bring `-content`, nothing to
   patch. `stream_limited` is `pub(crate)` in craft-pdf, so `incremental` in
   `info` reads the public `reconstructed`, `encryption_changed` and
-  `full_save_required` only. Not used yet: `-crypt`, `-print`, `-export`.
+  `full_save_required` only. Not used yet: `-crypt` (`-print`: #2258).
+- Slice 4 (#2257) adds `-edit`, `-create` and `-export`, same rev, for the
+  conversion; no patch entry (their craft-libs crates are git
+  dependencies, PdfCraft's root patches crates.io only). `-edit`'s
+  `icu_segmenter` 2.3 moved the lock's icu family from 2.2 to 2.4 (gpui's
+  `url` shares it); `-create` brings `jpeg-encoder` (IJG, credited in
+  NOTICE).
 
 ## PDF view: the worker child (#2245)
 
@@ -198,3 +207,383 @@ comments and form, the only thing it writes back (#2255).
   `python3 scripts/make-pdf-view-corpus.py links annots annots-noap forms
   signed` to write only them; the slice 1 files are not written byte for
   byte again by cairo and gs.
+
+## PDF view: encrypted, incremental and damaged files (#2256)
+
+- Protocol 3: `unlock {password}` (`Op::Unlock`, `Worker::unlock`); `info`
+  or `unlock` answers `locked: needs|wrong` (`Answer::Locked`) only for
+  PdfCraft's `NeedsPassword`/`WrongPassword`; anything else (an
+  unsupported handler) is a failure with its reason, never the prompt.
+  `DocMeta.security` (`SecurityMeta`: cipher, owner, the permissions) for
+  an encrypted file.
+- The child opens the working copy first with the typed password (user or
+  owner), then gives the renderer `recovered_user_password()` when there is
+  one (`doc.rs` `render_password`): hayro authenticates only the user
+  password of revisions 2-4 (RC4, AES-128), so an owner password typed for
+  one of those is refused by `inspect` without it (PdfCraft's engine does
+  the same, `render_password_for`). The display copy is written with the
+  file's own encryption, so the renderer takes the same password for it.
+  `saved` reopens with `open_with_same_credentials` (the key, no password).
+- `Secret` (`zeroize::Zeroizing<String>`): `Debug` is `Secret(..)`, cleared
+  on drop; the request line holding it is cleared after its write. It goes
+  on stdin only. The parent holds it only in that view's `Worker`, which
+  sends `unlock` first in `connect` to every new child, before the form
+  replay (so the clean child after a failed replay is unlocked too).
+  The prompt's typed text moves into the `Secret` on a try, is cleared when
+  the `PdfLock` drops, is never cloned to draw (bullets from its length),
+  and a pasted line is cleared after its insert. Not cleared: the freed
+  buffers typing leaves behind as the field's `String` grows
+  (`field_edit`'s inserts reallocate), the clipboard's own copy, and
+  PdfCraft's copies (`LoadOptions`, `RenderConfig`'s `Arc<str>`).
+- Permissions: shown (status `; restricted: printing, copying, changes`,
+  `pdf-read` `permissions`), not enforced, but for filling: a file whose
+  password does not allow `fill_forms` has every field read-only, and the
+  child refuses `set-field(s)` (`NO_FILLING`) whatever sends it.
+- The view: a locked file is a `Surface::Pdf` whose `PdfView::lock`
+  (`PdfLock`: the `Worker`, the masked `Field`, `wrong`) is set and that
+  has no pages and no `Engine` (not a `Surface` of its own: every PDF arm
+  already handles it). Its body is the prompt (`pdf-password`, `pdf-unlock`
+  probes); `try_unlock` is synchronous, as the open is; the field is
+  emptied each try. `pdf_tick` skips a locked view, so `restore_page` and
+  `zoom` (the session's `PdfAt`) wait for the pages; Save refuses
+  (`PDF_NOT_OPEN`); the harness's `open` takes a locked view as opened.
+  `field-read {"input":"pdf-password"}` says only `focused` and `empty`.
+- On Linux the child's `run` (never `serve`, the in-process path) sets
+  `RLIMIT_DATA` to `MEMORY_LIMIT` and `RLIMIT_CORE` to 0 (`limit_memory`):
+  an allocation past it aborts the child, and the parent fails the page.
+  The `limits` test child reads them back from `/proc/self/limits`.
+- A failed PDF tab draws "This PDF can't be opened" and its reason
+  (`pdf_failed_reason`: the status line, so Save and Save As refusals,
+  `note_save_refusal`, leave a failed PDF tab's status alone; `main.rs`
+  `pdf_failed_body`); `pdf-read` gives it as `failed`. A try the reader
+  cannot answer leaves the tab `PdfPending` with `load_failed` where the
+  view was (`unlock_tab`), as a restored tab whose file cannot be read. The
+  harness's `open` refuses a failed load by design, so no case opens
+  `damaged-unreadable.pdf`.
+- PdfCraft finds the objects of a file whose xref offsets are only wrong
+  without a rebuild (no repair log): its save appends. One with no xref or
+  trailer is rebuilt from its object headers and saved in full.
+- Corpus: `enc-*`, `incremental`, `objstm`, `damaged-*` (README there);
+  every one but `damaged-unreadable` has a reference, the damaged ones drawn
+  from the file before its damage. The mutation test adds them (encrypted
+  ones unlocked) and `structural` mutations; `a_flate_bomb_answers_in_time`
+  makes its bombs in the test (`zero_bomb`).
+
+## PDF view: convert to an editable document with the layout (#2257)
+
+- `pdf_view/convert.rs`, run by the converting child's `What::Pdf`
+  (`convert_child::convert_bytes`; the child sets the worker's
+  `limit_memory` for a PDF): `read_pages` builds `pdfcraft_export::Page`s
+  as `pdfcraft-engine`'s `export_pages_within` does (the engine crate is
+  not used: it brings JS, OCR and signing), copying the engine's
+  `pub(crate)` `weight_and_slant` and `display_unit`; pictures through
+  one `ImageBudget`, within `docxcore::import::html_image`'s
+  `MAX_IMAGE_BYTES`/`MAX_MEDIA_BYTES` (the suite loads the result).
+  `docx_with_language` writes the document; it is loaded with
+  `load_package` and becomes `ConvertedDoc { doc, base: Some(pkg) }`.
+- `convert_with` runs that step in `catch_unwind`: an error, a panic or a
+  file that keeps nothing (no text, no picture: a blank PDF stays a `load
+  error`) goes to the text importer (`import_pdf`, #951), whose encrypted
+  message covers a file that needs its password (the convert child has
+  none; an owner-only file converts). Tests inject the step.
+- Time and memory (r1, r2): the layout step's `Limits` from its start.
+  Reading (after `inspect`, each page, each picture, before the export)
+  stops at `READ_TIME` (8 s); the export and its loading are checked after
+  each against `DONE_TIME` (12 s); more than `MAX_LAYOUT_BLOCKS` (20,000)
+  text blocks stops it at once. Each gives an `Err` and the text importer
+  runs in the same child. Measured in release on this laptop: 300 pages of
+  text read in 0.5 s, 600 in 1.6 s (reading grows faster than the pages;
+  the export, load and save of those under 0.2 s); 300 pages of table
+  cells (86,700 blocks) export in 0.3 s, load in 7.0 s, save in 0.6 s,
+  about 0.1 ms a block, so the cap keeps that to about 2.3 s; the text
+  importer took 0.2 s on each. Not bounded: one page or one `inspect` that
+  alone runs past the 20 s (PdfCraft's own decode budgets bound them), and
+  the work after `DONE_TIME`'s last check (the passes and the child's
+  save, about 0.1 s for 20,000 blocks). Then the parent kills the child,
+  and the tab says it took too long; that is not retried, as the suite
+  waits on its UI thread. An abort (an allocation past `limit_memory`'s
+  `RLIMIT_DATA`, which `catch_unwind` cannot reach) kills the child: the
+  parent (`convert_child::convert`, `retrying`) tries a PDF whose child
+  died (`DIED`) once more as `What::PdfText` (`--convert-import
+  pdf-text`, `import_pdf` alone, no limit set), within what is left of
+  the same `TIMEOUT` (none under `RETRY_MIN`, 1 s).
+- Running headers and footers (`convert/running.rs`), on the pages before
+  the export: an unrotated block wholly in the top or bottom 12 % whose
+  text, with digit runs as `#`, repeats on at least 2 and more than half
+  the pages, middles within 6 pt and an edge (left, centre, right) within
+  12 pt, and each digit run the same on every page, each page's number or
+  the page count (a date cell, an amount or a count not starting at 1
+  stays in the body). Removed from every page; the first page's pieces
+  become a header and a footer part (Header/Footer style, centre and
+  right tab stops of the text width, hand-written run XML in schema
+  order), referenced from
+  the first section only; digit runs that are each page's number are
+  `PAGE`, the page count `NUMPAGES`. No running piece on page 1 of 3 or
+  more pages: `w:titlePg` with empty first-page parts. `pgMar
+  w:header/w:footer` from the pieces' positions.
+- Columns (`convert/columns.rs`): PdfCraft flows every page as one column,
+  and takes lines side by side at shared baselines for a table (its
+  `tables()` clusters short blocks' left edges). So a page in 2 or 3
+  equal columns (gutters at least `max(12 pt, body)` in the middle 80 %;
+  each band a fifth of the text height and half filled; no rule in the
+  region) is split before the export into **virtual pages**: the band
+  above (the real page's size), then the region with its columns stacked
+  on a page whose PdfCraft text area (`min(w/8, 1 in)` margins) is one
+  column wide. One section per virtual page comes out; the region's gets
+  `w:cols`, a continuous start and the real page's `pgSz`/`pgMar` back.
+  Where a column begins is its highest block or picture; a block above
+  where every column has begun is lifted into the band (a heading over
+  the first column; from another column only when the band's own text is
+  over it), never a column's last block.
+  The export sizes headings against each virtual page, so a band's
+  paragraphs get their level again against the real page's body
+  (`heading_level`, PdfCraft's `level` rule). A positioned page
+  (`positioned`, copied: rotated text, overlaps), text between column
+  runs, unequal or more columns stay as PdfCraft flows them. The section
+  break is PdfCraft's own 1 pt paragraph.
+- Fonts and colours: `pdfcraft_export::Block` has no font. Each block's
+  colour is replaced by a unique code (`code_color`, 1 to 2^24 - 1, never
+  black) before the export, which only copies colours (`chr`, a cell's
+  colour); after loading, every coded run (body, cells, text boxes,
+  hyperlinks) gets its block's real colour (none for black) and
+  `fonts::family` (PdfCraft's `font_family`, then the base 14 as Word's
+  Arial/Times New Roman/Courier New, DejaVu's installed names). A text
+  box is written twice (DrawingML and a VML `mc:Fallback`) and docxcore
+  saves edited blocks into the first copy only, so `twin_copies` rewrites
+  every identical copy with `blocks_to_xml`. The tests check the saved
+  file's every part for a code colour.
+- Corpus: `convert.pdf` (RawPdf, README there), checked by what it
+  converts to, before and after a save and reload; `columns.pdf`,
+  `scanned.pdf` and `rotated.pdf` (a positioned page) too, and every corpus
+  file converts or says why in time. It is in the worker's mutation test
+  (`UNREFERENCED`).
+- Not done: links as hyperlinks, form values as text, footnotes,
+  even/odd headers, floating pictures, unequal or more than 3 columns,
+  text below columns, fonts by metrics, page numbers that do not start at
+  1 as a field; a page whose forms run past PdfCraft's reading limits, or
+  a picture past the budgets, converts without it and says nothing
+  (`export_pages_within`'s `truncated` is not carried across the child);
+  converting in terminal docxy or VS Code (#2259 views only).
+
+## PDF view: print and export (#2258)
+
+- Crates (same rev, no patch entry): `pdfcraft-print` (`impose`, `layout`,
+  `select_pages`, `PAPERS`, `matching_paper`, `paper_media_option`,
+  `add_cups_orientation`, `spool::{printers, submit, lp_args}`,
+  `printer_default_paper`; through craft-print and craft-cms at craft-libs
+  `e2dc681a3`) and `pdfcraft-organize` (`extract_pages`). craft-print has
+  an **unconditional** git dependency on storytold/winprint.rs
+  (`craft-winprint-gdi`, a source of its own in the lock even on Linux);
+  `winprint` (twice: craft-print's rev and pdfcraft-print's) and its
+  build-dependencies (reqwest, sigstore, aws-lc) are Windows only.
+  `suite/docxy/build.rs` delay-loads `windows.data.pdf.dll` and
+  `prntvpt.dll` (`rustc-link-arg`, every executable: the tests link
+  winprint too), as PdfCraft's apps do; not buildable on Linux.
+- Protocol 4 (`worker.rs`): `print {job}` (`PrintJob`, our serde mirror of
+  `Settings` and `spool::Job`: pages 0-based, paper name and size,
+  `Sizing`, `Orient`, `PrintContent`, printer, copies, title, `Spool`),
+  `png {page, dpi}` and `extract-pages {pages}` (bytes after the line);
+  the parent's `Op::ExportTo {export, path}` asks the child per page
+  (each PNG its own request and timeout) and writes every file or none
+  (r2: one file, a PDF or a page's PNG, through `fsio::export_atomic`;
+  several through `Staged`, by fsio's rules (`write_destination`: a
+  symlink writes its target, a read-only file is refused up front, the
+  replaced file's permissions kept; `temp_sibling`: exclusive temporary
+  names never shared between writers). Each page is written and synced
+  as it comes, so the suite holds paths, not pictures. `commit` renames
+  in order, a file already at a name moved aside first but at the last
+  name, whose rename replaces it atomically; on a failure it puts every
+  done name back, best effort, and the error says where a file it could
+  not put back is; a file moved aside that cannot be removed after is
+  named in the status (`Exported::left`). The temporary files go on drop;
+  the same file twice is refused.) A page named twice is one picture
+  (`distinct`, where the export is built). No export replaces the PDF the
+  view reads (`EXPORT_OVER_ITSELF`, `fsio::same_file`).
+  `Op::timeout`: print and extract get `JOB_FACTOR` (3) × the child's
+  timeout, in the parent's `exchange` and in the child's watchdog
+  (`Busy` holds each request's limit, twice it). A print or export goes
+  in `form_ops` (after the fills before it, before any page); the view's
+  pages wait while it runs (one question at a time).
+- The child (`worker/doc.rs` `output`): refuses pages past its own count;
+  then the permissions, as PdfCraft's engine (`NO_PRINTING` `print()`,
+  `NO_COPYING` `copy()` for a PNG, `NO_EXTRACTING` `extract_pages()`, which
+  is assembly and copying); a file only the renderer reads (no working
+  copy) refuses too (`NOT_READ`), never the raw bytes. `shown()` is the
+  display document (`with_field_appearances_cached(
+  with_missing_appearances_cached(cos))`, or `cos`): the display copy's
+  bytes are written from it, and print and extract take it, so unsaved
+  values and PdfCraft's appearances print. Print: `impose`, `layout` (the
+  pages' `display_size`, as `impose` reads them) for
+  `add_cups_orientation` (CUPS only: nothing on Windows, whose print
+  ticket turns each sheet), the job's options `paper_media_option` (as
+  PdfCraft's Print dialog), `Scaling::Exact`, duplex left to the printer.
+  PNG: dpi clamped 18–1200 and capped by `effective_scale` (the answer
+  says the dpi drawn; the status says so when lower). `extract_pages`
+  output is never encrypted (`Document::new_empty`).
+- The parent (`print.rs`, `output.rs`): Ctrl+P (`is_print_chord`, before
+  the PDF keys, on any `Kind::Pdf` tab) and File > Print (`bs-pdf-print`)
+  list the printers on a thread of their own (`discover`: `lpstat` and the
+  PPD take seconds), then open `pdf-print`; never on the view's worker
+  thread. The range is parsed in the parent (`select_pages` with `info`'s
+  labels, `PrintError::said(in_english)`); typing a range picks Pages, a
+  percent Custom scale (`react`, which reads the control's new value: the
+  dialog hands it the old one). Paper: the printer's default paper, else
+  the first page's `matching_paper`, else US Letter. File > Export
+  (`bs-pdf-export`, the `bs_export` page drawn by `pdf_export_page` on a
+  PDF tab) has tiles `pdf-export-png` / `pdf-export-pdf` (probes), each a
+  dialog (`pdf-export-png`: pages, 72/150/300/600 dpi; `pdf-export-pdf`)
+  then the native Save dialog (`with_extension`, shared with Save As's
+  `pdf_save_as_target`: the extension added, any other refused;
+  `picked_export_target` refuses a name the extension was added to that
+  is a file already). PNG names: one page the name picked, several
+  `<stem>_Page_<n>.png` zero-padded to the highest page's digits
+  (`png_names`); one of those taken (but the picked one) refuses all.
+  The rail filter has `pdf_only` (`backstage_rail_items(project, doc,
+  pdf)`); a PDF tab not open refuses with `PDF_NOT_OPEN_OUTPUT`.
+- Harness: never spools. Its printers are `harness_printers` (Test
+  Printer, the default, and Second Printer), its jobs `Spool::Dir`
+  `<config root>/print-jobs` (`job-<n>.pdf`, `job-<n>.json` with the job,
+  `options` and `lp_args`); `pdf-read` adds `printed` (the last job's
+  JSON and `jobs`), `export_waiting` and `exported` (the last export's
+  file names). An export's Save dialog is the `save-as` verb: Save… keeps
+  the export on the view (`export_waiting`), and `save-as` on that tab
+  writes it instead of a Save As (one queued export, one path); a name it
+  refuses keeps the export waiting. `printers_arrived` opens the dialog
+  only on the tab in front and clears "Looking for printers…" either way.
+  `uiharness/cases/pdf-print.uit`.
+- Tests (`pdf_view/print_tests.rs`): sheets' size per paper and
+  orientation, the order chosen, sizing measured on the sheet as drawn
+  (ink width), Actual size on paper the page's size against the corpus's
+  `ref/` (the block test, `text` and `rotated`), unsaved values in the
+  print and the PDF, Form fields only and Document, permissions on
+  `enc-owner-only` and `enc-aes-128` (user and owner), PNG sizes and the
+  72-dpi PNG against `ref/`, export names and all-or-none, the job file;
+  `worker/tests.rs`: a print past a page's timeout answered, a hung one
+  given up at its own deadline; the mutation test prints and exports the
+  originals and the first `OUTPUT_MUTATIONS` (7) mutations of each file.
+- Not done: print preview, pages per sheet, booklet, poster, print as
+  image, grayscale, duplex choice, printer properties; lifting an
+  owner-only file's restrictions (no UI takes its owner password);
+  printing documents, sheets or projects; printing from terminal docxy
+  or VS Code (#2259 views only).
+
+## Terminal docxy and the wasm editors (#2259)
+
+- `suite/pdfpages`, a suite-workspace member (the PdfCraft rev, lock and
+  patch table are the suite's; no new lock entry but its own), is the one
+  core: `Doc` answers `info` (pages' displayed size and label, the outline
+  flattened, the title), `pixels(page, scale)` (straight RGBA over white,
+  within the suite's 4096 px / 16 MP caps by `capped_scale`) and
+  `text(page)` (`PageText::plain_text`, reading order), from
+  `pdfcraft-render` alone. No password, link, form, annotation (but what
+  hayro draws), Find, select or print: those are the suite's.
+- Terminal docxy cannot link PdfCraft: the root workspace's MSRV is 1.88,
+  and docxy is published to crates.io, which refuses a git dependency even
+  optional. So **`docxy-pdf <file> [<ms>]`** (`pdfpages/src/bin`,
+  `pdfpages::child`) serves it, protocol 1: a hello line
+  `{"hello":"docxy-pdf","protocol":1}`, then one JSON line per request
+  (`info`, `pixels {page, scale}`, `text {page}`) and per answer
+  (`{"ok":false,"error","locked"}` for a failure; RGBA after a pixels line,
+  `len` bytes). It is the suite worker's rules without its code (the suite
+  crate is gpui): the watchdog at twice the timeout, `RLIMIT_DATA` 2 GiB
+  and `RLIMIT_CORE` 0 and `oom_score_adj` 1000 on Linux. Its protocol is
+  its own, not the suite's `--pdf-worker` (forms, print, protocol 4).
+- Terminal docxy (`docxy/src/pdf_view.rs`, `pdf_view/child.rs`): `main`
+  sends a PDF by its bytes (`opens_as_pdf`: `%PDF-` in the first 1 KB,
+  never a `.md` or web page by `format_for`, a `.pdf` without it goes the
+  old way) to `pdf_view::run`, its own loop beside `App`; `--pdf|--md|
+  --docx|--html` with a PDF input exit 2 (`headless_refusal`). `Child`
+  finds `docxy-pdf` as `$DOCXY_PDF`, beside `current_exe`, or on `PATH`
+  (`find_child_in`); stderr is null (it would draw over the viewer), lines
+  before the hello are skipped, one question at a time on `Engine`'s
+  thread, `recv_timeout` 20 s; a timeout, death or nonsense kills it, the
+  question answers why, the next starts a new child. A page that failed is
+  never asked again (`failed`). No child (none found, or `Ans::NoChild`: it
+  cannot be started) or a reasoned `Failed` on `info` (`Next::TextOnly`):
+  `TextOnly` runs `import_pdf` (#951) on the engine thread and shows its
+  text as one stream; the status gives why, and `HOW_TO_GET_PAGES` only
+  when there is no child (`t` repeats it). A child that died (`DIED`) or
+  ran out of time (`TOO_LONG`) opening the file: the reason, no text (the
+  file is not read again in docxy's process). A locked file says `LOCKED`
+  (no prompt). A panic in a source answers `DIED` (`Engine` catches it; the
+  panic hook leaves the engine thread's alone). Quitting, or dropping the
+  `Engine`, kills the child through its shared `Killer`, mid-question too.
+  The hello wait has one deadline. Every text drawn (a page's, a reason,
+  the file name) goes through `clean_text`/`clean_line`: C0/C1 controls and
+  DEL become U+FFFD, `\r` is a line break, tabs expand to 8, bidi controls
+  and invisible format characters are dropped.
+- The viewer: Image mode when the `Picker` has a protocol (not
+  Halfblocks), Text otherwise; `t` toggles (Halfblocks pages too), `w` fit
+  page / fit width (Up/Down scroll; a fit-width raster is cropped to the
+  viewport per step, never asked again), PgDn/Space/n/Right,
+  PgUp/p/Left, Home/End, `g` + digits + Enter (`docxy-pdf-page`, #2259 in
+  `suite/docxy/src/inputs.rs`), q/Esc/Ctrl+Q. A raster is asked at the
+  body's pixel size (`font_size` x cells), keyed by `Want` (page, fit,
+  box); 4 kept. The shown page is asked first, then the next. No F1, theme
+  or prefs.
+- Its control server (`control::control_dir`/`instance_name`, as `App`)
+  answers `field-read` (`ctlcore::field` counters; every key counted, a
+  frame after each) and `pdf-read` (`pages`, `page`, `label`, `mode`,
+  `fit`, `scroll`, `source` child|text-only, `status`, `unopened`,
+  `failed`, `drawn`, `busy`, `outline`, `lines`: the body's text rows);
+  `{"until_idle":true}` replies once nothing is pending, at most 5 s. Any
+  other verb is refused. The harness's terminal `open` of a `.pdf` in docxy
+  waits on it (`term::waits_for_pdf`), so a case's first key finds the
+  pages read.
+- VS Code: `offxy.pdfViewer` (`src/pdfviewer.ts`, a
+  `CustomReadonlyEditorProvider`, `*.pdf` at priority `default`) posts the
+  bytes to `media/pdf.js`. **wasm32 has no unwinding**: a panic, the memory
+  cap or a stack overflow traps and leaves the instance unusable, and a
+  slow page would block the webview. So the engine runs in one blob Worker
+  per view (`pdfengine.js` + `pdfworker.js`; the main thread compiles the
+  module and posts it; CSP `worker-src blob:`), behind `pdfhost.js`: one
+  request at a time, 20 s each (the open too); past it, or on a trap or a
+  dead worker, the worker is ended, the page shows why and is not asked
+  again, and a new worker opens the same bytes. A worker that dies opening
+  the file is not started again. Pages are stacked at their size, drawn
+  near the viewport (IntersectionObserver, `100%` margin; far pages give
+  their canvas back) at zoom x devicePixelRatio; fit width follows the
+  view's width (ResizeObserver: the scrollbar's arrival too).
+- `pdfpages.wasm`: the hand-written ABI (`abi.rs`, docxwasm's style,
+  length-prefixed answers; `pdf_render` is `[u32 w][u32 h][RGBA]` or zeros
+  and why) is built on every target, so native clippy and tests cover it.
+  `build.rs` caps linear memory at 1 GiB (`--max-memory`).
+  `[profile.wasm]` (opt-level `s`, LTO, one codegen unit, stripped, abort)
+  leaves the suite's release alone; `build:wasm` builds it and
+  `copy-wasm.mjs` copies `suite/target/wasm32-unknown-unknown/wasm/`.
+  PdfCraft builds for wasm32 as it is (its `Stopwatch` and getrandom's
+  `wasm_js` are there for it). Its only imports are getrandom's
+  wasm-bindgen placeholders (lopdf's `rand`, for writing encrypted files);
+  getrandom 0.4 cannot switch backend with `wasm_js` on, so each import is
+  a throwing stub (`stubImports`), and the module carries js-sys's 1,366
+  unused `__wbindgen_describe_*` exports (the wasm-bindgen CLI would strip
+  them; not used, to keep the ABI hand-written).
+- Measured (this laptop, 22 cores): `docxy-pdf` clean release build 70 s,
+  10.1 MB stripped (the release step strips it: the suite profile's line
+  tables make it 79 MB); `pdfpages.wasm` 6.90 MB, 2.39 MB gzipped at `s`
+  (`z`: 6.73 / 2.33 MB, 30 % slower on the corpus); the VSIX 2.94 MB to
+  5.36 MB.
+- Tests: `pdfpages` (page 1 of each referenced corpus file against
+  `ref/` in the suite's block tolerance, text order, sizes and outline,
+  locked and unreadable files, the ABI natively; `tests/child.rs` the built
+  child end to end, its Linux limits read from `/proc`, every corpus file
+  and 21 mutations of each); docxy's `pdf_view::tests` (state, keys,
+  drawing, verbs on fake answers; the client against the test binary as a
+  fake child; `real_child_*`, ignored unless `DOCXY_PDF`, which CI's
+  `suite-linux` runs, the only place both halves of the protocol meet);
+  `offxy-vscode/media/pdf.test.mjs` (the import list, the corpus with no
+  stub called, a trap past the cap and a fresh instance, `pdfhost.js` with
+  fake workers); `uiharness/cases/terminal-docxy-pdf.uit` and the
+  `docxy-pdf-page` cases in `terminal-docxy-inputs-typing.uit` through the
+  real child (the sweep sets `DOCXY_PDF` to the `docxy-pdf` beside
+  `--suite`, `pdf_child`).
+- Shipping: the release `build` matrix builds `docxy-pdf` stripped and
+  ships `docxy-pdf-<suffix>` beside `docxy-<suffix>` (renamed `docxy-pdf`
+  to be found); `tui.iss` installs it (`PdfSrcDir`); the macOS CLI tarball
+  has it. `cargo install docxy` users build it from `suite/`.
+- Not done: a password prompt, links, select/copy, Find, outline
+  navigation, print and convert in the terminal and VS Code; the
+  JetBrains plugin (Chicory runs wasm in the JVM, Swing draws: the same
+  module would load, the viewer is its own work); the editable-HTML page;
+  tiles past the caps; `NOTICE` is not bundled in the VSIX or the CLI
+  downloads (nor in the suite's installers).

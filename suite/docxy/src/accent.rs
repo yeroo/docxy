@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use docxy_integration::protocol::Rgb;
 
-use crate::{BRAND, FILE_FG, Kind, brand, ext_kinds};
+use crate::{BRAND, FILE_FG, Kind, ext_kinds};
 
 static FILL: AtomicU32 = AtomicU32::new(BRAND);
 static ON_FILL: AtomicU32 = AtomicU32::new(FILE_FG);
@@ -33,8 +33,8 @@ pub(crate) struct Drawn {
 
 /// The roles of `accent` ([`for_tab`]): `accent` in each, white text on its
 /// fill, except that the brand takes each colour the plugin gives that the
-/// suite takes ([`brand::accents`]).
-pub(crate) fn drawn(accent: u32, plugin: &brand::Accents) -> Drawn {
+/// suite takes ([`crate::brand::accents`]).
+pub(crate) fn drawn(accent: u32, plugin: &crate::brand::Accents) -> Drawn {
     let mut d = Drawn {
         fill: accent,
         on_fill: FILE_FG,
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn the_brand_takes_the_plugins_roles_and_a_types_accent_stays() {
         use docxy_integration::accent::Accepted;
-        let none = brand::Accents::default();
+        let none = crate::brand::Accents::default();
         let own = Drawn {
             fill: BRAND,
             on_fill: FILE_FG,
@@ -184,7 +184,7 @@ mod tests {
             text: BRAND,
         };
         assert_eq!(drawn(BRAND, &none), own);
-        let plugin = brand::Accents {
+        let plugin = crate::brand::Accents {
             primary: Some(Accepted {
                 color: Rgb(0x11, 0x22, 0x33),
                 text: Some(Rgb(0, 0, 0)),
@@ -201,7 +201,7 @@ mod tests {
                 text: 0x445566,
             }
         );
-        let only_link = brand::Accents {
+        let only_link = crate::brand::Accents {
             link: Some(Rgb(0x44, 0x55, 0x66)),
             ..none
         };

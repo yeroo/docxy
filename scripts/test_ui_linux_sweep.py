@@ -74,6 +74,26 @@ class ScriptCases(unittest.TestCase):
         self.assertEqual(sweep.script_cases(text), [
             'plain name', 'indented and shouted', 'non-breaking space', '"quoted # kept" tail'])
 
+    def test_a_terminal_docxy_script_that_opens_a_pdf_needs_docxy_pdf(self):
+        self.assertTrue(sweep.opens_pdf('terminal docxy\ntest t\n  open copy:../fixtures/a.pdf\n'))
+        self.assertFalse(sweep.opens_pdf('terminal docxy\ntest t\n  open copy:../fixtures/a.docx\n'))
+        self.assertFalse(sweep.opens_pdf('test t\n  open copy:../fixtures/a.pdf\n'),
+                         'the suite draws its own PDFs')
+        self.assertFalse(sweep.opens_pdf('terminal xlsxy\ntest t\n  open a.pdf\n'))
+        committed = {p.name for p in sweep.CASES.glob('*.uit')
+                     if sweep.opens_pdf(p.read_text(encoding='utf-8'))}
+        self.assertIn('terminal-docxy-pdf.uit', committed)
+        self.assertIn('terminal-docxy-inputs-typing.uit', committed)
+
+    def test_docxy_pdf_is_beside_the_suite_unless_named(self):
+        suite = Path('/build/suite/target/release/suite')
+        self.assertEqual(sweep.pdf_child({}, suite, ''),
+                         Path('/build/suite/target/release/docxy-pdf'))
+        self.assertEqual(sweep.pdf_child({}, suite, '.exe'),
+                         Path('/build/suite/target/release/docxy-pdf.exe'))
+        self.assertEqual(sweep.pdf_child({'DOCXY_PDF': '/elsewhere/docxy-pdf'}, suite, ''),
+                         Path('/elsewhere/docxy-pdf'))
+
     def test_reads_the_terminal_editor_a_script_drives(self):
         self.assertEqual(sweep.script_editor('# note\n\nterminal docxy --vim\ntest t\n'), 'docxy')
         self.assertEqual(sweep.script_editor('terminal yppxy # the plan\n'), 'yppxy')
@@ -81,6 +101,8 @@ class ScriptCases(unittest.TestCase):
         self.assertIsNone(sweep.script_editor('test t\nterminal docxy\n'),
                           'only the first line names an editor')
         self.assertIsNone(sweep.script_editor('terminal\n'))
+        self.assertIsNone(sweep.script_editor(''), 'no lines: the suite')
+        self.assertIsNone(sweep.script_editor('# only a comment\n\n'))
         committed = {p.name: sweep.script_editor(p.read_text(encoding='utf-8'))
                      for p in sweep.CASES.glob('terminal-*.uit')}
         self.assertEqual(sorted(set(committed.values())), ['docxy', 'xlsxy', 'yppxy'])

@@ -54,6 +54,18 @@ jobs:
       - name: Build
         run: cargo build --release -p docxy -p xlsxy --features docxy/html-export
 
+      # Terminal docxy draws a PDF's pages with docxy-pdf (#2259), a member of the
+      # suite workspace (PdfCraft needs a newer Rust than the root's MSRV and is a
+      # git dependency); it needs none of gpui's system packages. Stripped: the
+      # suite's release profile keeps line tables for its crash log (79 MB on
+      # Linux), and the child writes none (10 MB).
+      - name: Build docxy-pdf
+        env:
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+          CARGO_PROFILE_RELEASE_DEBUG: "false"
+          CARGO_PROFILE_RELEASE_STRIP: "true"
+        run: cargo build --release --locked --manifest-path suite/Cargo.toml -p pdfpages --bin docxy-pdf
+
       - name: Stage binaries + checksums
         shell: bash
         run: |
@@ -61,6 +73,7 @@ jobs:
           for bin in docxy xlsxy; do
             cp "target/release/${bin}${{ matrix.ext }}" "dist/${bin}-${{ matrix.suffix }}"
           done
+          cp "suite/target/release/docxy-pdf${{ matrix.ext }}" "dist/docxy-pdf-${{ matrix.suffix }}"
           cd dist
           for asset in *; do
             if command -v sha256sum >/dev/null; then
@@ -78,6 +91,7 @@ jobs:
           subject-path: |
             dist/docxy-${{ matrix.suffix }}
             dist/xlsxy-${{ matrix.suffix }}
+            dist/docxy-pdf-${{ matrix.suffix }}
 
       - name: Install cosign
         if: startsWith(github.ref, 'refs/tags/')
@@ -89,7 +103,7 @@ jobs:
         env:
           COSIGN_YES: "true"
         run: |
-          for bin in docxy xlsxy; do
+          for bin in docxy xlsxy docxy-pdf; do
             cosign sign-blob --yes \
               --output-signature "dist/${bin}-${{ matrix.suffix }}.sig" \
               --output-certificate "dist/${bin}-${{ matrix.suffix }}.pem" \
@@ -114,6 +128,10 @@ jobs:
     permissions:
       contents: write # attach the .vsix to the release
     runs-on: ubuntu-latest
+    # build:wasm builds the PDF engine (#2259) from the suite workspace, whose
+    # PdfCraft dependencies are git sources, as the suite jobs fetch them.
+    env:
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - uses: actions/checkout@v7
 
@@ -127,9 +145,9 @@ jobs:
 
       - name: Build the .vsix
         working-directory: offxy-vscode
-        # `vsce package` runs the vscode:prepublish script, which builds both
-        # the docxwasm and gridwasm wasm crates (cargo) and bundles the
-        # extension before packaging.
+        # `vsce package` runs the vscode:prepublish script, which builds the
+        # docxwasm and gridwasm wasm crates and the suite workspace's pdfpages
+        # (cargo) and bundles the extension before packaging.
         run: |
           npm ci
           npx --yes @vscode/vsce@latest package --no-dependencies
@@ -300,7 +318,7 @@ jobs:
           New-Item -ItemType Directory -Force $out | Out-Null
           & $iscc "/DAppVersion=$ver" "/DSrcDir=$PWD\suite\target\release" "/DIcoDir=$PWD\suite\docxy\assets" "/O$out" "packaging\inno\suite.iss"
           if ($LASTEXITCODE -ne 0) { throw "suite.iss compile failed ($LASTEXITCODE)" }
-          & $iscc "/DAppVersion=$ver" "/DSrcDir=$PWD\target\release" "/O$out" "packaging\inno\tui.iss"
+          & $iscc "/DAppVersion=$ver" "/DSrcDir=$PWD\target\release" "/DPdfSrcDir=$PWD\suite\target\release" "/O$out" "packaging\inno\tui.iss"
           if ($LASTEXITCODE -ne 0) { throw "tui.iss compile failed ($LASTEXITCODE)" }
           & $iscc "/DAppVersion=$ver" "/DSrcDir=$PWD\dist\office-shims" "/O$out" "packaging\inno\comshim.iss"
           if ($LASTEXITCODE -ne 0) { throw "comshim.iss compile failed ($LASTEXITCODE)" }
@@ -414,10 +432,12 @@ jobs:
       - name: Build desktop suite
         run: cargo build --release --manifest-path suite/Cargo.toml --features html-export
 
+      # docxy-pdf (#2259) comes from the suite build above, which builds every
+      # member of the suite workspace.
       - name: Package TUI tarball
         run: |
           mkdir -p out
-          tar -C target/release -czf "out/docxy-cli-macos-aarch64.tar.gz" docxy xlsxy
+          tar -czf "out/docxy-cli-macos-aarch64.tar.gz" -C target/release docxy xlsxy -C "$PWD/suite/target/release" docxy-pdf
           ( cd out && shasum -a 256 docxy-cli-macos-aarch64.tar.gz > docxy-cli-macos-aarch64.tar.gz.sha256 )
 
       - name: Build docxy.app + .dmg

@@ -158,3 +158,11 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the terminal edi
 - The terminal harness has no `manual` line, `help-read` or `help-open` for
   these editors yet, and an editor cannot tell it runs under the harness, so
   once a manual is published a terminal case would see the built-in one.
+
+## Terminal docxy's PDF viewer (#2259)
+
+- `docxy <file.pdf>` opens `docxy/src/pdf_view.rs`, a read-only viewer
+  with its own loop beside `App`, its pages drawn and read by the
+  `docxy-pdf` child (suite/pdfpages). Its notes (the child protocol, the
+  text fallback, keys, `field-read`/`pdf-read`, the `docxy-pdf-page`
+  prompt) are in `docs/claude/pdf-view.md`.

@@ -1,3 +1,4 @@
+// Modified for docxy (#2282): a copy's images written, not only its text.
 use anyhow::{Context as _, anyhow};
 use ashpd::WindowIdentifier;
 use calloop::{
@@ -1744,10 +1745,11 @@ impl LinuxClient for X11Client {
 
     fn write_to_clipboard(&self, item: gpui::ClipboardItem) {
         let mut state = self.0.borrow_mut();
+        // Its images too, each as its own mime (#2282).
         state
             .clipboard
-            .set_text(
-                std::borrow::Cow::Owned(item.text().unwrap_or_default()),
+            .set_item(
+                &item,
                 clipboard::ClipboardKind::Clipboard,
                 clipboard::WaitConfig::None,
             )

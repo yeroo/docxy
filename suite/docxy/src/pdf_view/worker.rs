@@ -10,12 +10,12 @@
 //! skips anything before it (a test binary run as the child prints its own
 //! lines first). The child reads its file once and keeps one
 //! `PageRenderer`; it ends at the end of its input (the suite closed it, or
-//! died), or by its own watchdog when one request runs past twice its
+//! died), or by its own watchdog when one request runs past twice its own
 //! timeout (a spin the suite can no longer kill).
 //!
 //! The parent's [`Worker`] asks one question at a time and waits at most
-//! its timeout; past it, or when the child dies or answers nonsense, the
-//! child is killed and the next question starts a new one. [`Engine`] runs a
+//! that question's own timeout ([`Op::timeout`]); past it, or when the child
+//! dies or answers nonsense, the child is killed and the next question starts a new one. [`Engine`] runs a
 //! worker on a thread of its own, so the UI thread never waits on a page.
 //! Unit tests and `DOCXY_CONVERT_IN_PROCESS=1` serve in this process over a
 //! pipe pair ([`Spawn::InProcess`]): the same [`serve`] code, no isolation.
@@ -46,8 +46,15 @@ const EXIT_USAGE: i32 = 2;
 /// The first line a worker writes.
 const HELLO: &str = "docxy-pdf-worker";
 /// The protocol's revision, in the hello line: 2 adds links, notes and the
-/// form to `info`, and the form's operations (#2255).
-const PROTOCOL: u32 = 2;
+/// form to `info`, and the form's operations (#2255); 3 the password
+/// (`unlock`), a locked file's answer and the file's security (#2256); 4
+/// printing, a page as a PNG and pages as a PDF of their own (#2258).
+const PROTOCOL: u32 = 4;
+/// How many times [`TIMEOUT`] a whole-document job may take (#2258): a
+/// print or a page range extracted reads and writes every page it takes,
+/// so it gets a budget of its own, `JOB_FACTOR` × the child's timeout (60 s
+/// by default); its watchdog is twice that, as every request's is.
+pub(crate) const JOB_FACTOR: u32 = 3;
 /// The longest answer line read (a page's text as JSON).
 const MAX_LINE: u64 = 256 << 20;
 /// The most pixel bytes one answer may carry (8192 × 8192 BGRA).
@@ -63,6 +70,40 @@ pub(crate) const CHANGED: &str = "the file was changed by another program since 
 /// a new reader (#2255).
 pub(crate) const VALUES_LOST: &str = "the PDF reader stopped and the form values \
      not yet saved could not be restored";
+
+/// A PDF's password (#2256): never printed (`Debug` shows `Secret(..)`),
+/// cleared from memory when dropped. It goes to the child on its stdin
+/// only, never on its command line or in its environment.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub(crate) struct Secret(zeroize::Zeroizing<String>);
+
+impl Secret {
+    pub(crate) fn new(password: String) -> Secret {
+        Secret(zeroize::Zeroizing::new(password))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(..)")
+    }
+}
+
+impl Serialize for Secret {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for Secret {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Secret, D::Error> {
+        String::deserialize(d).map(Secret::new)
+    }
+}
 
 /// What the worker is asked.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -93,16 +134,157 @@ pub(crate) enum Op {
     /// [`Worker`] asks the child for the bytes and writes them; never sent
     /// to the child.
     SaveTo { path: PathBuf },
+    /// Open an encrypted file with `password` (#2256), user or owner: the
+    /// answer is `info`'s, or locked (`wrong`) when it does not open it.
+    /// The [`Worker`] sends it again first to every new child.
+    Unlock { password: Secret },
+    /// Print (#2258): the pages laid out on sheets as drawn (unsaved form
+    /// values too), then handed to the spooler, or written to a folder.
+    Print { job: PrintJob },
+    /// Page `page` as a PNG at `dpi` (capped as the renderer caps a page),
+    /// its bytes after the line (#2258).
+    Png { page: usize, dpi: f64 },
+    /// `pages` (0-based, in this order) as a new PDF of their own, as drawn,
+    /// its bytes after the line (#2258).
+    ExtractPages { pages: Vec<usize> },
+    /// The parent: export to `path` (#2258). The [`Worker`] asks the child
+    /// for each page's PNG, or for the pages' PDF, and writes the files;
+    /// never sent to the child.
+    ExportTo { export: Export, path: PathBuf },
 }
 
 impl Op {
-    /// The form's operations, which the view sends before any page.
+    /// The form's operations, which the view sends before any page; a print
+    /// or an export goes in the same queue (#2258), after the fills before it.
     pub(crate) fn is_form(&self) -> bool {
         matches!(
             self,
-            Op::SetField { .. } | Op::SetFields { .. } | Op::Fields | Op::SaveTo { .. }
+            Op::SetField { .. }
+                | Op::SetFields { .. }
+                | Op::Fields
+                | Op::SaveTo { .. }
+                | Op::Print { .. }
+                | Op::ExportTo { .. }
         )
     }
+
+    /// The longest this request may take, given the child's `timeout`
+    /// (#2258): a whole-document job ([`JOB_FACTOR`] times it), else `timeout`.
+    pub(crate) fn timeout(&self, timeout: Duration) -> Duration {
+        match self {
+            Op::Print { .. } | Op::ExtractPages { .. } => timeout.saturating_mul(JOB_FACTOR),
+            _ => timeout,
+        }
+    }
+}
+
+/// A print job on the wire (#2258): what `pdfcraft_print::Settings` and
+/// `spool::Job` take (theirs are not serde). The pages are 0-based, in
+/// print order, parsed by the parent from what was typed; the child checks
+/// them against its own page count again.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct PrintJob {
+    pub pages: Vec<usize>,
+    /// The paper's name in `pdfcraft_print::PAPERS` (`None`: a size of its
+    /// own), and its size in points, portrait.
+    pub paper_name: Option<String>,
+    pub paper: (f64, f64),
+    pub sizing: Sizing,
+    pub orientation: Orient,
+    pub content: PrintContent,
+    /// `None`: the system's default printer.
+    pub printer: Option<String>,
+    pub copies: u32,
+    pub collate: bool,
+    pub title: String,
+    pub spool: Spool,
+}
+
+/// Page sizing, as Acrobat's Print dialog names it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Sizing {
+    Fit,
+    Actual,
+    /// Shrink oversized pages.
+    Shrink,
+    /// A scale of the page's size, percent.
+    Custom {
+        percent: f64,
+    },
+}
+
+/// The sheets' orientation: Auto turns a sheet for a landscape page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Orient {
+    Auto,
+    Portrait,
+    Landscape,
+}
+
+/// Acrobat's Comments and forms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum PrintContent {
+    /// The page, its form fields and every printable comment.
+    DocumentAndMarkups,
+    /// The page and its form fields.
+    Document,
+    FormFieldsOnly,
+}
+
+/// Where a print job goes (#2258): the system's spooler, or (a harness, a
+/// test) a folder that takes `job-<n>.pdf` and `job-<n>.json` instead. The
+/// parent chooses; nothing in the child's environment does.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Spool {
+    System,
+    Dir { dir: PathBuf },
+}
+
+/// What a print answers.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Printed {
+    /// Sheets sent (one page each).
+    pub sheets: usize,
+    /// What the spooler calls the job (CUPS's request id), or the job file
+    /// written for a [`Spool::Dir`].
+    pub job: String,
+}
+
+/// An export (#2258), as [`Op::ExportTo`] does it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub(crate) enum Export {
+    /// One PNG per page at `dpi`: one page to the path picked, several each
+    /// to its own name beside it ([`png_names`]).
+    Png { pages: Vec<usize>, dpi: f64 },
+    /// The pages as one new PDF.
+    Pdf { pages: Vec<usize> },
+}
+
+impl Export {
+    /// The extension its file takes: `png` or `pdf`.
+    pub(crate) fn extension(&self) -> &'static str {
+        match self {
+            Export::Png { .. } => "png",
+            Export::Pdf { .. } => "pdf",
+        }
+    }
+}
+
+/// What an export wrote.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Exported {
+    pub files: Vec<PathBuf>,
+    /// PNG: the resolution the pages were drawn at when the renderer drew
+    /// one at less than asked (its size caps), the lowest.
+    pub dpi_used: Option<f64>,
+    /// Files that were at the names, moved aside, and could not be removed
+    /// after: where they are (the status says so).
+    pub left: Vec<PathBuf>,
 }
 
 /// A form field's new value on the wire (#2255).
@@ -320,6 +502,62 @@ pub(crate) struct DocMeta {
     pub notes: Vec<NoteMeta>,
     #[serde(default)]
     pub form: FormMeta,
+    /// An encrypted file's security handler and what its password allows
+    /// (#2256); `None` for a file that is not encrypted.
+    #[serde(default)]
+    pub security: Option<SecurityMeta>,
+}
+
+/// What an encrypted file allows (#2256), as the password it was opened
+/// with reads `/P`: the owner password allows everything.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SecurityMeta {
+    /// The cipher, as the status line names it: `RC4 40-bit`, `AES 256-bit`.
+    pub method: String,
+    /// Opened with the owner password.
+    pub owner: bool,
+    pub print: bool,
+    pub copy: bool,
+    pub modify: bool,
+    pub annotate: bool,
+    pub fill_forms: bool,
+    /// Pages may be taken into a new file (#2258): assembly and copying,
+    /// as PdfCraft's Extract Pages asks.
+    #[serde(default)]
+    pub extract: bool,
+}
+
+impl SecurityMeta {
+    /// What the file withholds, as the status line lists it: empty when
+    /// nothing is (the owner password, or a file that allows everything).
+    pub(crate) fn restrictions(&self) -> Vec<&'static str> {
+        if self.owner {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for (allowed, what) in [
+            (self.print, "printing"),
+            (self.copy, "copying"),
+            (self.modify, "changes"),
+            (self.annotate, "comments"),
+            (self.fill_forms, "filling in forms"),
+        ] {
+            if !allowed {
+                out.push(what);
+            }
+        }
+        out
+    }
+}
+
+/// Why `info` or `unlock` did not open the file (#2256).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Locked {
+    /// Encrypted: it needs a password.
+    Needs,
+    /// The password given does not open it.
+    Wrong,
 }
 
 /// A glyph on the wire: [`TextGlyph`] with short names.
@@ -359,6 +597,15 @@ struct Head {
     /// working document may be half changed): the parent starts another.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     fatal: bool,
+    /// The file needs a password, or the one given is wrong (#2256).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    locked: Option<Locked>,
+    /// A print's answer (#2258).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    printed: Option<Printed>,
+    /// A PNG's resolution as drawn (#2258): `bytes` PNG bytes follow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dpi: Option<f64>,
     /// A raster's size; `len` pixel bytes follow the line.
     #[serde(default)]
     w: u32,
@@ -400,6 +647,20 @@ pub(crate) enum Answer {
     Saved(PathBuf),
     /// Done, nothing to say ([`Op::Saved`]).
     Ok,
+    /// The file is encrypted (#2256): it needs a password (`wrong`: the one
+    /// given does not open it).
+    Locked {
+        wrong: bool,
+    },
+    /// A print sent (#2258).
+    Printed(Printed),
+    /// A page as a PNG, and the resolution it was drawn at (#2258).
+    Png {
+        png: Vec<u8>,
+        dpi: f64,
+    },
+    /// An export written (#2258).
+    Exported(Exported),
     /// Why it could not: the file's fault, or the child's fate.
     Failed(String),
 }
@@ -425,14 +686,16 @@ pub(crate) fn child_main(args: &[OsString]) -> Option<i32> {
 }
 
 /// Serve `path` on this process's stdin and stdout, under a watchdog that
-/// ends the process when one request runs past twice `timeout`. `before`
+/// ends the process when one request runs past twice its own timeout
+/// ([`Op::timeout`] of `timeout`). `before`
 /// sees each request first (the tests' misbehaving children).
 pub(crate) fn run(path: &Path, timeout: Duration, before: impl FnMut(&Op)) -> i32 {
     first_to_go();
+    limit_memory();
     let bytes = std::fs::read(path)
         .map(Arc::new)
         .map_err(|e| format!("the file could not be read: {e}"));
-    let busy = Arc::new(Busy::default());
+    let busy = Arc::new(Busy::new(timeout));
     watchdog(busy.clone(), timeout.saturating_mul(2));
     let stdin = std::io::stdin().lock();
     let stdout = std::io::BufWriter::new(std::io::stdout().lock());
@@ -448,11 +711,52 @@ fn first_to_go() {
     let _ = std::fs::write("/proc/self/oom_score_adj", "1000");
 }
 
-/// When the request being answered started (ms since `base`, 0: none).
+/// On Linux, the child limits its own memory (#2256), as Windows' job
+/// limits it from outside: past [`crate::convert_child::MEMORY_LIMIT`] of
+/// data an allocation fails and the child aborts, and the parent answers
+/// the page with why. `RLIMIT_DATA`, not `RLIMIT_AS`: glibc's per-thread
+/// arenas reserve address space they never use, which an address-space
+/// limit counts. No core is written for that abort (`RLIMIT_CORE` 0).
+/// Only ever in a child process: the worker's own `run`, and
+/// `convert_child::child_main` for a PDF conversion (#2257, whose parent
+/// retries a child that died by the PDF's text). Never in [`serve`], which
+/// also runs in the suite's process ([`Spawn::InProcess`]), nor anywhere
+/// else in the suite's process.
+pub(crate) fn limit_memory() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::ffi::{c_int, c_ulong};
+        #[repr(C)]
+        struct Rlimit {
+            cur: c_ulong,
+            max: c_ulong,
+        }
+        // The asm-generic numbering, which x86_64 and aarch64 Linux use.
+        const RLIMIT_DATA: c_int = 2;
+        const RLIMIT_CORE: c_int = 4;
+        unsafe extern "C" {
+            fn setrlimit(resource: c_int, rlim: *const Rlimit) -> c_int;
+        }
+        let set = |resource, n: usize| {
+            let n = c_ulong::try_from(n).unwrap_or(c_ulong::MAX);
+            let r = Rlimit { cur: n, max: n };
+            // SAFETY: `r` is a valid `struct rlimit` for the call's length.
+            unsafe { setrlimit(resource, &r) };
+        };
+        set(RLIMIT_CORE, 0);
+        set(RLIMIT_DATA, crate::convert_child::MEMORY_LIMIT);
+    }
+}
+
+/// When the request being answered started (ms since `base`, 0: none),
+/// and how long it may run before the watchdog ends the child: twice its
+/// own timeout ([`Op::timeout`], #2258), from the child's `timeout`.
 #[derive(Default)]
 pub(crate) struct Busy {
     since: AtomicU64,
+    limit_ms: AtomicU64,
     base: std::sync::OnceLock<Instant>,
+    timeout: Duration,
 }
 
 impl Busy {
@@ -462,8 +766,25 @@ impl Busy {
         base.elapsed().as_millis() as u64 + 1
     }
 
-    fn start(&self) {
+    pub(crate) fn new(timeout: Duration) -> Busy {
+        Busy {
+            timeout,
+            ..Busy::default()
+        }
+    }
+
+    fn start(&self, op: &Op) {
+        let limit = op.timeout(self.timeout).saturating_mul(2);
+        self.limit_ms.store(
+            u64::try_from(limit.as_millis()).unwrap_or(u64::MAX),
+            Ordering::SeqCst,
+        );
         self.since.store(self.now(), Ordering::SeqCst);
+    }
+
+    /// How long the request being answered may run.
+    fn limit(&self) -> Duration {
+        Duration::from_millis(self.limit_ms.load(Ordering::SeqCst))
     }
 
     fn stop(&self) {
@@ -477,14 +798,16 @@ impl Busy {
     }
 }
 
-/// End the process when one request runs past `limit`: a child spinning in
-/// a page whose parent is gone, or no longer waits, never stops otherwise.
+/// End the process when one request runs past its limit ([`Busy::start`];
+/// `limit`, an ordinary request's, sets how often it looks): a child
+/// spinning in a page whose parent is gone, or no longer waits, never
+/// stops otherwise.
 fn watchdog(busy: Arc<Busy>, limit: Duration) {
     let step = (limit / 8).clamp(Duration::from_millis(10), Duration::from_millis(500));
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(step);
-            if busy.running().is_some_and(|ran| ran > limit) {
+            if busy.running().is_some_and(|ran| ran > busy.limit()) {
                 std::process::exit(EXIT_WATCHDOG);
             }
         }
@@ -519,7 +842,7 @@ pub(crate) fn serve(
         let (head, body) = match serde_json::from_str::<Request>(line.trim()) {
             Ok(req) => {
                 if let Some(b) = busy {
-                    b.start();
+                    b.start(&req.op);
                 }
                 before(&req.op);
                 let answered = match &bytes {
@@ -606,6 +929,16 @@ fn flatten(items: &[pdfcraft_render::OutlineItem], depth: usize, out: &mut Vec<B
 /// Pages are drawn over white, so alpha is 255 and only red and blue swap;
 /// a pixel with less is un-premultiplied too.
 pub(crate) fn straight_bgra(rgba: &[u8]) -> Vec<u8> {
+    straight::<true>(rgba)
+}
+
+/// Premultiplied RGBA as straight RGBA, as a PNG takes it (#2258).
+pub(crate) fn straight_rgba(rgba: &[u8]) -> Vec<u8> {
+    straight::<false>(rgba)
+}
+
+/// Premultiplied RGBA un-premultiplied, in BGRA order when `BGR`.
+fn straight<const BGR: bool>(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len());
     for &[r, g, b, a] in rgba.as_chunks::<4>().0 {
         let un = |c: u8| match a {
@@ -613,7 +946,11 @@ pub(crate) fn straight_bgra(rgba: &[u8]) -> Vec<u8> {
             0 => 0,
             a => ((c as u32 * 255 + a as u32 / 2) / a as u32).min(255) as u8,
         };
-        out.extend_from_slice(&[un(b), un(g), un(r), a]);
+        if BGR {
+            out.extend_from_slice(&[un(b), un(g), un(r), a]);
+        } else {
+            out.extend_from_slice(&[un(r), un(g), un(b), a]);
+        }
     }
     out
 }
@@ -722,6 +1059,10 @@ pub(crate) struct Worker {
     /// A new child could not be given the values: they are gone, and the
     /// next answer says so ([`Self::take_lost`]).
     lost: bool,
+    /// The password that opened the file (#2256): every new child is
+    /// unlocked with it first, so a child killed after the prompt is
+    /// replaced without asking again. Held only here, for this view.
+    password: Option<Secret>,
     /// Children started so far (the tests' respawn check).
     #[cfg(test)]
     pub(crate) started: usize,
@@ -754,6 +1095,7 @@ impl Worker {
             edits: Vec::new(),
             stamp: None,
             lost: false,
+            password: None,
             #[cfg(test)]
             started: 0,
         }
@@ -768,12 +1110,30 @@ impl Worker {
         if let Op::SaveTo { path } = op {
             return self.save_to(path);
         }
+        if let Op::ExportTo { export, path } = op {
+            return self.export_to(export, path);
+        }
         let answer = match self.ask_raw(op) {
             Ok((head, body)) => decode(op, head, body),
             Err(why) => Answer::Failed(why),
         };
         if let (Op::SetField { name, value }, Answer::Form(_)) = (op, &answer) {
             self.edits.push((name.clone(), value.clone()));
+        }
+        answer
+    }
+
+    /// Try `password` on the file (#2256): its `info` when it opens it (and
+    /// the password is kept, for every new child), else
+    /// [`Answer::Locked`] or why not.
+    pub(crate) fn unlock(&mut self, password: Secret) -> Answer {
+        let op = Op::Unlock { password };
+        let answer = match self.ask_raw(&op) {
+            Ok((head, body)) => decode(&op, head, body),
+            Err(why) => Answer::Failed(why),
+        };
+        if let (Answer::Info(_), Op::Unlock { password }) = (&answer, op) {
+            self.password = Some(password);
         }
         answer
     }
@@ -790,11 +1150,20 @@ impl Worker {
         &self.edits
     }
 
+    /// The file this worker reads (the tests' look).
+    #[cfg(test)]
+    pub(crate) fn path_for_tests(&self) -> &Path {
+        &self.path
+    }
+
     fn ask_raw(&mut self, op: &Op) -> Reply {
         self.ensure()?;
         self.exchange(op)
     }
 
+    /// A new child, unlocked with the file's password first when it has
+    /// one (#2256): before the form values are given again, and before any
+    /// question. A child the password does not open fails, with why.
     fn connect(&mut self) -> Result<(), String> {
         let conn = self
             .start()
@@ -803,6 +1172,20 @@ impl Worker {
         #[cfg(test)]
         {
             self.started += 1;
+        }
+        if let Some(password) = self.password.clone() {
+            let op = Op::Unlock { password };
+            let why = match self.exchange(&op) {
+                Ok((head, body)) => match decode(&op, head, body) {
+                    Answer::Info(_) => return Ok(()),
+                    Answer::Locked { .. } => "the PDF's password no longer opens it".to_string(),
+                    Answer::Failed(why) => why,
+                    _ => DIED.to_string(),
+                },
+                Err(why) => why,
+            };
+            self.stop();
+            return Err(why);
         }
         Ok(())
     }
@@ -871,6 +1254,102 @@ impl Worker {
         Answer::Saved(target.to_path_buf())
     }
 
+    /// Export to `path` (#2258): the child draws each page's PNG (each its
+    /// own request and timeout) or makes the pages' PDF, and this writes
+    /// them, every file or none ([`Staged`]): each answer goes to a
+    /// temporary file beside its name as it comes, so only paths are held
+    /// here, and they are moved into place when all are in. A page asked
+    /// twice is written once. A PNG export of several pages refuses when a
+    /// name it would write, other than the one picked (whose replacing the
+    /// dialog confirmed), exists already; no export replaces the PDF this
+    /// view reads.
+    fn export_to(&mut self, export: &Export, path: &Path) -> Answer {
+        if opccore::fsio::same_file(path, &self.path) {
+            return Answer::Failed(EXPORT_OVER_ITSELF.into());
+        }
+        // One file (a PDF, a page's PNG): fsio's own atomic export.
+        let one = |w: &mut Worker, bytes: Vec<u8>, dpi_used| match opccore::fsio::export_atomic(
+            Some(&w.path),
+            path,
+            &bytes,
+        ) {
+            Ok(()) => Answer::Exported(Exported {
+                files: vec![path.to_path_buf()],
+                dpi_used,
+                left: Vec::new(),
+            }),
+            Err(e) => Answer::Failed(write_error(&e)),
+        };
+        let mut staged = Staged::default();
+        let stage = |staged: &mut Staged, name: &Path, bytes: &[u8]| {
+            staged.add(name, bytes).map_err(|e| write_error(&e))
+        };
+        let dpi_used = match export {
+            Export::Pdf { pages } => {
+                let op = Op::ExtractPages {
+                    pages: pages.clone(),
+                };
+                return match self.ask(&op) {
+                    Answer::Bytes(pdf) => one(self, pdf, None),
+                    Answer::Failed(why) => Answer::Failed(why),
+                    _ => Answer::Failed(DIED.into()),
+                };
+            }
+            Export::Png { pages, dpi } if distinct(pages).len() == 1 => {
+                let page = pages[0];
+                return match self.ask(&Op::Png { page, dpi: *dpi }) {
+                    Answer::Png { png, dpi: drawn } => {
+                        one(self, png, (drawn + 0.5 < *dpi).then_some(drawn))
+                    }
+                    Answer::Failed(why) => Answer::Failed(format!("page {}: {why}", page + 1)),
+                    _ => Answer::Failed(DIED.into()),
+                };
+            }
+            Export::Png { pages, dpi } => {
+                let pages = distinct(pages);
+                let names = png_names(path, &pages);
+                if let Some(own) = names
+                    .iter()
+                    .find(|n| opccore::fsio::same_file(n, &self.path))
+                {
+                    return Answer::Failed(format!("{}: {EXPORT_OVER_ITSELF}", own.display()));
+                }
+                if let Some(taken) = names.iter().find(|n| n.as_path() != path && n.exists()) {
+                    return Answer::Failed(format!(
+                        "{} already exists, so nothing was written: choose another name",
+                        taken.display()
+                    ));
+                }
+                let mut used: Option<f64> = None;
+                for (&page, name) in pages.iter().zip(&names) {
+                    match self.ask(&Op::Png { page, dpi: *dpi }) {
+                        Answer::Png { png, dpi: drawn } => {
+                            if drawn + 0.5 < *dpi {
+                                used = Some(used.map_or(drawn, |u| u.min(drawn)));
+                            }
+                            if let Err(why) = stage(&mut staged, name, &png) {
+                                return Answer::Failed(why);
+                            }
+                        }
+                        Answer::Failed(why) => {
+                            return Answer::Failed(format!("page {}: {why}", page + 1));
+                        }
+                        _ => return Answer::Failed(DIED.into()),
+                    }
+                }
+                used
+            }
+        };
+        match staged.commit() {
+            Ok(Committed { files, left }) => Answer::Exported(Exported {
+                files,
+                dpi_used,
+                left,
+            }),
+            Err(e) => Answer::Failed(write_error(&e)),
+        }
+    }
+
     /// Send `op` to the live child and wait for its answer.
     fn exchange(&mut self, op: &Op) -> Reply {
         if self.conn.is_none() {
@@ -878,17 +1357,23 @@ impl Worker {
         }
         self.next_id += 1;
         let id = self.next_id;
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + op.timeout(self.timeout);
         let conn = self.conn.as_mut().expect("started above");
-        let line =
-            serde_json::to_string(&Request { id, op: op.clone() }).map_err(|e| e.to_string())?;
-        if writeln!(conn.input, "{line}")
+        let mut line = zeroize::Zeroizing::new(
+            serde_json::to_string(&Request { id, op: op.clone() }).map_err(|e| e.to_string())?,
+        );
+        line.push('\n');
+        // The line is cleared when dropped: an `unlock`'s holds the password.
+        if conn
+            .input
+            .write_all(line.as_bytes())
             .and_then(|()| conn.input.flush())
             .is_err()
         {
             self.stop();
             return Err(DIED.into());
         }
+        drop(line);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.conn.as_ref().expect("live").replies.recv_timeout(left) {
@@ -984,6 +1469,193 @@ impl Drop for Worker {
     }
 }
 
+/// The files a PNG export of `pages` (0-based) to `path` writes (#2258):
+/// one page, `path` itself; several, `<stem>_Page_<n>.png` beside it, `n`
+/// the page's number zero-padded to the digits of the highest one, so the
+/// names sort in page order.
+pub(crate) fn png_names(path: &Path, pages: &[usize]) -> Vec<PathBuf> {
+    if pages.len() <= 1 {
+        return pages.iter().map(|_| path.to_path_buf()).collect();
+    }
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let width = pages.iter().max().map_or(1, |m| (m + 1).to_string().len());
+    pages
+        .iter()
+        .map(|p| path.with_file_name(format!("{stem}_Page_{:0width$}.png", p + 1)))
+        .collect()
+}
+
+/// Why an export's file could not be written (#2258): a file this user may
+/// not write, or one marked read-only, in the same words on every platform
+/// (Linux says "Permission denied", Windows "Access is denied"), the
+/// system's own after them.
+pub(crate) fn write_error(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied {
+        format!("{WRITE_REFUSED} ({e})")
+    } else {
+        format!("the file could not be written: {e}")
+    }
+}
+
+/// What [`write_error`] says of a file that may not be written.
+pub(crate) const WRITE_REFUSED: &str =
+    "the file could not be written: it is read-only, or you may not change it";
+
+/// `pages` without repeats, the first of each kept in its place (#2258):
+/// a range may name a page twice ("1-3, 2"), and a page is one picture.
+pub(crate) fn distinct(pages: &[usize]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    pages.iter().copied().filter(|p| seen.insert(*p)).collect()
+}
+
+/// What an export over the PDF the view reads says (#2258).
+pub(crate) const EXPORT_OVER_ITSELF: &str =
+    "an export cannot replace the PDF that is open: choose another name";
+
+/// The files a PNG export of several pages writes (#2258), every one or
+/// none as far as the file system lets it be undone, by `opccore::fsio`'s
+/// rules: a symlinked name writes its target, a read-only one is refused
+/// up front, a replaced file's permissions are kept.
+///
+/// [`Staged::add`] writes and syncs each file to a temporary sibling of its
+/// own (`fsio::temp_sibling`: exclusive, never shared with another writer)
+/// as it comes, so the suite holds paths, not pictures. [`Staged::commit`]
+/// renames them into place in order: a file already at a name is first
+/// moved aside to a sibling of its own, but at the last name, whose rename
+/// replaces it atomically (nothing after it can fail, so it never needs
+/// putting back). When a rename fails, every name done is put back, the
+/// files that were there moved back; that putting back is best effort, and
+/// the error says where a file it could not put back is now. The
+/// temporary files go when it is dropped, committed or not.
+#[derive(Default)]
+pub(crate) struct Staged {
+    files: Vec<StagedFile>,
+}
+
+struct StagedFile {
+    /// The name as asked, for the answer.
+    asked: PathBuf,
+    /// The file written: `asked`, or a symlink's target.
+    dest: PathBuf,
+    temp: PathBuf,
+}
+
+/// What a commit did.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Committed {
+    pub files: Vec<PathBuf>,
+    /// Files moved aside that could not be removed after: where they are.
+    pub left: Vec<PathBuf>,
+}
+
+impl Staged {
+    /// Write `bytes` for `path`, to its temporary file. A name already
+    /// added (as written, a symlink followed) is refused: one file, one
+    /// picture.
+    pub(crate) fn add(&mut self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        let (dest, permissions) = opccore::fsio::write_destination(path)?;
+        let same = |f: &StagedFile| f.dest == dest || opccore::fsio::same_file(&f.dest, &dest);
+        if self.files.iter().any(same) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} would be written twice", path.display()),
+            ));
+        }
+        let (temp, mut file) = opccore::fsio::temp_sibling(&dest)?;
+        // Listed first, so a write that fails halfway is removed too.
+        self.files.push(StagedFile {
+            asked: path.to_path_buf(),
+            dest,
+            temp,
+        });
+        file.write_all(bytes)?;
+        if let Some(p) = permissions {
+            file.set_permissions(p)?;
+        }
+        file.sync_all()
+    }
+
+    /// Move every file into place, or put back the ones done.
+    pub(crate) fn commit(self) -> std::io::Result<Committed> {
+        // Each name done, and where the file that was there went.
+        let mut done: Vec<(&Path, Option<PathBuf>)> = Vec::with_capacity(self.files.len());
+        let last = self.files.len().saturating_sub(1);
+        for (i, f) in self.files.iter().enumerate() {
+            let step = (|| {
+                let aside = if i < last && f.dest.is_file() {
+                    let (aside, _) = opccore::fsio::temp_sibling(&f.dest)?;
+                    if let Err(e) = std::fs::rename(&f.dest, &aside) {
+                        let _ = std::fs::remove_file(&aside);
+                        return Err(e);
+                    }
+                    Some(aside)
+                } else {
+                    None
+                };
+                match std::fs::rename(&f.temp, &f.dest) {
+                    Ok(()) => Ok(aside),
+                    Err(e) => {
+                        let mut why = e.to_string();
+                        if let Some(old) = &aside
+                            && std::fs::rename(old, &f.dest).is_err()
+                        {
+                            why.push_str(&format!(
+                                "; the file that was at {} is now at {}",
+                                f.dest.display(),
+                                old.display()
+                            ));
+                        }
+                        Err(std::io::Error::new(e.kind(), why))
+                    }
+                }
+            })();
+            match step {
+                Ok(aside) => done.push((&f.dest, aside)),
+                Err(e) => {
+                    let mut why = e.to_string();
+                    for (dest, aside) in done.iter().rev() {
+                        let put_back = match aside {
+                            Some(old) => std::fs::rename(old, dest).map_err(|_| {
+                                format!(
+                                    "; the file that was at {} is now at {}",
+                                    dest.display(),
+                                    old.display()
+                                )
+                            }),
+                            None => std::fs::remove_file(dest)
+                                .map_err(|_| format!("; {} was written and stays", dest.display())),
+                        };
+                        if let Err(note) = put_back {
+                            why.push_str(&note);
+                        }
+                    }
+                    return Err(std::io::Error::new(e.kind(), why));
+                }
+            }
+        }
+        let left = done
+            .into_iter()
+            .filter_map(|(_, aside)| aside)
+            .filter(|old| std::fs::remove_file(old).is_err())
+            .collect();
+        Ok(Committed {
+            files: self.files.iter().map(|f| f.asked.clone()).collect(),
+            left,
+        })
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        for f in &self.files {
+            let _ = std::fs::remove_file(&f.temp);
+        }
+    }
+}
+
 fn kill(slot: &Slot) {
     if let Some(mut limited) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
         let _ = limited.child.kill();
@@ -1057,11 +1729,16 @@ fn read_replies(mut out: impl BufRead, tx: mpsc::Sender<Reply>) {
 
 /// An answer's line and bytes as what `op` asked for.
 fn decode(op: &Op, head: Head, body: Vec<u8>) -> Answer {
+    if let Some(locked) = head.locked {
+        return Answer::Locked {
+            wrong: locked == Locked::Wrong,
+        };
+    }
     if let Some(why) = head.error {
         return Answer::Failed(why);
     }
     match op {
-        Op::Info => head
+        Op::Info | Op::Unlock { .. } => head
             .info
             .map_or_else(|| Answer::Failed(DIED.into()), Answer::Info),
         Op::Pixels { .. } if head.len > 0 => Answer::Pixels(Raster {
@@ -1081,8 +1758,17 @@ fn decode(op: &Op, head: Head, body: Vec<u8>) -> Answer {
         Op::Save if head.bytes > 0 => Answer::Bytes(body),
         Op::Save => Answer::Failed(DIED.into()),
         Op::Saved => Answer::Ok,
-        // Never sent: the Worker answers it.
-        Op::SaveTo { .. } => Answer::Failed(DIED.into()),
+        Op::Print { .. } => head
+            .printed
+            .map_or_else(|| Answer::Failed(DIED.into()), Answer::Printed),
+        Op::Png { .. } => match head.dpi {
+            Some(dpi) if head.bytes > 0 => Answer::Png { png: body, dpi },
+            _ => Answer::Failed(DIED.into()),
+        },
+        Op::ExtractPages { .. } if head.bytes > 0 => Answer::Bytes(body),
+        Op::ExtractPages { .. } => Answer::Failed(DIED.into()),
+        // Never sent: the Worker answers them.
+        Op::SaveTo { .. } | Op::ExportTo { .. } => Answer::Failed(DIED.into()),
     }
 }
 
@@ -1169,3 +1855,16 @@ impl Drop for Engine {
 mod doc;
 #[cfg(test)]
 pub(crate) mod tests;
+
+/// What a fill of a form its permissions keep from being filled answers
+/// (the tests' look).
+#[cfg(test)]
+pub(crate) fn doc_no_filling() -> &'static str {
+    doc::NO_FILLING
+}
+
+/// What the child answers a print, a PNG and a PDF of pages the file's
+/// permissions refuse (#2258), for the dialogs' own refusal up front.
+pub(crate) fn doc_refusals() -> (&'static str, &'static str, &'static str) {
+    (doc::NO_PRINTING, doc::NO_COPYING, doc::NO_EXTRACTING)
+}
