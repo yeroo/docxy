@@ -1524,8 +1524,8 @@ pub enum SyncEvent {
     /// One `SignIn` may send two (#2218): when the sign-in asking
     /// `AuthConfig::scope` and `AuthConfig::optional_scope` is refused for
     /// consent, a second follows, asking `AuthConfig::scope` alone, with no
-    /// `Error` for the first refusal.
-    SignInStarted { authorize_url: String },
+    /// `Error` for the first refusal. Its `Debug` hides the login hint.
+    SignInStarted { authorize_url: auth::AuthorizeUrl },
     /// The scopes the signed-in token was granted (#1875), as the token
     /// response spelled them, and the scopes of `AuthConfig::scope` and
     /// `AuthConfig::optional_scope` it lacks (#2218;
@@ -2914,6 +2914,12 @@ struct Engine {
     /// ([`Engine::ask_broker_after_refusal`]), signing in with its token or
     /// asking for a sign-in for this reason.
     broker_after_refusal: Option<SignInReason>,
+    /// A brokered token's renewal gave a token whose account cannot be
+    /// compared with the session's (one of them names none): the refusal
+    /// that `try_refresh` answered goes to the broker again, through
+    /// [`Engine::ask_broker_after_refusal`] and its mailbox check, not to a
+    /// sign-in.
+    broker_recheck: bool,
     /// A probe that failed for a reason `react` does not handle (a 5xx, a
     /// 4xx, a parse error, a store error) holds the next one off until this
     /// instant (#1946), so a fast tick does not probe every few seconds.
@@ -3044,6 +3050,7 @@ impl Engine {
             meeting_class_refused: false,
             mailbox_unchecked,
             broker_after_refusal: None,
+            broker_recheck: false,
             check_retry: None,
             check_backoff: BACKOFF_MIN,
         }
@@ -10670,16 +10677,33 @@ impl Engine {
             return Refresh::SignIn(SignInReason::NotSignedIn);
         };
         if self.brokered {
-            return match self.ask_broker() {
-                Some(t) => {
-                    self.token = Some(t);
-                    self.announce_scopes();
-                    Refresh::Done
-                }
-                None => Refresh::SignIn(SignInReason::Expired {
+            let held = token.account.clone();
+            let refused = || {
+                Refresh::SignIn(SignInReason::Expired {
                     code: String::new(),
                     aadsts: None,
-                }),
+                })
+            };
+            return match self.ask_broker() {
+                Some(t) => match same_account(&held, &t.account) {
+                    Some(true) => {
+                        self.token = Some(t);
+                        self.announce_scopes();
+                        Refresh::Done
+                    }
+                    // Another account's token is not used: the held one goes
+                    // too, so the refusal ends the session.
+                    Some(false) => {
+                        self.token = None;
+                        refused()
+                    }
+                    None => {
+                        self.token = None;
+                        self.broker_recheck = true;
+                        refused()
+                    }
+                },
+                None => refused(),
             };
         }
         if token.refresh_token.is_empty() {
@@ -10797,6 +10821,7 @@ impl Engine {
             )));
         }
         self.mailbox_unchecked = true;
+        self.broker_recheck = false;
         self.check_retry = None;
         self.check_backoff = BACKOFF_MIN;
         if !brokered && let Ok(storage) = self.save_token(&t) {
@@ -10872,7 +10897,7 @@ impl Engine {
         let redirect_uri = format!("http://localhost:{port}");
         let req = auth::begin_auth_with_scope(&self.config.cfg, &redirect_uri, scope);
         self.emit(SyncEvent::SignInStarted {
-            authorize_url: req.authorize_url.clone(),
+            authorize_url: req.authorize_url.clone().into(),
         });
         // The wait reads the channel on each poll (#2131): a `Shutdown`
         // ends it, and the commands before it go to `deferred`, in order,
@@ -11178,7 +11203,11 @@ impl Engine {
     /// sign-in asked for `reason` at once.
     fn signin_after_refusal(&mut self, reason: SignInReason) {
         let saved_refused = !self.brokered && matches!(reason, SignInReason::Expired { .. });
-        if saved_refused && self.config.options.broker.is_some() && !self.broker_refused {
+        let recheck = std::mem::take(&mut self.broker_recheck);
+        if (saved_refused || recheck)
+            && self.config.options.broker.is_some()
+            && !self.broker_refused
+        {
             self.drop_session();
             self.broker_after_refusal = Some(reason);
         } else {
@@ -11951,6 +11980,13 @@ enum Refresh {
 /// description text. `needs_sign_in` admits only `Denied`, so the code is
 /// always there; the empty `code` of a token with no refresh token comes
 /// from `try_refresh`, not from here.
+/// Whether two tokens' accounts are the same, ignoring ASCII case; `None`
+/// when either names none.
+fn same_account(held: &str, renewed: &str) -> Option<bool> {
+    let (held, renewed) = (held.trim(), renewed.trim());
+    (!held.is_empty() && !renewed.is_empty()).then(|| held.eq_ignore_ascii_case(renewed))
+}
+
 fn expired(e: &auth::AuthError) -> SignInReason {
     SignInReason::Expired {
         code: e.refusal_code().unwrap_or_default(),
@@ -52530,7 +52566,7 @@ mod tests {
         fn a_refused_refresh_mid_drain_signs_in_with_the_broker_and_checks_first() {
             let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
             let srv = FakeServer::start_limited(refused_routes("ROOT_B"));
-            let (handle, token_path, dir) = spawn_refused(&srv, "dv12-broker", Some(broker));
+            let (handle, token_path, dir) = spawn_refused(&srv, "refused-broker", Some(broker));
             let events = wait_for(&handle.evt_rx, |e| {
                 matches!(e, SyncEvent::MailboxChanged { .. })
             });
@@ -52566,7 +52602,7 @@ mod tests {
         #[test]
         fn a_refused_refresh_with_no_broker_asks_for_a_sign_in() {
             let srv = FakeServer::start_limited(refused_routes("ROOT_A"));
-            let (handle, token_path, dir) = spawn_refused(&srv, "dv12-none", None);
+            let (handle, token_path, dir) = spawn_refused(&srv, "refused-none", None);
             let events = wait_for(&handle.evt_rx, |e| {
                 matches!(e, SyncEvent::SignInRequired { .. })
             });
@@ -53822,6 +53858,106 @@ mod tests {
             scopes,
             Some((strings(&["Mail.ReadWrite", "offline_access"]), Vec::new())),
             "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_sign_in_started_debug_print_hides_the_login_hint() {
+        let event = SyncEvent::SignInStarted {
+            authorize_url: "https://h/a?login_hint=person%40example.test&state=s".into(),
+        };
+        let printed = format!("{event:?}");
+        assert!(!printed.contains("person"), "{printed}");
+    }
+
+    /// A renewal whose token names another account than the session's is not
+    /// used: the session ends and a sign-in is asked, and no call carries it.
+    #[test]
+    fn a_renewed_brokered_token_of_another_account_is_not_used() {
+        let broker = fake_broker(|_, n| {
+            if n == 0 {
+                brokered("FIRST", 10)
+            } else {
+                BrokerResult::Token {
+                    access_token: "OTHER".into(),
+                    expires_at_unix: now_unix() + 3600,
+                    account: "someone.else@example.com".into(),
+                    scopes: Some(strings(SEEDED)),
+                }
+            }
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-other-account",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInStarted { .. })),
+            "{events:?}"
+        );
+        assert!(broker_calls(broker).len() >= 2);
+        let other = srv.requests().iter().any(|r| {
+            r.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer OTHER")
+        });
+        assert!(!other, "a request carried the other account's token");
+        finish(handle, dir);
+    }
+
+    /// A renewal whose token names no account signs in again through the
+    /// broker, so the mailbox check runs on the new token before any other
+    /// call; the renewal's own token is never sent.
+    #[test]
+    fn a_renewed_brokered_token_naming_no_account_checks_the_mailbox_first() {
+        let unnamed = |token: &str, expires_in: u64| BrokerResult::Token {
+            access_token: token.into(),
+            expires_at_unix: now_unix() + expires_in,
+            account: String::new(),
+            scopes: Some(strings(SEEDED)),
+        };
+        let broker = fake_broker(move |_, n| match n {
+            0 => unnamed("FIRST", 10),
+            1 => unnamed("SECOND", 3600),
+            _ => unnamed("THIRD", 3600),
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-unnamed-account",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 3);
+        let bearer = |r: &crate::testserver::RecordedRequest| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let sent: Vec<(String, String)> = srv
+            .requests()
+            .iter()
+            .map(|r| (r.path.clone(), bearer(r)))
+            .collect();
+        assert!(sent.iter().all(|(_, b)| b != "Bearer SECOND"), "{sent:?}");
+        let first_third = sent.iter().position(|(_, b)| b == "Bearer THIRD").unwrap();
+        assert!(
+            sent[first_third]
+                .0
+                .starts_with("/me/mailFolders/msgfolderroot"),
+            "{sent:?}"
         );
         finish(handle, dir);
     }

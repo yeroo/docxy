@@ -75,8 +75,9 @@ impl Cloud {
     }
 }
 
-/// Which tenant/app registration/scopes to authenticate against.
-#[derive(Debug, Clone)]
+/// Which tenant/app registration/scopes to authenticate against. Its
+/// `Debug` hides the login hint.
+#[derive(Clone)]
 pub struct AuthConfig {
     /// Names the tenant: its last path segment (`…/organizations`,
     /// `…/<tenant id>`). Its host is not used; the login host is
@@ -101,6 +102,78 @@ pub struct AuthConfig {
     /// non-empty one, the sign-in does not ask the person to pick an account
     /// first.
     pub login_hint: Option<String>,
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("authority", &self.authority)
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .field("optional_scope", &self.optional_scope)
+            .field("cloud", &self.cloud)
+            .field("login_hint", &self.login_hint.as_ref().map(|_| "<hidden>"))
+            .finish()
+    }
+}
+
+/// An `/authorize` URL as the browser opens it: `Display`, `Deref` and
+/// [`AuthorizeUrl::into_string`] give it whole, and its `Debug` gives it
+/// with the `login_hint` parameter's value hidden.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct AuthorizeUrl(String);
+
+impl AuthorizeUrl {
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for AuthorizeUrl {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for AuthorizeUrl {
+    fn from(url: String) -> AuthorizeUrl {
+        AuthorizeUrl(url)
+    }
+}
+
+impl From<&str> for AuthorizeUrl {
+    fn from(url: &str) -> AuthorizeUrl {
+        AuthorizeUrl(url.to_string())
+    }
+}
+
+impl fmt::Display for AuthorizeUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for AuthorizeUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shown = match self.0.split_once('?') {
+            Some((path, query)) => {
+                let params: Vec<&str> = query
+                    .split('&')
+                    .map(|p| {
+                        if p.starts_with("login_hint=") {
+                            "login_hint=<hidden>"
+                        } else {
+                            p
+                        }
+                    })
+                    .collect();
+                format!("{path}?{}", params.join("&"))
+            }
+            None => self.0.clone(),
+        };
+        f.debug_tuple("AuthorizeUrl").field(&shown).finish()
+    }
 }
 
 impl Default for AuthConfig {
@@ -748,6 +821,29 @@ mod tests {
             cloud: Cloud::Global,
             login_hint: None,
         }
+    }
+
+    #[test]
+    fn a_debug_print_hides_the_login_hint() {
+        let cfg = AuthConfig {
+            login_hint: Some("person@example.test".into()),
+            ..AuthConfig::default()
+        };
+        let printed = format!("{cfg:?}");
+        assert!(!printed.contains("person"), "{printed}");
+        assert!(printed.contains("<hidden>"), "{printed}");
+        let url =
+            AuthorizeUrl::from("https://h/a?client_id=c&login_hint=person%40example.test&state=s");
+        let printed = format!("{url:?}");
+        assert!(!printed.contains("person"), "{printed}");
+        assert!(
+            printed.contains("client_id=c&login_hint=<hidden>&state=s"),
+            "{printed}"
+        );
+        assert_eq!(
+            url.to_string(),
+            "https://h/a?client_id=c&login_hint=person%40example.test&state=s"
+        );
     }
 
     #[test]

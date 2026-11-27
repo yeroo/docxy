@@ -797,7 +797,9 @@ impl App {
             }
             SyncEvent::SignInStarted { authorize_url } => {
                 self.open_url_with_os_handler(&authorize_url);
-                self.signin_modal = Some(SignInModal::Started { authorize_url });
+                self.signin_modal = Some(SignInModal::Started {
+                    authorize_url: authorize_url.into_string(),
+                });
             }
             SyncEvent::AutomaticRepliesFetched { replies } => {
                 if let Some(form) = self.oof_form.as_mut() {

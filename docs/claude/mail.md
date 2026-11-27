@@ -6451,7 +6451,13 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   first pass), and none is `enter_signin` for the refusal's reason. With no broker set, a refusal
   asks for a sign-in at once. A second 401 on a brokered token sets `broker_refused` until a browser
   sign-in completes.
-- `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL.
+- A brokered token's renewal is used only when its account is the session's (`same_account`,
+  ASCII case ignored). Another account's ends the session as a refusal does, with a sign-in asked.
+  When either token names no account, the refusal sets `broker_recheck`, so `signin_after_refusal`
+  asks the broker again through `ask_broker_after_refusal`, whose `signed_in` makes the mailbox
+  check before any other call.
+- `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL. `AuthConfig`'s
+  `Debug` and `SyncEvent::SignInStarted`'s (`auth::AuthorizeUrl`) hide it.
 - `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
   terminal client's.
 - mailcore does not depend on `docxy-integration`: a host wraps its plugin's `token` method as the
@@ -6464,4 +6470,8 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `mailbox_change::a_refused_refresh_with_no_broker_asks_for_a_sign_in`,
   `mailbox_change::a_refused_refresh_whose_broker_gives_no_token_asks_for_a_sign_in`,
   `mailbox_change::a_command_while_offline_with_the_check_owed_stays_offline`,
-  `a_browser_sign_in_lets_the_broker_be_asked_again`.
+  `a_browser_sign_in_lets_the_broker_be_asked_again`,
+  `a_renewed_brokered_token_of_another_account_is_not_used`,
+  `a_renewed_brokered_token_naming_no_account_checks_the_mailbox_first`,
+  `a_sign_in_started_debug_print_hides_the_login_hint`;
+  `auth::tests::a_debug_print_hides_the_login_hint`.
