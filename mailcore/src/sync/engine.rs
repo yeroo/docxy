@@ -3282,7 +3282,8 @@ impl Engine {
         self.follow_saved_signin_backoff();
         self.next_tick = Instant::now() + self.config.tick;
         loop {
-            // A refused refresh's broker (DV12): after the step that met it.
+            // The broker after a refused refresh (#2317), once the step that
+            // met it has ended.
             if !self.shutting_down {
                 self.ask_broker_after_refusal();
             }
@@ -11174,7 +11175,7 @@ impl Engine {
     /// broker set drops the session as any refusal does, and leaves the
     /// broker to the main loop, once the work that met the refusal has
     /// ended ([`Engine::ask_broker_after_refusal`]); anything else is a
-    /// sign-in asked for `reason`, as before.
+    /// sign-in asked for `reason` at once.
     fn signin_after_refusal(&mut self, reason: SignInReason) {
         let saved_refused = !self.brokered && matches!(reason, SignInReason::Expired { .. });
         if saved_refused && self.config.options.broker.is_some() && !self.broker_refused {
@@ -52520,7 +52521,7 @@ mod tests {
             all
         }
 
-        /// DV12: a saved token whose refresh is refused mid-drain, with a
+        /// #2317: a saved token whose refresh is refused mid-drain, with a
         /// broker whose token holds another mailbox. The drain ends as at a
         /// refusal; the broker's token then signs in as a sign-in does, so
         /// the next call is the mailbox probe, which empties the store: no op
@@ -52560,11 +52561,10 @@ mod tests {
             finish(handle, dir);
         }
 
-        /// DV12 with no broker set: as `origin/main`, the refused refresh
-        /// asks for a sign-in; nothing goes out after it, and the saved
-        /// sign-in's file stays.
+        /// With no broker set, a refused refresh asks for a sign-in (#2317):
+        /// nothing goes out after it, and the saved sign-in's file stays.
         #[test]
-        fn a_refused_refresh_with_no_broker_asks_for_a_sign_in_as_before() {
+        fn a_refused_refresh_with_no_broker_asks_for_a_sign_in() {
             let srv = FakeServer::start_limited(refused_routes("ROOT_A"));
             let (handle, token_path, dir) = spawn_refused(&srv, "dv12-none", None);
             let events = wait_for(&handle.evt_rx, |e| {
@@ -52585,9 +52585,55 @@ mod tests {
             finish(handle, dir);
         }
 
+        /// A refused refresh whose broker gives no token (it needs the person,
+        /// or it cannot answer) asks for a sign-in for the refusal's reason
+        /// (#2317): the broker was asked, the drain ended at the refusal, the
+        /// saved sign-in's file stays, and the state is not left syncing.
+        #[test]
+        fn a_refused_refresh_whose_broker_gives_no_token_asks_for_a_sign_in() {
+            for (tag, interaction) in [
+                ("dv-none-interaction", true),
+                ("dv-none-unavailable", false),
+            ] {
+                let broker = fake_broker(move |_, _| {
+                    if interaction {
+                        BrokerResult::InteractionRequired("needs the person".into())
+                    } else {
+                        BrokerResult::Unavailable("no answer".into())
+                    }
+                });
+                let srv = FakeServer::start_limited(refused_routes("ROOT_A"));
+                let (handle, token_path, dir) = spawn_refused(&srv, tag, Some(broker));
+                let events = wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::State(SyncState::SignInRequired))
+                });
+                assert!(
+                    events.iter().any(|e| matches!(
+                        e,
+                        SyncEvent::SignInRequired {
+                            reason: SignInReason::Expired { .. }
+                        }
+                    )),
+                    "{tag}: {events:?}"
+                );
+                assert!(
+                    !broker_calls(broker).is_empty(),
+                    "{tag}: the broker was asked"
+                );
+                let patches = srv
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method == "PATCH")
+                    .count();
+                assert_eq!(patches, 1, "{tag}");
+                assert!(token_path.exists(), "{tag}");
+                finish(handle, dir);
+            }
+        }
+
         /// With the mailbox check owed and the engine offline, a command that
-        /// cannot reach Graph leaves the Offline state and its back-off as
-        /// `origin/main` does: no gate answers it in their place.
+        /// cannot reach Graph keeps the Offline state and its back-off
+        /// (#2317).
         #[test]
         fn a_command_while_offline_with_the_check_owed_stays_offline() {
             use crate::graph::model::{AutomaticReplies, ExternalAudience, OofStatus};
