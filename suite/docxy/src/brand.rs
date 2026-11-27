@@ -286,6 +286,9 @@ pub(crate) fn start(config_root: &std::path::Path, harness: bool) -> Option<Stri
         let integration = docxy_integration::start(config);
         let _ = branding();
         let _ = integration.context();
+        // The Mail and Chat tabs' values too, before the first window: their
+        // factories run on gpui's thread, which then reads them kept.
+        integration.ask_ahead(&[App::Mail, App::Chat]);
     }
     let notice = docxy_integration::global().take_notice();
     STARTUP_NOTICE.get_or_init(|| notice.clone());
@@ -850,7 +853,10 @@ pub(crate) mod tests {
 
     /// The suite shows its name only through this module, so an integration
     /// plugin's name replaces it. The guard does not see a name
-    /// built from parts: `concat!` or `format!` pieces, or char escapes.
+    /// built from parts: `concat!` or `format!` pieces, or char escapes;
+    /// nor a shared crate's texts the suite shows (it scans
+    /// `suite/docxy/src` only): those name the product through a parameter,
+    /// as htmlbundle's `*_for(app)` do.
     #[test]
     fn the_product_name_is_written_only_here() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");

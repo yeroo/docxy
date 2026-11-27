@@ -314,6 +314,35 @@ pub(crate) fn shown(label: &str) -> String {
     label.replace(APP, crate::brand::short())
 }
 
+/// One menu as the bar shows it: its title and its entries, each item's
+/// label filled ([`shown`]) and `None` for a separator.
+pub(crate) type ShownMenu = (String, Vec<Option<(String, Cmd)>>);
+
+/// The bar as [`install`] sets it: [`MENUS`] with every label filled.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn bar() -> Vec<ShownMenu> {
+    MENUS
+        .iter()
+        .map(|m| {
+            let entries = m
+                .entries
+                .iter()
+                .map(|e| match *e {
+                    Separator => None,
+                    Item(label, cmd) => Some((shown(label), cmd)),
+                })
+                .collect();
+            (shown(m.name), entries)
+        })
+        .collect()
+}
+
+/// The native dialogs' menu bar's one app item ([`native::Swap`]), filled.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn native_hide_label() -> String {
+    shown("Hide {app}")
+}
+
 /// Every command on the bar, in menu order.
 pub(crate) fn commands() -> impl Iterator<Item = Cmd> {
     MENUS.iter().flat_map(|m| {
@@ -722,11 +751,11 @@ pub(crate) fn install(cx: &mut App) {
         })
         .collect();
     cx.bind_keys(bindings);
-    cx.set_menus(MENUS.iter().map(|m| {
-        gpui::Menu::new(shown(m.name)).items(m.entries.iter().map(|e| match *e {
-            Separator => gpui::MenuItem::separator(),
-            Item(name, cmd) => gpui::MenuItem::Action {
-                name: shown(name).into(),
+    cx.set_menus(bar().into_iter().map(|(title, entries)| {
+        gpui::Menu::new(title).items(entries.into_iter().map(|e| match e {
+            None => gpui::MenuItem::separator(),
+            Some((name, cmd)) => gpui::MenuItem::Action {
+                name: name.into(),
                 action: cmd.action(),
                 os_action: cmd.os_action(),
                 checked: false,
@@ -769,7 +798,7 @@ mod native {
             // NSApplication answers hide: itself, before its delegate.
             app_menu.addItem(&item(
                 mtm,
-                &super::shown("Hide {app}"),
+                &super::native_hide_label(),
                 sel!(hide:),
                 "h",
                 cmd,
@@ -1030,6 +1059,36 @@ mod tests {
         assert_eq!(shown("Quit {app}"), "Quit docxy");
         assert_eq!(shown("{app} Help"), "docxy Help");
         assert_eq!(shown("Hide Others"), "Hide Others");
+    }
+
+    /// What `install` and the native dialogs' bar show: every `{app}` filled,
+    /// the app named docxy with no plugin, every command still on its item.
+    #[test]
+    fn the_bar_and_the_native_hide_item_fill_the_apps_name() {
+        let bar = bar();
+        let labels: Vec<&str> = bar
+            .iter()
+            .flat_map(|(title, entries)| {
+                std::iter::once(title.as_str())
+                    .chain(entries.iter().flatten().map(|(label, _)| label.as_str()))
+            })
+            .collect();
+        assert!(labels.iter().all(|l| !l.contains(APP)), "{labels:?}");
+        for want in [
+            "docxy",
+            "About docxy",
+            "Hide docxy",
+            "Quit docxy",
+            "docxy Help",
+        ] {
+            assert!(labels.contains(&want), "{want}: {labels:?}");
+        }
+        let cmds: Vec<Cmd> = bar
+            .iter()
+            .flat_map(|(_, entries)| entries.iter().flatten().map(|(_, cmd)| *cmd))
+            .collect();
+        assert_eq!(cmds, commands().collect::<Vec<_>>());
+        assert_eq!(native_hide_label(), "Hide docxy");
     }
 
     #[test]

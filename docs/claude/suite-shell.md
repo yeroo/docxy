@@ -190,6 +190,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   its id, so `SHEET_RIBBON` stays a `const` table) and the About dialog's title use
   `brand::about_label()` ("About" and the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
   titles use `brand::short()`. With no plugin, both are today's text.
+- `brand::start` also asks the Mail and Chat apps' branding and sign-in (`ask_ahead`) before the
+  first window, so the extension tabs' factories, on gpui's thread, read kept values and never
+  call the plugin.
 - The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
   failed, the first window's status line (`brand::startup_notice`). An accent refusal (once per
   theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds
@@ -216,4 +219,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   variables, `app_id`, temp names), stderr and crash-log lines, `--version` and the title-bar
   label per tab type. `brand::tests::the_product_name_is_written_only_here` fails on any other
   product-name literal in non-test source outside `brand.rs` that `NAME_LITERALS_KEPT` and
-  `NAME_HEADERS_KEPT` do not name; each named literal there has its reason.
+  `NAME_HEADERS_KEPT` do not name; each named literal there has its reason. It scans
+  `suite/docxy/src` only: a shared crate's texts the suite shows are outside it, so they take the
+  name as a parameter. htmlbundle's refusals and errors do (`check_html_target_for`,
+  `Error::text_for`, filled with `brand::short()` in `html_bundle`); a file name in them stays as
+  typed.

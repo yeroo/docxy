@@ -64,7 +64,7 @@ pub(crate) struct Opened {
 
 pub(crate) fn open(path: &Path) -> Result<Opened, String> {
     let html = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
-    let bundle = htmlbundle::unwrap(&html).map_err(|e| e.to_string())?;
+    let bundle = htmlbundle::unwrap(&html).map_err(named)?;
     if bundle.meta.format() != "docx" {
         return Err(format!(
             "this file holds a {} document, not a Word document",
@@ -92,9 +92,9 @@ pub(crate) fn bundle_bytes(
     opened: Option<&str>,
     docx: &[u8],
 ) -> Result<String, String> {
-    htmlbundle::check_html_target(path)?;
+    htmlbundle::check_html_target_for(path, crate::brand::short())?;
     if let Some(old) = opened {
-        return htmlbundle::rewrap(old, docx).map_err(|e| e.to_string());
+        return htmlbundle::rewrap(old, docx).map_err(named);
     }
     let engine = ENGINE.ok_or_else(|| {
         format!(
@@ -115,7 +115,12 @@ pub(crate) fn bundle_bytes(
         env!("CARGO_PKG_VERSION"),
         &htmlbundle::now_utc(),
     )
-    .map_err(|e| e.to_string())
+    .map_err(named)
+}
+
+/// `e`'s text with the suite's name ([`crate::brand::short`]) as the product.
+fn named(e: htmlbundle::Error) -> String {
+    e.text_for(crate::brand::short())
 }
 
 /// The bundle HTML a tab restored after a restart holds: its file's, when
@@ -123,7 +128,9 @@ pub(crate) fn bundle_bytes(
 /// hot-exit sidecar; the bundle is what Save and Save As rewrap.)
 pub(crate) fn restored_bundle(path: Option<&Path>) -> Option<String> {
     let path = path.filter(|p| doc_target(p, false) == DocTarget::Html)?;
-    htmlbundle::check_html_target(path).ok().flatten()
+    htmlbundle::check_html_target_for(path, crate::brand::short())
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
