@@ -189,7 +189,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
 - Names: the About commands (the sheet ribbon's through `SheetCmd::label` and `text`, keyed by
   its id, so `SHEET_RIBBON` stays a `const` table) and the About dialog's title use
   `brand::about_label()` ("About" and the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
-  titles use `brand::short()`. With no plugin, both are today's text.
+  titles use `brand::short()`. With no plugin, both name the suite ("About docxy suite", "docxy").
 - `brand::start` also asks the Mail and Chat apps' branding and sign-in (`ask_ahead`) before the
   first window, so the extension tabs' factories, on gpui's thread, read kept values and never
   call the plugin.

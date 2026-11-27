@@ -146,7 +146,7 @@ pub(crate) fn set_chrome(d: Drawn) {
 
 /// The brand's roles now, whichever tab is selected: the chrome outside
 /// the ribbon, backstage and title bar (dialogs, panes, bars, fields)
-/// draws these, so a sheet tab's dialog keeps the brand as before and a
+/// draws these, so a sheet tab's dialog keeps the brand's teal and a
 /// plugin's colours reach it. Without a plugin each is `BRAND` (on_fill
 /// `FILE_FG`).
 pub(crate) fn chrome() -> Drawn {
@@ -637,7 +637,7 @@ mod tests {
     }
 
     /// With no plugin the brand's roles are `BRAND` (text on the fill
-    /// `FILE_FG`), so the chrome draws as before, whichever tab is
+    /// `FILE_FG`), so the chrome draws the brand's own colours, whichever tab is
     /// selected: they start from the brand, not the tab's accent.
     #[test]
     fn the_brands_roles_are_brand_without_a_plugin() {
