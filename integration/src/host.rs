@@ -13,7 +13,7 @@ use std::ffi::{CString, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The registry key that holds the folder on Windows, under HKLM.
 pub const REGISTRY_KEY: &str = r"SOFTWARE\docxy\Integration";
@@ -32,8 +32,8 @@ pub enum Hive {
 /// Where [`plugin_dir`] reads the folder.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
-    /// A `REG_SZ` value, read from the 64-bit view. Windows only; elsewhere
-    /// it holds no folder.
+    /// A `REG_SZ` value, read from the 64-bit view; a value of another type
+    /// names no folder. Windows only; elsewhere it holds no folder.
     Registry {
         hive: Hive,
         key: String,
@@ -74,7 +74,8 @@ fn registry_string(hive: Hive, key: &str, value: &str) -> Option<OsString> {
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
-        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY, RegGetValueW,
+        HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_SZ, RRF_SUBKEY_WOW6464KEY,
+        RegGetValueW,
     };
     let root = match hive {
         Hive::LocalMachine => HKEY_LOCAL_MACHINE,
@@ -87,7 +88,9 @@ fn registry_string(hive: Hive, key: &str, value: &str) -> Option<OsString> {
             .collect()
     };
     let (key, value) = (wide(key), wide(value));
-    let flags = RRF_RT_REG_SZ | RRF_SUBKEY_WOW6464KEY;
+    // Without `RRF_NOEXPAND` a `REG_EXPAND_SZ` would pass as `REG_SZ`, expanded with the
+    // caller's own environment.
+    let flags = RRF_RT_REG_SZ | RRF_NOEXPAND | RRF_SUBKEY_WOW6464KEY;
     let mut size = 0u32;
     // SAFETY: both names are NUL-terminated; a null buffer asks the size.
     let status = unsafe {
@@ -222,6 +225,12 @@ pub fn shutdown() {
 /// Load the one `dxi_*` library in `dir` for `config`, unless a crash
 /// marker of `config.app` says the last run ended in a plugin call.
 pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
+    if !dir.is_absolute() {
+        return Integration::refused(
+            dir.display().to_string(),
+            "the folder is not an absolute path".into(),
+        );
+    }
     let library = match find_library(dir) {
         Ok(library) => library,
         Err(why) => return Integration::refused(dir.display().to_string(), why),
@@ -391,15 +400,15 @@ impl Integration {
 
     /// The plugin's names and icons for `app`, asked once and kept.
     pub fn branding(&self, app: App) -> Option<Branding> {
+        self.branding_within(app, self.deadlines.call)
+    }
+
+    fn branding_within(&self, app: App, deadline: Duration) -> Option<Branding> {
         if let Some(known) = lock(&self.branding).get(&app) {
             return known.clone();
         }
         let answer = self
-            .call(
-                abi::METHOD_BRANDING,
-                AppRequest { app }.to_json(),
-                self.deadlines.call,
-            )
+            .call(abi::METHOD_BRANDING, AppRequest { app }.to_json(), deadline)
             .ok()
             .and_then(|text| Branding::from_json(&text).ok());
         lock(&self.branding).insert(app, answer.clone());
@@ -408,31 +417,42 @@ impl Integration {
 
     /// The plugin's sign-in settings for `app`, asked once and kept.
     pub fn sign_in(&self, app: App) -> Option<SignIn> {
+        self.sign_in_within(app, self.deadlines.call)
+    }
+
+    fn sign_in_within(&self, app: App, deadline: Duration) -> Option<SignIn> {
         if let Some(known) = lock(&self.sign_in).get(&app) {
             return known.clone();
         }
         let answer = self
-            .call(
-                abi::METHOD_SIGN_IN,
-                AppRequest { app }.to_json(),
-                self.deadlines.call,
-            )
+            .call(abi::METHOD_SIGN_IN, AppRequest { app }.to_json(), deadline)
             .ok()
             .and_then(|text| SignIn::from_json(&text).ok());
         lock(&self.sign_in).insert(app, answer.clone());
         answer
     }
 
-    /// Asks and keeps `apps`' branding and sign-in settings now, on the
-    /// caller's thread: a host that starts the plugin before its first window
-    /// calls it there, so a later [`Integration::branding`] or
-    /// [`Integration::sign_in`] for one of them (a tab made on the UI thread)
-    /// reads the kept value and calls nothing.
-    pub fn ask_ahead(&self, apps: &[App]) {
-        for &app in apps {
-            let _ = self.branding(app);
-            let _ = self.sign_in(app);
+    /// Asks and keeps the branding of `branding`'s apps, the sign-in
+    /// settings of `sign_in`'s, and the context, now, on the caller's thread,
+    /// all by `end`: a host that starts the plugin before its first window
+    /// calls it there, so a later [`Integration::branding`],
+    /// [`Integration::sign_in`] or [`Integration::context`] (a tab made on
+    /// the UI thread) reads the kept value and calls nothing. Each call waits
+    /// for what is left until `end`, at most its own deadline; past `end`,
+    /// the plugin is stopped for the run, as at any call's deadline.
+    pub fn ask_ahead_by(&self, branding: &[App], sign_in: &[App], end: Instant) {
+        let left = || {
+            self.deadlines
+                .call
+                .min(end.saturating_duration_since(Instant::now()))
+        };
+        for &app in branding {
+            let _ = self.branding_within(app, left());
         }
+        for &app in sign_in {
+            let _ = self.sign_in_within(app, left());
+        }
+        let _ = self.context_within(left());
     }
 
     /// A token from the plugin, asked each time. Any failure is
@@ -447,9 +467,13 @@ impl Integration {
 
     /// The person's organization and desktop, asked once and kept.
     pub fn context(&self) -> Option<Context> {
+        self.context_within(self.deadlines.call)
+    }
+
+    fn context_within(&self, deadline: Duration) -> Option<Context> {
         self.context
             .get_or_init(|| {
-                self.call(abi::METHOD_CONTEXT, "{}".into(), self.deadlines.call)
+                self.call(abi::METHOD_CONTEXT, "{}".into(), deadline)
                     .ok()
                     .and_then(|text| Context::from_json(&text).ok())
             })
@@ -473,6 +497,9 @@ impl Integration {
         let _turn = lock(&worker.turn);
         if worker.stopped.load(Ordering::SeqCst) {
             return Err(format!("{} stopped answering", worker.file));
+        }
+        if deadline.is_zero() {
+            return Err(self.stop(worker, format!("no time was left for {method}")));
         }
         let (reply, answer) = mpsc::channel();
         let job: Job = Box::new(move |loaded: &Loaded| {

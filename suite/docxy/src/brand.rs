@@ -283,12 +283,18 @@ pub(crate) fn start(config_root: &std::path::Path, harness: bool) -> Option<Stri
             env!("CARGO_PKG_VERSION"),
             Some(config_root.join("docxy")),
         );
+        // Loading and every call before the first window share the load's
+        // deadline.
+        let end = std::time::Instant::now() + config.deadlines.init;
         let integration = docxy_integration::start(config);
+        // The Mail and Chat tabs' values too: their factories run on gpui's
+        // thread, which then reads them kept.
+        integration.ask_ahead_by(
+            &[App::Suite, App::Mail, App::Chat],
+            &[App::Mail, App::Chat],
+            end,
+        );
         let _ = branding();
-        let _ = integration.context();
-        // The Mail and Chat tabs' values too, before the first window: their
-        // factories run on gpui's thread, which then reads them kept.
-        integration.ask_ahead(&[App::Mail, App::Chat]);
     }
     let notice = docxy_integration::global().take_notice();
     STARTUP_NOTICE.get_or_init(|| notice.clone());

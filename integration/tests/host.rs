@@ -174,10 +174,16 @@ fn one_library_loads_and_answers_every_method() {
 fn a_value_asked_ahead_is_kept_and_asked_no_more() {
     let dir = plugin_folder("ahead", None);
     let plugin = load_from(&dir, &config(App::Suite));
-    plugin.ask_ahead(&[App::Mail, App::Chat]);
+    plugin.ask_ahead_by(
+        &[App::Suite, App::Mail, App::Chat],
+        &[App::Mail, App::Chat],
+        std::time::Instant::now() + Duration::from_secs(60),
+    );
     assert_eq!(
         methods(&dir),
-        ["branding", "sign_in", "branding", "sign_in"]
+        [
+            "branding", "branding", "branding", "sign_in", "sign_in", "context"
+        ]
     );
     assert_eq!(
         plugin
@@ -189,7 +195,8 @@ fn a_value_asked_ahead_is_kept_and_asked_no_more() {
     assert!(plugin.sign_in(App::Mail).is_some());
     assert!(plugin.branding(App::Mail).is_some());
     assert!(plugin.sign_in(App::Chat).is_some());
-    assert_eq!(methods(&dir).len(), 4);
+    assert!(plugin.context().is_some());
+    assert_eq!(methods(&dir).len(), 6);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -422,6 +429,49 @@ fn a_method_the_plugin_does_not_offer_is_never_called() {
 }
 
 #[test]
+fn a_relative_folder_is_refused() {
+    let plugin = load_from(Path::new("plugins"), &config(App::Suite));
+    assert_eq!(
+        refusal(&plugin),
+        (
+            "plugins".to_string(),
+            "the folder is not an absolute path".to_string()
+        )
+    );
+}
+
+#[test]
+fn the_calls_ahead_share_one_budget() {
+    let dir = plugin_folder("budget", Some("slow 300"));
+    let plugin = load_from(&dir, &config(App::Suite));
+    let started = std::time::Instant::now();
+    plugin.ask_ahead_by(
+        &[App::Mail, App::Chat],
+        &[App::Mail, App::Chat],
+        started + Duration::from_millis(500),
+    );
+    let spent = started.elapsed();
+    assert!(spent < Duration::from_millis(900), "{spent:?}");
+    let (_, why) = refusal(&plugin);
+    assert!(
+        why.starts_with("it did not answer branding within"),
+        "{why}"
+    );
+    assert_eq!(plugin.sign_in(App::Mail), None);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn no_call_is_made_once_the_budget_is_spent() {
+    let dir = plugin_folder("budget-spent", None);
+    let plugin = load_from(&dir, &config(App::Suite));
+    plugin.ask_ahead_by(&[App::Suite], &[App::Mail], std::time::Instant::now());
+    assert_eq!(refusal(&plugin).1, "no time was left for branding");
+    assert!(calls(&dir).is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn no_value_names_no_folder_and_loads_nothing() {
     let unset = format!("DXI_TEST_UNSET_{}", std::process::id());
     assert_eq!(plugin_dir(&Source::Env(unset.clone())), None);
@@ -478,6 +528,41 @@ fn a_registry_value_names_its_folder() {
     assert_eq!(set, 0);
     assert_eq!(found, Some(dir.clone()));
     assert!(matches!(status, Status::Loaded { .. }), "{status:?}");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(windows)]
+#[test]
+fn an_expandable_registry_value_names_no_folder() {
+    use docxy_integration::host::{Hive, REGISTRY_VALUE};
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, REG_EXPAND_SZ, RegDeleteTreeW, RegSetKeyValueW,
+    };
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let key = format!(r"Software\docxy-integration-expand-{}", std::process::id());
+    let source = Source::Registry {
+        hive: Hive::CurrentUser,
+        key: key.clone(),
+        value: REGISTRY_VALUE.into(),
+    };
+    let dir = plugin_folder("registry-expand", None);
+    let data = wide(&dir.display().to_string());
+    // SAFETY: NUL-terminated names and `data.len()` UTF-16 units of data.
+    let set = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            wide(&key).as_ptr(),
+            wide(REGISTRY_VALUE).as_ptr(),
+            REG_EXPAND_SZ,
+            data.as_ptr().cast(),
+            (data.len() * 2) as u32,
+        )
+    };
+    let found = plugin_dir(&source);
+    // SAFETY: deletes the test's own key.
+    unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, wide(&key).as_ptr()) };
+    assert_eq!(set, 0);
+    assert_eq!(found, None);
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -184,15 +184,16 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
 
 - `brand.rs` is the one place the suite reads its integration plugin (`docs/integration-plugins.md`).
   `run()` calls `brand::start` after the harness gate and the format plugins, before the app loop
-  and so before any `docxy_integration::global()`. A harness instance loads no integration plugin,
-  as it inherits no plugin folders.
+  and so before any `docxy_integration::global()`. A harness instance loads no integration plugin:
+  `brand::start` skips the load for it, whatever folder the registry or the environment names.
 - Names: the About commands (the sheet ribbon's through `SheetCmd::label` and `text`, keyed by
   its id, so `SHEET_RIBBON` stays a `const` table) and the About dialog's title use
   `brand::about_label()` ("About" and the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
   titles use `brand::short()`. With no plugin, both name the suite ("About docxy suite", "docxy").
-- `brand::start` also asks the Mail and Chat apps' branding and sign-in (`ask_ahead`) before the
-  first window, so the extension tabs' factories, on gpui's thread, read kept values and never
-  call the plugin.
+- `brand::start` also asks the Mail and Chat apps' branding and sign-in, and the context
+  (`ask_ahead_by`), before the first window, so the extension tabs' factories, on gpui's thread,
+  read kept values and never call the plugin. Loading and all of these calls share the load's 5 s
+  deadline, not one deadline each.
 - The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
   failed, the first window's status line (`brand::startup_notice`). An accent refusal (once per
   theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds
@@ -200,7 +201,8 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   names `brand::product()` and ends with those rows. `app-info` carries `integration`. The quit
   hook calls `docxy_integration::host::shutdown()`, so a normal quit leaves no crash marker.
 - Each window gets the plugin's icon in `open_docxy_window` (`brand::set_window_icon`, Windows).
-- Accents: the brand's colour (doc, mail, no tab) has four roles in `accent.rs`: `fill` (the File
+- Accents: the brand's colour (every tab kind but sheet and project, which keep their own, and an
+  extension tab with no accent of its own) has four roles in `accent.rs`: `fill` (the File
   button, washes, a checked box, the focus ring), `on_fill` (its text), `mark` (the active tab's
   underline, a selected tile's and a hover border) and `text` (accent text). `accent::drawn` gives
   them the plugin's `primary`, its text, `highlight` and `link` that `brand::accents` takes for the

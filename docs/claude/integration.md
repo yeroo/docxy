@@ -10,9 +10,11 @@
   `shutdown()` from each host's quit hook. One worker thread makes every call. A call's deadline
   starts when it takes the worker's turn lock, so a call queued behind a slow `token` keeps its
   whole deadline. A call past its deadline stops the plugin for the run. `branding` and `sign_in`
-  are asked once per app and kept, `context` once per process; `ask_ahead` asks the first two for
-  several apps at once. The crash marker `dxi-<app>-<pid>.marker` is written around loading,
-  `dxi_abi`, `dxi_init` and each call. `shutdown()` removes it unless a call was abandoned.
+  are asked once per app and kept, `context` once per process; `ask_ahead_by` asks them for
+  several apps at once, every call within one budget that ends at a given instant (a call that
+  would wait past it stops the plugin, and none is made once it has passed). The crash marker
+  `dxi-<app>-<pid>.marker` is written around loading, `dxi_abi`, `dxi_init` and each call.
+  `shutdown()` removes it unless a call was abandoned.
 - `accent.rs` holds the colour rule every host applies to the plugin's accents (`check` per role on
   the theme's background); `win_icon.rs` sets a window's icon (Windows).
 - The hosts: the suite (`suite/docxy/src/brand.rs`, `docs/claude/suite-shell.md`); mailcore takes
