@@ -244,7 +244,7 @@ impl PdfView {
                 fit_width,
             } => self.go_dest(page, x, y, zoom, fit_width),
             LinkGo::Other { what } => {
-                self.notice = Some(format!("The link was not followed: it is {}", named(what)));
+                self.notice = Some(format!("The link was not followed: it is {}", named(&what)));
             }
         }
     }
