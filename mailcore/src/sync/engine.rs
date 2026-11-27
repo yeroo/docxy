@@ -2393,8 +2393,11 @@ pub struct EngineOptions {
 ///   before the browser sign-in;
 /// - for a token it gave, near its expiry and on a 401, in place of a
 ///   refresh;
-/// - when a saved token's refresh is refused, before a sign-in is asked
-///   for; its token then replaces the saved one, whose file goes.
+/// - when a saved token's refresh is refused (or it has no refresh token),
+///   once the pass or drain that met the refusal has ended as at any
+///   refusal: its token signs in as a sign-in does (the saved token's file
+///   removed, the mailbox check owed and made first), and with none a
+///   sign-in is asked for, as with no broker.
 ///
 /// When it gives nothing near a token's expiry, the token is used until it
 /// expires. A token Graph refuses twice (a second 401) stops the engine
@@ -2900,17 +2903,17 @@ struct Engine {
     /// refused `Class` batch.
     meeting_class_refused: bool,
     /// An interactive sign-in's mailbox check is owed (#1946,
-    /// `check_mailbox`), or a broker's token swapped in for a refused
-    /// refresh (`broker_in_place`): until it is made, no Graph call goes
-    /// out but the check itself ([`Engine::graph_gate`]), so nothing is
-    /// drained, synced, filled or served. Mirrors
+    /// `check_mailbox`): until it is made, nothing is drained or synced,
+    /// and no backfill, prefetch or size fill runs. Mirrors
     /// `meta.mailbox_check_owed`, which `sign_in` writes before it saves
     /// the token, so it survives a restart; a startup with a cached token
     /// and no owed check probes nothing.
     mailbox_unchecked: bool,
-    /// `check_mailbox`'s probe is running: the one call [`Engine::graph_gate`]
-    /// lets through while the check is owed.
-    checking_mailbox: bool,
+    /// A saved token's refresh was refused with a broker set: the session
+    /// was dropped as at a refusal, and the main loop asks the broker next
+    /// ([`Engine::ask_broker_after_refusal`]), signing in with its token or
+    /// asking for a sign-in for this reason.
+    broker_after_refusal: Option<SignInReason>,
     /// A probe that failed for a reason `react` does not handle (a 5xx, a
     /// 4xx, a parse error, a store error) holds the next one off until this
     /// instant (#1946), so a fast tick does not probe every few seconds.
@@ -3040,7 +3043,7 @@ impl Engine {
             type_parked: Vec::new(),
             meeting_class_refused: false,
             mailbox_unchecked,
-            checking_mailbox: false,
+            broker_after_refusal: None,
             check_retry: None,
             check_backoff: BACKOFF_MIN,
         }
@@ -3279,6 +3282,10 @@ impl Engine {
         self.follow_saved_signin_backoff();
         self.next_tick = Instant::now() + self.config.tick;
         loop {
+            // A refused refresh's broker (DV12): after the step that met it.
+            if !self.shutting_down {
+                self.ask_broker_after_refusal();
+            }
             if let Some((cmd, taken)) = self.deferred.pop_front() {
                 if self.shutting_down && !persists_at_shutdown(&cmd) {
                     continue;
@@ -6845,9 +6852,7 @@ impl Engine {
         // `None`, and the owed re-read below handles it as ever (no pause,
         // no back-off, no sign-in from here).
         let server = match (write, err) {
-            (ContactWrite::Update | ContactWrite::Delete, GraphError::Http { status: 412, .. })
-                if self.graph_gate().is_ok() =>
-            {
+            (ContactWrite::Update | ContactWrite::Delete, GraphError::Http { status: 412, .. }) => {
                 self.client().contact(&id).ok()
             }
             _ => None,
@@ -8359,7 +8364,6 @@ impl Engine {
     /// (#1874). A `CreateFolder` goes through `create_folder` with it too,
     /// so a retry answered 409 adopts the folder its lost POST made (#2109).
     fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<Applied, GraphError> {
-        self.graph_gate()?;
         // A `SendDraft`'s upload progress (#1941) goes out as it runs, from
         // a clone: the closure must not borrow `self` across `try_refresh`.
         let evt_tx = self.evt_tx.clone();
@@ -8390,10 +8394,6 @@ impl Engine {
                     let client = self.client();
                     apply(&client, &self.store)
                 }
-                // The mailbox check first: the drain ends, the op kept.
-                Refresh::Swapped => Err(GraphError::Throttled {
-                    retry_after_secs: 0,
-                }),
                 Refresh::SignIn(reason) => {
                     self.refused_refresh = Some(reason);
                     Err(GraphError::Unauthorized)
@@ -10501,39 +10501,19 @@ impl Engine {
 
     // --- Auth ------------------------------------------------------------
 
-    /// Whether a Graph call may go out now: not while the mailbox check is
-    /// owed (`mailbox_unchecked`), but for the check's own probe. Refused, it
-    /// is a zero-second throttle: the pass, drain or bulk loop that made the
-    /// call ends with its op kept, a command served between passes is
-    /// answered as throttled, and the next pass, brought forward, checks
-    /// first. Every Graph call passes here: [`Engine::with_auth`],
-    /// [`Engine::apply_op_with_retry`], and the contact re-read after a
-    /// refused write (`refuse_contact_write`).
-    fn graph_gate(&self) -> Result<(), GraphError> {
-        if self.mailbox_unchecked && !self.checking_mailbox {
-            return Err(GraphError::Throttled {
-                retry_after_secs: 0,
-            });
-        }
-        Ok(())
-    }
-
-    /// Runs a Graph call with the current token, once [`Engine::graph_gate`]
-    /// lets it. A brokered token near its expiry is asked of the broker first
-    /// (`renew_brokered_near_expiry`). On a 401 the token is renewed once
-    /// ([`Engine::try_refresh`]) and the call retried; a 401 still escaping
-    /// means that did not help, and the caller treats it as "sign-in
-    /// required". A renewal that swapped in the broker's token
-    /// ([`Refresh::Swapped`]) is not retried: it answers a zero-second
-    /// throttle, and the gate holds every later call until the check. A
-    /// refresh that failed transiently (#2167) is a `Transport` error
-    /// instead (`refresh_transport`): the caller goes offline and keeps the
-    /// token.
+    /// Runs a Graph call with the current token. A brokered token near its
+    /// expiry is asked of the broker first (`renew_brokered_near_expiry`). On
+    /// a 401 the token is renewed once ([`Engine::try_refresh`]) and the call
+    /// retried; a 401 still escaping means that did not help, and the caller
+    /// treats it as "sign-in required" (`signin_after_401`), which with a
+    /// broker set may sign in with the broker's token once the pass or
+    /// drain has ended ([`Engine::signin_after_refusal`]). A refresh that
+    /// failed transiently (#2167) is a `Transport` error instead
+    /// (`refresh_transport`): the caller goes offline and keeps the token.
     fn with_auth<T>(
         &mut self,
         f: impl Fn(&GraphClient) -> Result<T, GraphError>,
     ) -> Result<T, GraphError> {
-        self.graph_gate()?;
         self.renew_brokered_near_expiry()?;
         let first = {
             let client = self.client();
@@ -10545,12 +10525,6 @@ impl Engine {
                     let client = self.client();
                     f(&client)
                 }
-                // Not retried: the gate holds every call until the mailbox
-                // check, which the next pass, brought forward, makes first
-                // ([`Refresh::Swapped`]).
-                Refresh::Swapped => Err(GraphError::Throttled {
-                    retry_after_secs: 0,
-                }),
                 Refresh::SignIn(reason) => {
                     self.refused_refresh = Some(reason);
                     Err(GraphError::Unauthorized)
@@ -10620,10 +10594,9 @@ impl Engine {
             return true;
         }
         match self.try_refresh() {
-            // A swap's check is the pass's first step.
-            Refresh::Done | Refresh::Swapped => true,
+            Refresh::Done => true,
             Refresh::SignIn(reason) => {
-                self.enter_signin(reason);
+                self.signin_after_refusal(reason);
                 false
             }
             Refresh::Transient(_) => {
@@ -10668,15 +10641,15 @@ impl Engine {
 
     /// Renews the token. A brokered token is asked of the broker again
     /// (never saved), and none from it is [`Refresh::SignIn`]. A saved token
-    /// exchanges its refresh token for a fresh token set and persists it. A
-    /// saved token with no refresh token, or whose grant the endpoint
-    /// refused (`AuthError::needs_sign_in`), gives way to the broker's token
-    /// when the broker gives one ([`Engine::broker_in_place`],
-    /// [`Refresh::Swapped`], the token file deleted), else is
-    /// [`Refresh::SignIn`]; no token at all is [`Refresh::SignIn`]. Any
-    /// other failure (a dropped connection, a 5xx/429 page, a body that
-    /// does not parse, `temporarily_unavailable`, #2167) is
-    /// [`Refresh::Transient`], with the token kept in memory and on disk.
+    /// exchanges its refresh token for a fresh token set and persists it. No
+    /// token, no refresh token to refresh with, or an endpoint that refused
+    /// the grant (`AuthError::needs_sign_in`), is [`Refresh::SignIn`]: its
+    /// caller ends the pass or drain as at any refusal, and the refusal of a
+    /// saved token then asks the broker, when one is set, before a sign-in
+    /// ([`Engine::signin_after_refusal`]). Any other failure (a dropped
+    /// connection, a 5xx/429 page, a body that does not parse,
+    /// `temporarily_unavailable`, #2167) is [`Refresh::Transient`], with the
+    /// token kept in memory and on disk.
     /// Token values are never logged. While the token's grant is known and
     /// shares a scope with `AuthConfig::scope`, the refresh asks only for the
     /// scopes of `AuthConfig::scope` it was granted (otherwise
@@ -10709,12 +10682,10 @@ impl Engine {
             };
         }
         if token.refresh_token.is_empty() {
-            return self
-                .broker_in_place()
-                .unwrap_or(Refresh::SignIn(SignInReason::Expired {
-                    code: String::new(),
-                    aadsts: None,
-                }));
+            return Refresh::SignIn(SignInReason::Expired {
+                code: String::new(),
+                aadsts: None,
+            });
         }
         let (refresh_token, previous_scopes) = (token.refresh_token.clone(), token.scopes.clone());
         match auth::refresh(
@@ -10734,43 +10705,9 @@ impl Engine {
                 self.announce_scopes();
                 Refresh::Done
             }
-            Err(e) if e.needs_sign_in() => self
-                .broker_in_place()
-                .unwrap_or_else(|| Refresh::SignIn(expired(&e))),
+            Err(e) if e.needs_sign_in() => Refresh::SignIn(expired(&e)),
             Err(e) => Refresh::Transient(e.to_string()),
         }
-    }
-
-    /// A saved token that cannot be refreshed, replaced by the broker's: the
-    /// session goes on brokered, and the stale token file goes (a brokered
-    /// token is never saved), so the next start asks the broker too. The
-    /// broker's account may hold another mailbox, so its check is owed, as
-    /// after a sign-in, and the answer is [`Refresh::Swapped`]: a call that
-    /// asked for the refresh is not retried on the new token, and
-    /// [`Engine::graph_gate`] refuses every later one until the check, which
-    /// the next pass, made due now, runs first. `None` with no broker or no
-    /// token from it.
-    fn broker_in_place(&mut self) -> Option<Refresh> {
-        let t = self.ask_broker()?;
-        if let Err(e) = self.clear_token() {
-            self.emit(SyncEvent::Error(format!(
-                "cannot remove the saved sign-in: {e}"
-            )));
-        }
-        if let Err(e) = self.store.set_mailbox_check_owed() {
-            self.emit(SyncEvent::Error(format!(
-                "cannot record the mailbox check: {e}"
-            )));
-        }
-        self.mailbox_unchecked = true;
-        // The check at once: the next pass is due now, whatever the tick.
-        let now = Instant::now();
-        self.next_fast = now;
-        self.next_full = now;
-        self.token = Some(t);
-        self.brokered = true;
-        self.announce_scopes();
-        Some(Refresh::Swapped)
     }
 
     /// The interactive sign-in seam: at most two attempts
@@ -11065,10 +11002,7 @@ impl Engine {
             self.settle_state();
             return MailboxCheck::Blocked;
         }
-        self.checking_mailbox = true;
-        let probed = self.with_auth(|c| c.mailbox_root_id());
-        self.checking_mailbox = false;
-        let root = match probed {
+        let root = match self.with_auth(|c| c.mailbox_root_id()) {
             Ok(root) => root,
             Err(
                 e @ (GraphError::Unauthorized
@@ -11230,7 +11164,47 @@ impl Engine {
         if self.brokered && reason == SignInReason::Rejected {
             self.broker_refused = true;
         }
-        self.enter_signin(reason);
+        self.signin_after_refusal(reason);
+    }
+
+    /// Where every refusal of the session's token ends (a 401 the renewal
+    /// did not help, `signin_after_401`, from a pass, a drain, a bulk loop, a
+    /// fill or a command; or the start's refresh, `refresh_if_near_expiry`).
+    /// A saved token whose refresh was refused (or that has none) with a
+    /// broker set drops the session as any refusal does, and leaves the
+    /// broker to the main loop, once the work that met the refusal has
+    /// ended ([`Engine::ask_broker_after_refusal`]); anything else is a
+    /// sign-in asked for `reason`, as before.
+    fn signin_after_refusal(&mut self, reason: SignInReason) {
+        let saved_refused = !self.brokered && matches!(reason, SignInReason::Expired { .. });
+        if saved_refused && self.config.options.broker.is_some() && !self.broker_refused {
+            self.drop_session();
+            self.broker_after_refusal = Some(reason);
+        } else {
+            self.enter_signin(reason);
+        }
+    }
+
+    /// The broker after a refused refresh ([`Engine::signin_after_refusal`]),
+    /// asked from the main loop between its steps: its token signs in as a
+    /// sign-in does (`signed_in`, brokered: the stale token file removed,
+    /// the mailbox check owed, the first pass checking first); with none, a
+    /// sign-in is asked for the refusal's reason.
+    fn ask_broker_after_refusal(&mut self) {
+        let Some(reason) = self.broker_after_refusal.take() else {
+            return;
+        };
+        match self.ask_broker() {
+            Some(t) => {
+                if let Err(e) = self.clear_token() {
+                    self.emit(SyncEvent::Error(format!(
+                        "cannot remove the saved sign-in: {e}"
+                    )));
+                }
+                self.signed_in(t, true);
+            }
+            None => self.enter_signin(reason),
+        }
     }
 
     /// Drop to signed-out: clear the token and announce `SignInRequired`
@@ -11241,6 +11215,13 @@ impl Engine {
     /// the tick again, and the next session's back-off starts at
     /// `BACKOFF_MIN`.
     fn enter_signin(&mut self, reason: SignInReason) {
+        self.drop_session();
+        self.emit(SyncEvent::SignInRequired { reason });
+        self.set_state(SyncState::SignInRequired);
+    }
+
+    /// What [`Engine::enter_signin`] drops before it asks for a sign-in.
+    fn drop_session(&mut self) {
         self.token = None;
         self.brokered = false;
         self.refused_refresh = None;
@@ -11257,8 +11238,6 @@ impl Engine {
         self.masters_not_found.clear();
         self.masters_skipped.clear();
         self.user_ids.clear();
-        self.emit(SyncEvent::SignInRequired { reason });
-        self.set_state(SyncState::SignInRequired);
     }
 
     /// Suspend syncing until `after` from now (throttle `Retry-After`), without
@@ -11957,11 +11936,6 @@ fn numbered_sibling(path: &std::path::Path, n: u32) -> Option<PathBuf> {
 enum Refresh {
     /// A fresh token is in place (saved unless brokered).
     Done,
-    /// The broker's token replaced a saved one it may not share a mailbox
-    /// with (`Engine::broker_in_place`): its mailbox check is owed, and
-    /// `Engine::graph_gate` lets no call but the check's probe go out on it
-    /// until the check is made.
-    Swapped,
     /// Nothing to refresh, or the endpoint refused the grant: sign in
     /// again, for this reason (#2169).
     SignIn(SignInReason),
@@ -52476,15 +52450,59 @@ mod tests {
                 .count()
         }
 
-        /// A saved token whose refresh is refused mid-drain gives way to the
-        /// broker's, whose account holds another mailbox: the drain ends, the
-        /// op is kept, and the next drain's first call on the new token is
-        /// the mailbox check, which empties the store; no op goes out on it.
-        #[test]
-        fn a_broker_token_swapped_in_mid_drain_is_checked_before_any_op() {
-            let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
-            let srv = FakeServer::start_limited(vec![
-                (get_route(PROBE, 200, r#"{"id":"ROOT_B"}"#), None),
+        /// The bearer of `r`, empty without one.
+        fn bearer_of(r: &crate::testserver::RecordedRequest) -> String {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        }
+
+        /// A spawned engine over `ROOT_A`'s store (its mailbox checked, a
+        /// mark-read of `MA1` queued) and a saved token `AT`, on `srv`, asking
+        /// `broker` (none when `None`).
+        fn spawn_refused(
+            srv: &FakeServer,
+            tag: &str,
+            broker: Option<&'static FakeBroker>,
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            {
+                let s = Store::open(&store_path).unwrap();
+                mailbox_a(&s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "MA1".into(),
+                    read: true,
+                })
+                .unwrap();
+            }
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            let options = EngineOptions {
+                broker: broker.map(|b| Broker(b)),
+                ..EngineOptions::without_prefetch()
+            };
+            let handle = spawn_with_bases_and_options(
+                store_path,
+                token_path.clone(),
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                HOUR,
+                options,
+            );
+            (handle, token_path, dir)
+        }
+
+        /// The saved token's mark-read answered 401 and its refresh refused,
+        /// ahead of `ROOT_A`'s listing; the probe answers `probe_root`.
+        fn refused_routes(probe_root: &str) -> Vec<(Route, Option<usize>)> {
+            let mut all = vec![
+                (any_route("PATCH", "/me/messages/", 401, "{}"), None),
                 (
                     Route {
                         method: "POST".into(),
@@ -52497,142 +52515,34 @@ mod tests {
                     },
                     None,
                 ),
-                (any_route("PATCH", "/me/messages/", 401, "{}"), None),
-            ]);
-            let store = Store::open_in_memory().unwrap();
-            mailbox_a(&store, Some("ROOT_A"));
-            store.set_mailbox_root("ROOT_A").unwrap();
-            store
-                .enqueue_op(&OutboxOp::MarkRead {
-                    id: "MA1".into(),
-                    read: true,
-                })
-                .unwrap();
-            let options = EngineOptions {
-                broker: Some(Broker(broker)),
-                ..EngineOptions::without_prefetch()
-            };
-            let (mut engine, _evt_rx, _cmd_tx) = engine_with(&srv, store, options);
-            // ROOT_A's own token, its mailbox checked.
-            engine.mailbox_unchecked = false;
-            assert!(matches!(engine.drain_outbox(), Drain::Aborted));
-            assert!(engine.brokered && engine.mailbox_unchecked);
-            assert_eq!(engine.store.pending_ops().unwrap().len(), 1);
-            let bearer = |r: &crate::testserver::RecordedRequest| {
-                r.headers
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or_default()
-            };
-            assert!(
-                !srv.requests()
-                    .iter()
-                    .any(|r| bearer(r) == "Bearer BROKERED"),
-                "{:?}",
-                srv.requests()
-            );
-            engine.drain_outbox();
-            let on_new: Vec<String> = srv
-                .requests()
-                .iter()
-                .filter(|r| bearer(r) == "Bearer BROKERED")
-                .map(|r| format!("{} {}", r.method, r.path))
-                .collect();
-            // The probe as the engine sends it (`PROBE` and its `$select`).
-            assert!(
-                on_new
-                    .first()
-                    .is_some_and(|r| r.starts_with(&format!("GET {PROBE}"))),
-                "{on_new:?}"
-            );
-            assert!(!on_new.iter().any(|r| r.starts_with("PATCH")), "{on_new:?}");
-            assert!(engine.store.pending_ops().unwrap().is_empty());
-            assert_eq!(broker_calls(broker).len(), 1);
+            ];
+            all.extend(routes(&[(200, probe_root)], "FA", "ROOT_A"));
+            all
         }
 
-        /// The bearer of `r`, empty without one.
-        fn bearer_of(r: &crate::testserver::RecordedRequest) -> String {
-            r.headers
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
-                .map(|(_, v)| v.clone())
-                .unwrap_or_default()
-        }
-
-        /// The token endpoint refusing the saved token's grant.
-        fn refused_grant() -> (Route, Option<usize>) {
-            (
-                Route {
-                    method: "POST".into(),
-                    path_prefix: "/organizations/oauth2/v2.0/token".into(),
-                    status: 400,
-                    headers: vec![],
-                    body: r#"{"error":"invalid_grant","error_description":"AADSTS70000: gone"}"#
-                        .into(),
-                },
-                None,
-            )
-        }
-
-        /// `ROOT_A`'s store, its saved token `AT` checked, with a broker whose
-        /// token `BROKERED` holds another mailbox, `ROOT_B`, on `first`
-        /// ahead of the mailbox's routes.
-        fn swap_engine(
-            first: Vec<(Route, Option<usize>)>,
-        ) -> (
-            FakeServer,
-            Engine,
-            mpsc::Sender<SyncCommand>,
-            &'static FakeBroker,
-        ) {
-            let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
-            let mut all = first;
-            all.push(refused_grant());
-            all.extend(routes(&[(200, "ROOT_B")], "FA", "ROOT_A"));
-            let srv = FakeServer::start_limited(all);
-            let store = Store::open_in_memory().unwrap();
-            mailbox_a(&store, Some("ROOT_A"));
-            store.set_mailbox_root("ROOT_A").unwrap();
-            let options = EngineOptions {
-                broker: Some(Broker(broker)),
-                ..EngineOptions::without_prefetch()
-            };
-            let (mut engine, _evt_rx, cmd_tx) = engine_with(&srv, store, options);
-            engine.mailbox_unchecked = false;
-            (srv, engine, cmd_tx, broker)
-        }
-
-        /// A `FetchPresences` served at a pass's checkpoint 401s, the saved
-        /// token's refresh is refused and the broker's token, for another
-        /// mailbox, goes in: the presence handler takes the throttle as its
-        /// own, yet no folder delta and no other call goes out on the new
-        /// token before the next pass's probe, which the swap made due now.
+        /// DV12: a saved token whose refresh is refused mid-drain, with a
+        /// broker whose token holds another mailbox. The drain ends as at a
+        /// refusal; the broker's token then signs in as a sign-in does, so
+        /// the next call is the mailbox probe, which empties the store: no op
+        /// and no PATCH goes out on the new token, and no sign-in is asked.
         #[test]
-        fn a_swap_at_a_checkpoint_sends_nothing_before_the_check() {
-            let (srv, mut engine, cmd_tx, broker) = swap_engine(vec![
-                (any_route("GET", "/users", 401, "{}"), None),
-                (any_route("POST", "/communications/", 401, "{}"), None),
-            ]);
-            cmd_tx
-                .send(SyncCommand::FetchPresences {
-                    addresses: vec!["ada@contoso.com".into()],
-                })
-                .unwrap();
-            engine.run_sync_pass(false);
-            assert!(engine.brokered && engine.mailbox_unchecked);
-            assert_eq!(broker_calls(broker).len(), 1);
+        fn a_refused_refresh_mid_drain_signs_in_with_the_broker_and_checks_first() {
+            let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+            let srv = FakeServer::start_limited(refused_routes("ROOT_B"));
+            let (handle, token_path, dir) = spawn_refused(&srv, "dv12-broker", Some(broker));
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::MailboxChanged { .. })
+            });
             assert!(
-                !srv.requests()
+                !events
                     .iter()
-                    .any(|r| bearer_of(r) == "Bearer BROKERED"),
-                "{:?}",
-                srv.requests()
+                    .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+                "{events:?}"
             );
-            assert!(engine.next_fast <= Instant::now() && engine.next_full <= Instant::now());
-            engine.run_sync_pass(false);
-            let on_new: Vec<String> = srv
-                .requests()
+            let all = srv.requests();
+            let patches = all.iter().filter(|r| r.method == "PATCH").count();
+            assert_eq!(patches, 1, "the drain ended at the refusal: {all:?}");
+            let on_new: Vec<String> = all
                 .iter()
                 .filter(|r| bearer_of(r) == "Bearer BROKERED")
                 .map(|r| format!("{} {}", r.method, r.path))
@@ -52644,29 +52554,67 @@ mod tests {
                     .is_some_and(|r| r.starts_with(&format!("GET {PROBE}"))),
                 "{on_new:?}"
             );
+            assert!(!on_new.iter().any(|r| r.starts_with("PATCH")), "{on_new:?}");
+            assert_eq!(broker_calls(broker).len(), 1);
+            assert!(!token_path.exists(), "the stale saved sign-in goes");
+            finish(handle, dir);
         }
 
-        /// A `SetAutomaticReplies` asked after such a swap is refused until
-        /// the check: no PATCH goes out before the probe, and none after the
-        /// probe's reset either (the command is not replayed).
+        /// DV12 with no broker set: as `origin/main`, the refused refresh
+        /// asks for a sign-in; nothing goes out after it, and the saved
+        /// sign-in's file stays.
         #[test]
-        fn automatic_replies_after_a_swap_wait_for_the_check() {
+        fn a_refused_refresh_with_no_broker_asks_for_a_sign_in_as_before() {
+            let srv = FakeServer::start_limited(refused_routes("ROOT_A"));
+            let (handle, token_path, dir) = spawn_refused(&srv, "dv12-none", None);
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    SyncEvent::SignInRequired {
+                        reason: SignInReason::Expired { .. }
+                    }
+                )),
+                "{events:?}"
+            );
+            let all = srv.requests();
+            assert_eq!(all.iter().filter(|r| r.method == "PATCH").count(), 1);
+            assert!(token_path.exists());
+            finish(handle, dir);
+        }
+
+        /// With the mailbox check owed and the engine offline, a command that
+        /// cannot reach Graph leaves the Offline state and its back-off as
+        /// `origin/main` does: no gate answers it in their place.
+        #[test]
+        fn a_command_while_offline_with_the_check_owed_stays_offline() {
             use crate::graph::model::{AutomaticReplies, ExternalAudience, OofStatus};
-            let (srv, mut engine, _cmd_tx, _broker) = swap_engine(vec![(
-                any_route("PATCH", "/me/mailboxSettings", 200, "{}"),
-                None,
-            )]);
-            // As `broker_in_place` leaves it.
+            let (_cmd_tx, cmd_rx) = mpsc::channel();
+            let (evt_tx, _evt_rx) = mpsc::channel();
+            let config = EngineConfig {
+                store_path: PathBuf::from("unused.db"),
+                token_path: PathBuf::from("unused-token.json"),
+                cfg: test_cfg(),
+                backfill_days: 30,
+                graph_base: "http://127.0.0.1:9".into(),
+                auth_base: "http://127.0.0.1:9".into(),
+                tick: HOUR,
+                options: EngineOptions::without_prefetch(),
+                token_store: None,
+            };
+            let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
             engine.token = Some(TokenSet {
-                access_token: "BROKERED".into(),
-                refresh_token: String::new(),
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
                 expires_at_unix: u64::MAX / 2,
-                account: "person@example.com".into(),
+                account: String::new(),
                 scopes: None,
                 cloud: Cloud::Global,
             });
-            engine.brokered = true;
             engine.mailbox_unchecked = true;
+            engine.go_offline();
             engine.handle_command(SyncCommand::SetAutomaticReplies {
                 replies: AutomaticReplies {
                     status: OofStatus::Disabled,
@@ -52677,15 +52625,11 @@ mod tests {
                     scheduled_end_utc: "".into(),
                 },
             });
+            assert_eq!(engine.state, SyncState::Offline);
             assert!(
-                !srv.requests().iter().any(|r| r.method == "PATCH"),
-                "{:?}",
-                srv.requests()
+                engine.next_retry.is_some_and(|t| t > Instant::now()),
+                "the back-off stands"
             );
-            engine.run_sync_pass(false);
-            let first = srv.requests().into_iter().next().map(|r| r.path);
-            assert_eq!(first.as_deref().map(|p| p.starts_with(PROBE)), Some(true));
-            assert!(!srv.requests().iter().any(|r| r.method == "PATCH"));
         }
 
         fn folder_ids(s: &Store) -> Vec<String> {

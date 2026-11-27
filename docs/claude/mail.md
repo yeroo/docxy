@@ -6441,15 +6441,16 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   refresh-token grant. An explicit `SignIn` asks the broker only with no token held, so a re-consent
   with a token held (#2213) still goes to the browser. `ask_broker` repeats #2218's fallback: the
   full sign-in scope, then `AuthConfig::scope` alone when the first answer needs the person.
-- A saved token whose refresh is refused gives way to the broker's (`broker_in_place`): the token
-  file goes, the mailbox check is owed and the next pass is due now (`next_fast`, `next_full`). Its
-  answer is `Refresh::Swapped`, which `with_auth` and `apply_op_with_retry` turn into a zero-second
-  throttle, the call not retried. While a check is owed (after a swap or an interactive sign-in),
-  `Engine::graph_gate` refuses every Graph call but the check's own probe with that throttle: the
-  three senders (`with_auth`, `apply_op_with_retry`, `refuse_contact_write`'s re-read) all pass it,
-  so a pass, a drain, a bulk loop or a command served between passes or at a checkpoint sends
-  nothing on the new token before the check; a refused op stays queued. A second 401 on a brokered
-  token sets `broker_refused` until a browser sign-in completes.
+- A saved token whose refresh is refused (or that has no refresh token) with a broker set takes the
+  sign-in path (DV12). Every refusal ends at `signin_after_refusal` (from `signin_after_401`, which
+  the pass, the drain, a bulk loop, a fill and a command reach through `react`, and from
+  `refresh_if_near_expiry` at a start). There the session is dropped as at any refusal, so the work
+  that met it ends with its op kept, and `broker_after_refusal` holds the reason. The main loop's
+  next step asks the broker (`ask_broker_after_refusal`): a token signs in through `signed_in(t,
+  true)` as a sign-in does (the stale token file removed, the mailbox check owed and made by the
+  first pass), and none is `enter_signin` for the refusal's reason. With no broker set, nothing
+  differs from before. A second 401 on a brokered token sets `broker_refused` until a browser
+  sign-in completes.
 - `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL.
 - `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
   terminal client's.
@@ -6459,7 +6460,7 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `a_saved_token_comes_before_the_broker`, `the_required_scopes_alone_*`,
   `a_broker_without_a_token_leads_to_the_browser`, `a_401_asks_the_broker_once_*`,
   `the_sign_in_pages_name_the_app_when_told`, `a_sign_in_ends_on_the_named_app_page`,
-  `mailbox_change::a_broker_token_swapped_in_mid_drain_is_checked_before_any_op`,
-  `mailbox_change::a_swap_at_a_checkpoint_sends_nothing_before_the_check`,
-  `mailbox_change::automatic_replies_after_a_swap_wait_for_the_check`,
+  `mailbox_change::a_refused_refresh_mid_drain_signs_in_with_the_broker_and_checks_first`,
+  `mailbox_change::a_refused_refresh_with_no_broker_asks_for_a_sign_in_as_before`,
+  `mailbox_change::a_command_while_offline_with_the_check_owed_stays_offline`,
   `a_browser_sign_in_lets_the_broker_be_asked_again`.
