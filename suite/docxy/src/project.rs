@@ -1627,7 +1627,7 @@ fn editable_row_cells(
             };
             cell.border_1()
                 .border_color(if row == cursor_row && col == v.col {
-                    hsla_u(BRAND)
+                    hsla_u(crate::accent::chrome().fill)
                 } else {
                     hsla(0., 0., 0., 0.)
                 })
@@ -2228,7 +2228,7 @@ pub(crate) fn line_edit_view(edit: &LineEdit, offset: f32, caret_h: f32) -> Div 
         .child(edit.buf[..sel.start].to_owned())
         .when(edit.caret == sel.start, |d| d.child(caret_bar()))
         .when(sel.start < sel.end, |d| {
-            let c = hsla_u(BRAND);
+            let c = hsla_u(crate::accent::chrome().fill);
             d.child(
                 div()
                     .flex_none()

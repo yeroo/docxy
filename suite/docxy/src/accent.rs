@@ -17,6 +17,10 @@ static FILL: AtomicU32 = AtomicU32::new(BRAND);
 static ON_FILL: AtomicU32 = AtomicU32::new(FILE_FG);
 static MARK: AtomicU32 = AtomicU32::new(BRAND);
 static TEXT: AtomicU32 = AtomicU32::new(BRAND);
+static CHROME_FILL: AtomicU32 = AtomicU32::new(BRAND);
+static CHROME_ON_FILL: AtomicU32 = AtomicU32::new(FILE_FG);
+static CHROME_MARK: AtomicU32 = AtomicU32::new(BRAND);
+static CHROME_TEXT: AtomicU32 = AtomicU32::new(BRAND);
 
 /// The colours the chrome draws for one accent, by role.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +134,28 @@ pub(crate) fn set(d: Drawn) {
     ON_FILL.store(d.on_fill, Ordering::Relaxed);
     MARK.store(d.mark, Ordering::Relaxed);
     TEXT.store(d.text, Ordering::Relaxed);
+}
+
+/// Record the brand's roles this window is about to draw ([`chrome`]).
+pub(crate) fn set_chrome(d: Drawn) {
+    CHROME_FILL.store(d.fill, Ordering::Relaxed);
+    CHROME_ON_FILL.store(d.on_fill, Ordering::Relaxed);
+    CHROME_MARK.store(d.mark, Ordering::Relaxed);
+    CHROME_TEXT.store(d.text, Ordering::Relaxed);
+}
+
+/// The brand's roles now, whichever tab is selected: the chrome outside
+/// the ribbon, backstage and title bar (dialogs, panes, bars, fields)
+/// draws these, so a sheet tab's dialog keeps the brand as before and a
+/// plugin's colours reach it. Without a plugin each is `BRAND` (on_fill
+/// `FILE_FG`).
+pub(crate) fn chrome() -> Drawn {
+    Drawn {
+        fill: CHROME_FILL.load(Ordering::Relaxed),
+        on_fill: CHROME_ON_FILL.load(Ordering::Relaxed),
+        mark: CHROME_MARK.load(Ordering::Relaxed),
+        text: CHROME_TEXT.load(Ordering::Relaxed),
+    }
 }
 
 /// [`Drawn::fill`] now.
@@ -350,5 +376,259 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The `BRAND` uses outside this file that keep the brand's own teal
+    /// and take no role of [`chrome`]: (file, the item they are in, how
+    /// many, why). Every other accent the chrome draws (focus rings,
+    /// checked, chosen and active marks, selection washes, primary buttons,
+    /// accent text) takes a role, so a plugin's colours reach it.
+    const BRAND_KEPT: &[(&str, &str, usize, &str)] = &[
+        ("main.rs", "BRAND", 1, "the brand itself"),
+        (
+            "main.rs",
+            "build",
+            1,
+            "the first frame's accent, before render sets it",
+        ),
+        (
+            "main.rs",
+            "render",
+            2,
+            "the brand the roles start from; the ruler's guide on the page",
+        ),
+        ("main.rs", "caret_bar_h", 1, "a caret"),
+        ("main.rs", "fx_edit_row", 1, "a caret"),
+        ("main.rs", "ref_field_row", 1, "a caret"),
+        ("main.rs", "sheet_combo", 1, "a caret"),
+        ("main.rs", "sheet_cf_bar", 1, "a caret"),
+        ("main.rs", "sheet_rowh_bar", 1, "a caret"),
+        ("main.rs", "sheet_comment_bar", 1, "a caret"),
+        ("main.rs", "sheet_find_bar", 2, "carets"),
+        ("main.rs", "combo_box", 1, "a caret"),
+        ("main.rs", "info_properties", 1, "a caret"),
+        (
+            "main.rs",
+            "sheet_el",
+            3,
+            "carets; a chart's selection frame on the grid",
+        ),
+        ("project.rs", "line_edit_view", 1, "a caret"),
+        ("main.rs", "comment_bar", 3, "comments"),
+        ("main.rs", "comments_panel", 3, "comments"),
+        ("main.rs", "notes_panel", 1, "comments: a note's tag"),
+        ("main.rs", "paragraph_el", 3, "document content"),
+        (
+            "table_tab.rs",
+            "draw_overlay",
+            1,
+            "document content: the table pen's ink",
+        ),
+        (
+            "main.rs",
+            "sheet_row",
+            3,
+            "the sheet's grid: selection, range tint, fill handle",
+        ),
+        (
+            "main.rs",
+            "chart_grips",
+            1,
+            "the sheet's grid: a chart's grips",
+        ),
+        (
+            "main.rs",
+            "picture_grips",
+            1,
+            "the sheet's grid: a picture's grips",
+        ),
+        (
+            "main.rs",
+            "sheet_picture",
+            1,
+            "the sheet's grid: a picture's frame",
+        ),
+        (
+            "main.rs",
+            "pivot_panel",
+            1,
+            "the Rows area's colour, beside Columns' and Values'",
+        ),
+        (
+            "main.rs",
+            "ref_field",
+            1,
+            "a valid reference's status, beside the invalid red",
+        ),
+        (
+            "project/gantt.rs",
+            "bar_kind_color",
+            1,
+            "Project's Gantt bars",
+        ),
+        ("project/barstyle.rs", "of", 1, "Project's Gantt bar styles"),
+        (
+            "ribbon_export.rs",
+            "docx_snapshot",
+            1,
+            "the ribbon export's data",
+        ),
+    ];
+
+    /// The item a line of code begins: its first `fn name`, or a `const` or
+    /// `static` at the line's start.
+    fn item_named(code: &str) -> Option<&str> {
+        fn ident(s: &str) -> Option<&str> {
+            let n = s
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .unwrap_or(s.len());
+            (n > 0 && !s.starts_with(|c: char| c.is_ascii_digit())).then(|| &s[..n])
+        }
+        let mut from = 0;
+        while let Some(k) = code[from..].find("fn ").map(|k| from + k) {
+            if k == 0 || code.as_bytes()[k - 1].is_ascii_whitespace() {
+                if let Some(name) = ident(&code[k + 3..]) {
+                    return Some(name);
+                }
+            }
+            from = k + 3;
+        }
+        let bare = ["pub(crate) ", "pub(super) ", "pub "]
+            .iter()
+            .find_map(|p| code.strip_prefix(p))
+            .unwrap_or(code);
+        ["const ", "static "]
+            .iter()
+            .find_map(|kw| bare.strip_prefix(kw).and_then(ident))
+    }
+
+    /// How many times `code` names `BRAND` as a whole word.
+    fn brand_words(code: &str) -> usize {
+        let word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let b = code.as_bytes();
+        code.match_indices("BRAND")
+            .filter(|(k, _)| (*k == 0 || !word(b[k - 1])) && b.get(k + 5).is_none_or(|&c| !word(c)))
+            .count()
+    }
+
+    /// The `BRAND` uses of `src` outside comments and test items, by the
+    /// item they are in.
+    fn brand_uses_in(src: &str) -> Vec<(String, usize)> {
+        let mut found: Vec<(String, usize)> = Vec::new();
+        let mut item = String::new();
+        for line in crate::brand::tests::without_test_items(src).lines() {
+            let code = line.split("//").next().unwrap_or("");
+            if let Some(name) = item_named(code) {
+                item = name.to_string();
+            }
+            let n = brand_words(code);
+            if n == 0 {
+                continue;
+            }
+            match found.iter_mut().find(|(i, _)| *i == item) {
+                Some((_, c)) => *c += n,
+                None => found.push((item.clone(), n)),
+            }
+        }
+        found
+    }
+
+    /// Each `BRAND` use of the suite's non-test source outside this file:
+    /// (file, item, how many), sorted.
+    fn brand_uses(root: &std::path::Path) -> Vec<(String, String, usize)> {
+        let mut found = Vec::new();
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if name != "tests" {
+                        dirs.push(path);
+                    }
+                    continue;
+                }
+                if !name.ends_with(".rs") || name.ends_with("tests.rs") {
+                    continue;
+                }
+                let file = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if file == "accent.rs" {
+                    continue;
+                }
+                let src = std::fs::read_to_string(&path).unwrap();
+                for (item, n) in brand_uses_in(&src) {
+                    found.push((file.clone(), item, n));
+                }
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// The chrome draws the brand's roles, not `BRAND`: the uses left are
+    /// exactly [`BRAND_KEPT`]'s, so a new one is decided here (a role, or
+    /// kept with its reason) and a kept one that went is struck.
+    #[test]
+    fn the_chrome_draws_the_brands_roles_and_brand_is_kept_only_here() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut kept: Vec<(String, String, usize)> = BRAND_KEPT
+            .iter()
+            .map(|(f, i, n, _)| (f.to_string(), i.to_string(), *n))
+            .collect();
+        kept.sort();
+        assert_eq!(
+            brand_uses(&root),
+            kept,
+            "draw these through accent::chrome(), or keep them in BRAND_KEPT"
+        );
+    }
+
+    /// The guard's scanner: a use in code counts, by its item; one in a
+    /// comment, a test item or a longer name does not.
+    #[test]
+    fn the_brand_scan_counts_code_by_item_and_not_comments_tests_or_longer_names() {
+        let src = concat!(
+            "const BRAND: u32 = 1;\n",
+            "/// `BRAND` in a doc comment\n",
+            "fn a() -> u32 {\n",
+            "    let x = BRAND; // BRAND after code\n",
+            "    x + crate::BRAND + BRAND_X + XBRAND\n",
+            "}\n",
+            "pub(crate) fn b() { f(hsla_u(BRAND)); }\n",
+            "#[cfg(test)]\n",
+            "mod tests {\n",
+            "    fn t() { BRAND; }\n",
+            "}\n",
+            "fn c() {}\n",
+        );
+        assert_eq!(
+            brand_uses_in(src),
+            [
+                ("BRAND".to_string(), 1),
+                ("a".to_string(), 2),
+                ("b".to_string(), 1),
+            ]
+        );
+    }
+
+    /// With no plugin the brand's roles are `BRAND` (text on the fill
+    /// `FILE_FG`), so the chrome draws as before, whichever tab is
+    /// selected: they start from the brand, not the tab's accent.
+    #[test]
+    fn the_brands_roles_are_brand_without_a_plugin() {
+        let own = drawn(BRAND, &crate::brand::Accents::default());
+        assert_eq!(
+            own,
+            Drawn {
+                fill: BRAND,
+                on_fill: FILE_FG,
+                mark: BRAND,
+                text: BRAND,
+            }
+        );
     }
 }

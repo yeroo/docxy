@@ -2952,7 +2952,7 @@ impl Docxy {
                         .items_center()
                         .overflow_hidden()
                         .border_1()
-                        .border_color(hsla_u(BRAND))
+                        .border_color(hsla_u(crate::accent::chrome().fill))
                         .text_color(pal.fg)
                         .child(probe(&self.probes, "project-prompt-field"))
                         .child(line_edit_view(prompt, offset, 14.)),

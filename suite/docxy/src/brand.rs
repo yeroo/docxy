@@ -277,7 +277,7 @@ pub(crate) fn startup_notice() -> Option<&'static str> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use docxy_integration::protocol::Named;
 
@@ -579,7 +579,7 @@ mod tests {
     /// `src` without the items under `#[cfg(test)]`, in rustfmt's layout: a
     /// block item ends at the line that closes it at its attribute's
     /// indentation.
-    fn without_test_items(src: &str) -> String {
+    pub(crate) fn without_test_items(src: &str) -> String {
         let lines: Vec<&str> = src.lines().collect();
         let mut out = String::new();
         let mut i = 0;

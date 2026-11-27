@@ -1085,8 +1085,14 @@ impl Docxy {
                     .items_center()
                     .justify_center()
                     .border_1()
-                    .border_color(if checked { hsla_u(BRAND) } else { pal.dim })
-                    .when(checked, |b| b.bg(hsla_u(BRAND).opacity(0.35)))
+                    .border_color(if checked {
+                        hsla_u(crate::accent::chrome().fill)
+                    } else {
+                        pal.dim
+                    })
+                    .when(checked, |b| {
+                        b.bg(hsla_u(crate::accent::chrome().fill).opacity(0.35))
+                    })
                     .when(tool == dialog::RichTool::Bold, |b| {
                         b.font_weight(FontWeight::BOLD)
                     })
@@ -1175,9 +1181,12 @@ impl Docxy {
                     Some(day) => cell
                         .id(("dialog-calendar-day", (i * 8 + w) * 8 + n))
                         .cursor_pointer()
-                        .when(day == k.day(), |c| c.bg(hsla_u(BRAND).opacity(0.35)))
+                        .when(day == k.day(), |c| {
+                            c.bg(hsla_u(crate::accent::chrome().fill).opacity(0.35))
+                        })
                         .when(k.is_today(day, today), |c| {
-                            c.border_1().border_color(hsla_u(BRAND))
+                            c.border_1()
+                                .border_color(hsla_u(crate::accent::chrome().mark))
                         })
                         .child(probe(
                             &self.probes,
@@ -1277,7 +1286,11 @@ impl Docxy {
                 .min_w(px(96.))
                 .px_1()
                 .border_1()
-                .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                .border_color(if focused {
+                    hsla_u(crate::accent::chrome().fill)
+                } else {
+                    pal.dim
+                })
                 .bg(pal.panel)
                 .child(content)
         };
@@ -1326,7 +1339,11 @@ impl Docxy {
                             .child(part(start, f))
                             .when(caret == f, |r| r.child(caret_bar(pal.fg)))
                             .when(f != t, |r| {
-                                r.child(div().bg(hsla_u(BRAND).opacity(0.35)).child(part(f, t)))
+                                r.child(
+                                    div()
+                                        .bg(hsla_u(crate::accent::chrome().fill).opacity(0.35))
+                                        .child(part(f, t)),
+                                )
                             })
                             .when(caret == t && f != t, |r| r.child(caret_bar(pal.fg)))
                             .child(part(t, end))
@@ -1396,7 +1413,11 @@ impl Docxy {
                                     })
                                     .px_1()
                                     .border_1()
-                                    .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                                    .border_color(if focused {
+                                        hsla_u(crate::accent::chrome().fill)
+                                    } else {
+                                        pal.dim
+                                    })
                                     .bg(pal.panel)
                                     .child(probe(&self.probes, format!("dialog-field:{name}")))
                                     .children(lines)
@@ -1468,7 +1489,10 @@ impl Docxy {
                         .border_b_1()
                         .border_color(pal.border)
                         .when(head, |d| d.font_weight(FontWeight::BOLD).bg(pal.hover))
-                        .when(active, |d| d.border_1().border_color(hsla_u(BRAND)))
+                        .when(active, |d| {
+                            d.border_1()
+                                .border_color(hsla_u(crate::accent::chrome().mark))
+                        })
                         .child(content)
                 };
                 let text_cell = |text: String| SharedString::from(text).into_any_element();
@@ -1565,7 +1589,11 @@ impl Docxy {
                     .child(
                         v_flex()
                             .border_1()
-                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .border_color(if focused {
+                                hsla_u(crate::accent::chrome().fill)
+                            } else {
+                                pal.dim
+                            })
                             .bg(pal.panel)
                             .child(header)
                             .child(
@@ -1623,7 +1651,8 @@ impl Docxy {
                                                 .px_1()
                                                 .cursor_pointer()
                                                 .when(pick == Some(k), |r| {
-                                                    r.bg(hsla_u(BRAND).opacity(0.35))
+                                                    r.bg(hsla_u(crate::accent::chrome().fill)
+                                                        .opacity(0.35))
                                                 })
                                                 .relative()
                                                 .child(probe(
@@ -1692,7 +1721,11 @@ impl Docxy {
                         .child(part(0, from))
                         .when(caret == from, |r| r.child(bar()))
                         .when(from != to, |r| {
-                            r.child(div().bg(hsla_u(BRAND).opacity(0.35)).child(part(from, to)))
+                            r.child(
+                                div()
+                                    .bg(hsla_u(crate::accent::chrome().fill).opacity(0.35))
+                                    .child(part(from, to)),
+                            )
                         })
                         .when(caret == to && from != to, |r| r.child(bar()))
                         .child(part(to, chars.len()))
@@ -1778,7 +1811,10 @@ impl Docxy {
                         })
                 });
                 row.child(aligned(label))
-                    .when(focused, |r| r.border_b_1().border_color(hsla_u(BRAND)))
+                    .when(focused, |r| {
+                        r.border_b_1()
+                            .border_color(hsla_u(crate::accent::chrome().fill))
+                    })
                     .children(items)
                     .into_any_element()
             }
@@ -1843,7 +1879,11 @@ impl Docxy {
                     .child(
                         div()
                             .border_1()
-                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .border_color(if focused {
+                                hsla_u(crate::accent::chrome().fill)
+                            } else {
+                                pal.dim
+                            })
                             .bg(pal.panel)
                             .relative()
                             .child(list)
@@ -1902,7 +1942,9 @@ impl Docxy {
                                     .id(("dialog-list-item", k))
                                     .h(px(18.))
                                     .px_1()
-                                    .when(chosen == Some(k), |r| r.bg(hsla_u(BRAND).opacity(0.35)))
+                                    .when(chosen == Some(k), |r| {
+                                        r.bg(hsla_u(crate::accent::chrome().fill).opacity(0.35))
+                                    })
                                     .child(SharedString::from(c.items[k].clone()))
                                     .when(enabled, |r| {
                                         r.cursor_pointer().on_click(on_widget(cx, i, Some(k)))
@@ -1932,7 +1974,11 @@ impl Docxy {
                             .when(d.cell_columns(c) == 1, |l| l.min_w(px(160.)))
                             .when(d.cell_columns(c) > 1, |l| l.w_full())
                             .border_1()
-                            .border_color(if focused { hsla_u(BRAND) } else { pal.dim })
+                            .border_color(if focused {
+                                hsla_u(crate::accent::chrome().fill)
+                            } else {
+                                pal.dim
+                            })
                             .bg(pal.panel)
                             .child(list),
                     )
@@ -2091,7 +2137,10 @@ impl Docxy {
                         .text_size(px(12.))
                         .cursor_pointer()
                         .text_color(if i == d.tab { pal.fg } else { pal.dim })
-                        .when(i == d.tab, |t| t.border_b_1().border_color(hsla_u(BRAND)))
+                        .when(i == d.tab, |t| {
+                            t.border_b_1()
+                                .border_color(hsla_u(crate::accent::chrome().mark))
+                        })
                         .child(probe(&self.probes, format!("dialog-tab:{t}")))
                         .child(SharedString::from(t.replace('&', "")))
                         .on_click(
@@ -2118,7 +2167,11 @@ impl Docxy {
                 .justify_center()
                 .text_size(px(12.))
                 .border_1()
-                .border_color(if b.default { hsla_u(BRAND) } else { pal.border })
+                .border_color(if b.default {
+                    hsla_u(crate::accent::chrome().mark)
+                } else {
+                    pal.border
+                })
                 .text_color(if b.enabled { pal.fg } else { pal.dim })
                 .child(probe(&self.probes, format!("dialog-button:{}", b.label)))
                 .child(SharedString::from(b.label.replace('&', "")))
@@ -2460,7 +2513,9 @@ fn rich_line(
                     div()
                         .when(seg.bold, |d| d.font_weight(FontWeight::BOLD))
                         .when(seg.italic, |d| d.italic())
-                        .when(seg.selected, |d| d.bg(hsla_u(BRAND).opacity(0.35)))
+                        .when(seg.selected, |d| {
+                            d.bg(hsla_u(crate::accent::chrome().fill).opacity(0.35))
+                        })
                         .child(SharedString::from(seg.text)),
                 );
             }

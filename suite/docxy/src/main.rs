@@ -13846,7 +13846,9 @@ fn find_field_text(
         .flex()
         .items_center()
         .child(probe_el)
-        .when(sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+        .when(sel, |d| {
+            d.bg(hsla_u(crate::accent::chrome().fill).opacity(0.25))
+        })
         .children(find_field_segment(&text[..at], 0, f, ent))
         .children(bar)
         .children(find_field_segment(&text[at..], base, f, ent))
@@ -14014,7 +14016,7 @@ fn fx_edit_row(
 fn proposal_bg() -> Hsla {
     Hsla {
         a: 0.25,
-        ..hsla_u(BRAND)
+        ..hsla_u(crate::accent::chrome().fill)
     }
 }
 
@@ -16272,7 +16274,7 @@ fn ref_field_segment(
         .when(selected, |d| {
             d.bg(Hsla {
                 a: 0.30,
-                ..hsla_u(BRAND)
+                ..hsla_u(crate::accent::chrome().fill)
             })
         })
         .cursor_text()
@@ -19911,7 +19913,7 @@ impl Docxy {
                 .px_2()
                 .rounded(px(3.))
                 .border_1()
-                .border_color(hsla_u(BRAND))
+                .border_color(hsla_u(crate::accent::chrome().mark))
                 .cursor_pointer()
                 .hover(|d| d.bg(sidebar))
                 .text_color(fg)
@@ -26266,7 +26268,7 @@ impl Docxy {
             .bg(hsla_u(0xffffff))
             .border_1()
             .border_color(if editing.is_some() {
-                hsla_u(BRAND)
+                hsla_u(crate::accent::chrome().fill)
             } else {
                 pal.border
             })
@@ -26353,9 +26355,21 @@ impl Docxy {
                     .cursor_pointer()
                     .text_size(px(11.))
                     .border_1()
-                    .border_color(if on { hsla_u(BRAND) } else { pal.border })
-                    .bg(if on { hsla_u(BRAND) } else { pal.hover })
-                    .text_color(if on { hsla_u(0xffffff) } else { pal.fg })
+                    .border_color(if on {
+                        hsla_u(crate::accent::chrome().fill)
+                    } else {
+                        pal.border
+                    })
+                    .bg(if on {
+                        hsla_u(crate::accent::chrome().fill)
+                    } else {
+                        pal.hover
+                    })
+                    .text_color(if on {
+                        hsla_u(crate::accent::chrome().on_fill)
+                    } else {
+                        pal.fg
+                    })
                     .hover(|d| if on { d } else { d.bg(pal.panel) })
                     .child(label)
                     .on_click(move |_ev, _w, cx2| {
@@ -29919,7 +29933,7 @@ impl Docxy {
                 .border_color(if ring { pal.fg } else { pal.border })
                 .bg(bg)
                 .cursor_pointer()
-                .hover(|d| d.border_color(hsla_u(BRAND)))
+                .hover(|d| d.border_color(hsla_u(crate::accent::chrome().mark)))
         };
         let mut row = h_flex()
             .w_full()
@@ -29958,7 +29972,10 @@ impl Docxy {
                 .border_1()
                 .border_color(pal.border)
                 .cursor_pointer()
-                .hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND)))
+                .hover(|d| {
+                    d.bg(pal.hover)
+                        .border_color(hsla_u(crate::accent::chrome().mark))
+                })
                 .child(label)
         };
         match kind {
@@ -30049,7 +30066,10 @@ impl Docxy {
                             .border_1()
                             .border_color(pal.border)
                             .cursor_pointer()
-                            .hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND)))
+                            .hover(|d| {
+                                d.bg(pal.hover)
+                                    .border_color(hsla_u(crate::accent::chrome().mark))
+                            })
                             .child(SharedString::from(s))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.insert_symbol(s, window, cx)
@@ -30082,11 +30102,22 @@ impl Docxy {
                             .px_2()
                             .rounded(px(3.))
                             .text_size(px(12.))
-                            .text_color(if active { hsla_u(BRAND) } else { pal.fg })
+                            .text_color(if active {
+                                hsla_u(crate::accent::chrome().text)
+                            } else {
+                                pal.fg
+                            })
                             .border_1()
-                            .border_color(if active { hsla_u(BRAND) } else { pal.border })
+                            .border_color(if active {
+                                hsla_u(crate::accent::chrome().mark)
+                            } else {
+                                pal.border
+                            })
                             .cursor_pointer()
-                            .hover(|d| d.bg(pal.hover).border_color(hsla_u(BRAND)))
+                            .hover(|d| {
+                                d.bg(pal.hover)
+                                    .border_color(hsla_u(crate::accent::chrome().mark))
+                            })
                             .child(label)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.apply_line_spacing(line, window, cx)
@@ -31792,7 +31823,11 @@ impl Docxy {
                 .min_w(px(150.))
                 .rounded(px(4.))
                 .border_1()
-                .border_color(if active { hsla_u(BRAND) } else { pal.border })
+                .border_color(if active {
+                    hsla_u(crate::accent::chrome().fill)
+                } else {
+                    pal.border
+                })
                 .bg(pal.panel)
                 .child(div().text_size(px(10.)).text_color(pal.dim).child(label))
                 .child(
@@ -45148,7 +45183,7 @@ impl Docxy {
             .rounded(px(3.))
             .border_1()
             .border_color(if edit.is_some() {
-                hsla_u(BRAND)
+                hsla_u(crate::accent::chrome().fill)
             } else {
                 pal.border
             })
@@ -45167,7 +45202,9 @@ impl Docxy {
                         .overflow_hidden()
                         .text_size(px(11.))
                         .text_color(pal.fg)
-                        .when(f.sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                        .when(f.sel, |d| {
+                            d.bg(hsla_u(crate::accent::chrome().fill).opacity(0.25))
+                        })
                         .child(SharedString::from(f.text[..at].to_string()))
                         .child(div().w(px(1.)).h(px(13.)).bg(hsla_u(BRAND)))
                         .child(SharedString::from(f.text[at..].to_string()))
@@ -45426,7 +45463,7 @@ impl Docxy {
                     .rounded_sm()
                     .bg(hsla_u(0xffffff))
                     .border_1()
-                    .border_color(hsla_u(BRAND))
+                    .border_color(hsla_u(crate::accent::chrome().fill))
                     .text_size(px(12.))
                     .text_color(hsla_u(0x1a1a1a))
                     .child(div().child(SharedString::from(if buf.is_empty() {
@@ -45450,8 +45487,8 @@ impl Docxy {
                     .rounded_sm()
                     .cursor_pointer()
                     .text_size(px(12.))
-                    .bg(hsla_u(BRAND))
-                    .text_color(hsla_u(0xffffff))
+                    .bg(hsla_u(crate::accent::chrome().fill))
+                    .text_color(hsla_u(crate::accent::chrome().on_fill))
                     .border_1()
                     .border_color(pal.border)
                     .child("Apply")
@@ -45538,7 +45575,7 @@ impl Docxy {
                     .rounded_sm()
                     .bg(hsla_u(0xffffff))
                     .border_1()
-                    .border_color(hsla_u(BRAND))
+                    .border_color(hsla_u(crate::accent::chrome().fill))
                     .text_size(px(12.))
                     .text_color(hsla_u(0x1a1a1a))
                     .child(div().child(SharedString::from(if buf.is_empty() {
@@ -45639,8 +45676,16 @@ impl Docxy {
                 .rounded_sm()
                 .cursor_pointer()
                 .text_size(px(12.))
-                .bg(if primary { hsla_u(BRAND) } else { pal.panel })
-                .text_color(if primary { hsla_u(0xffffff) } else { pal.fg })
+                .bg(if primary {
+                    hsla_u(crate::accent::chrome().fill)
+                } else {
+                    pal.panel
+                })
+                .text_color(if primary {
+                    hsla_u(crate::accent::chrome().on_fill)
+                } else {
+                    pal.fg
+                })
                 .border_1()
                 .border_color(pal.border)
                 .child(label.to_string())
@@ -45670,7 +45715,7 @@ impl Docxy {
                     .rounded_sm()
                     .bg(hsla_u(0xffffff))
                     .border_1()
-                    .border_color(hsla_u(BRAND))
+                    .border_color(hsla_u(crate::accent::chrome().fill))
                     .text_size(px(12.))
                     .text_color(hsla_u(0x1a1a1a))
                     .child(div().child(SharedString::from(buf.to_string())))
@@ -45718,7 +45763,11 @@ impl Docxy {
                 .px_2()
                 .rounded(px(3.))
                 .border_1()
-                .border_color(if focused { hsla_u(BRAND) } else { pal.border })
+                .border_color(if focused {
+                    hsla_u(crate::accent::chrome().fill)
+                } else {
+                    pal.border
+                })
                 .bg(hsla_u(0xffffff))
                 .cursor_text()
                 .text_size(px(12.))
@@ -46752,7 +46801,7 @@ impl Docxy {
             .rounded(px(3.))
             .border_1()
             .border_color(if edit.is_some() {
-                hsla_u(BRAND)
+                hsla_u(crate::accent::chrome().fill)
             } else {
                 pal.border
             })
@@ -46771,7 +46820,9 @@ impl Docxy {
                         .overflow_hidden()
                         .text_size(px(11.))
                         .text_color(pal.fg)
-                        .when(f.sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                        .when(f.sel, |d| {
+                            d.bg(hsla_u(crate::accent::chrome().fill).opacity(0.25))
+                        })
                         .child(SharedString::from(f.text[..at].to_string()))
                         .child(div().w(px(1.)).h(px(13.)).bg(hsla_u(BRAND)))
                         .child(SharedString::from(f.text[at..].to_string()))
@@ -47232,7 +47283,9 @@ impl Docxy {
                         .flex()
                         .items_center()
                         .overflow_hidden()
-                        .when(e.sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                        .when(e.sel, |d| {
+                            d.bg(hsla_u(crate::accent::chrome().fill).opacity(0.25))
+                        })
                         .child(SharedString::from(e.text[..at].to_string()))
                         .child(div().w(px(1.)).h(px(14.)).bg(hsla_u(BRAND)))
                         .child(SharedString::from(e.text[at..].to_string()))
@@ -47257,7 +47310,11 @@ impl Docxy {
                             .px_2()
                             .rounded_sm()
                             .border_1()
-                            .border_color(if edit.is_some() { hsla_u(BRAND) } else { dim })
+                            .border_color(if edit.is_some() {
+                                hsla_u(crate::accent::chrome().fill)
+                            } else {
+                                dim
+                            })
                             .text_size(px(13.))
                             .text_color(fg)
                             .cursor_text()
@@ -48337,7 +48394,9 @@ impl Render for Docxy {
         // (#1473); set it before any of them is built.
         self.drawn_accent = self.accent_now(cx);
         let dark = self.theme_pref.resolve(self.os_appearance) == ThemeMode::Dark;
-        accent::set(accent::drawn(self.drawn_accent, &brand::accents(dark)));
+        let plugin = brand::accents(dark);
+        accent::set(accent::drawn(self.drawn_accent, &plugin));
+        accent::set_chrome(accent::drawn(BRAND, &plugin));
         self.drawn_galleries.borrow_mut().clear();
         // Pictures a package change replaced leave gpui's asset cache (#1639).
         self.release_pictures(None, window, cx);
@@ -53578,7 +53637,7 @@ fn sheet_el(
                 .bg(hsla_u(0xffffff))
                 .border_1()
                 .border_color(if name_edit.is_some() {
-                    hsla_u(BRAND)
+                    hsla_u(crate::accent::chrome().fill)
                 } else {
                     gridline
                 })
@@ -53595,7 +53654,9 @@ fn sheet_el(
                             div()
                                 .flex()
                                 .items_center()
-                                .when(*sel, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+                                .when(*sel, |d| {
+                                    d.bg(hsla_u(crate::accent::chrome().fill).opacity(0.25))
+                                })
                                 .child(SharedString::from(text[..at].to_string()))
                                 .child(div().w(px(1.)).h(px(13.)).bg(hsla_u(BRAND)))
                                 .child(SharedString::from(text[at..].to_string())),
@@ -53974,8 +54035,8 @@ fn sheet_el(
             if selected {
                 field = field.child(
                     div()
-                        .bg(hsla_u(BRAND))
-                        .text_color(hsla_u(0xffffff))
+                        .bg(hsla_u(crate::accent::chrome().fill))
+                        .text_color(hsla_u(crate::accent::chrome().on_fill))
                         .child(SharedString::from(mid)),
                 );
             } else {
@@ -53987,7 +54048,7 @@ fn sheet_el(
             tab = tab
                 .bg(hsla_u(0xffffff))
                 .border_1()
-                .border_color(hsla_u(BRAND))
+                .border_color(hsla_u(crate::accent::chrome().fill))
                 .child(field);
         } else {
             let ent_sel = ent.clone();
@@ -54794,7 +54855,7 @@ fn placeholder(kind: Kind, bg: Hsla, dim: Hsla, cx: &App) -> impl IntoElement {
         .gap_2()
         .child(
             div()
-                .text_color(rgb(BRAND))
+                .text_color(rgb(crate::accent::chrome().text))
                 .font_weight(FontWeight::BOLD)
                 .text_size(px(20.))
                 .child(name),
