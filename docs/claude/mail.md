@@ -6442,10 +6442,14 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   with a token held (#2213) still goes to the browser. `ask_broker` repeats #2218's fallback: the
   full sign-in scope, then `AuthConfig::scope` alone when the first answer needs the person.
 - A saved token whose refresh is refused gives way to the broker's (`broker_in_place`): the token
-  file goes and the mailbox check is owed. Its answer is `Refresh::Swapped`, which `with_auth` and
-  `apply_op_with_retry` turn into a zero-second throttle: the pass or drain ends with the call not
-  retried and the op kept, so the next pass's check is the first call on the new token. A second
-  401 on a brokered token sets `broker_refused` until a browser sign-in completes.
+  file goes, the mailbox check is owed and the next pass is due now (`next_fast`, `next_full`). Its
+  answer is `Refresh::Swapped`, which `with_auth` and `apply_op_with_retry` turn into a zero-second
+  throttle, the call not retried. While a check is owed (after a swap or an interactive sign-in),
+  `Engine::graph_gate` refuses every Graph call but the check's own probe with that throttle: the
+  three senders (`with_auth`, `apply_op_with_retry`, `refuse_contact_write`'s re-read) all pass it,
+  so a pass, a drain, a bulk loop or a command served between passes or at a checkpoint sends
+  nothing on the new token before the check; a refused op stays queued. A second 401 on a brokered
+  token sets `broker_refused` until a browser sign-in completes.
 - `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL.
 - `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
   terminal client's.
@@ -6456,4 +6460,6 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `a_broker_without_a_token_leads_to_the_browser`, `a_401_asks_the_broker_once_*`,
   `the_sign_in_pages_name_the_app_when_told`, `a_sign_in_ends_on_the_named_app_page`,
   `mailbox_change::a_broker_token_swapped_in_mid_drain_is_checked_before_any_op`,
+  `mailbox_change::a_swap_at_a_checkpoint_sends_nothing_before_the_check`,
+  `mailbox_change::automatic_replies_after_a_swap_wait_for_the_check`,
   `a_browser_sign_in_lets_the_broker_be_asked_again`.

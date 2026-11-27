@@ -2900,12 +2900,17 @@ struct Engine {
     /// refused `Class` batch.
     meeting_class_refused: bool,
     /// An interactive sign-in's mailbox check is owed (#1946,
-    /// `check_mailbox`): until it is made, nothing is drained or synced,
-    /// and no backfill, prefetch or size fill runs. Mirrors
+    /// `check_mailbox`), or a broker's token swapped in for a refused
+    /// refresh (`broker_in_place`): until it is made, no Graph call goes
+    /// out but the check itself ([`Engine::graph_gate`]), so nothing is
+    /// drained, synced, filled or served. Mirrors
     /// `meta.mailbox_check_owed`, which `sign_in` writes before it saves
     /// the token, so it survives a restart; a startup with a cached token
     /// and no owed check probes nothing.
     mailbox_unchecked: bool,
+    /// `check_mailbox`'s probe is running: the one call [`Engine::graph_gate`]
+    /// lets through while the check is owed.
+    checking_mailbox: bool,
     /// A probe that failed for a reason `react` does not handle (a 5xx, a
     /// 4xx, a parse error, a store error) holds the next one off until this
     /// instant (#1946), so a fast tick does not probe every few seconds.
@@ -3035,6 +3040,7 @@ impl Engine {
             type_parked: Vec::new(),
             meeting_class_refused: false,
             mailbox_unchecked,
+            checking_mailbox: false,
             check_retry: None,
             check_backoff: BACKOFF_MIN,
         }
@@ -6839,7 +6845,9 @@ impl Engine {
         // `None`, and the owed re-read below handles it as ever (no pause,
         // no back-off, no sign-in from here).
         let server = match (write, err) {
-            (ContactWrite::Update | ContactWrite::Delete, GraphError::Http { status: 412, .. }) => {
+            (ContactWrite::Update | ContactWrite::Delete, GraphError::Http { status: 412, .. })
+                if self.graph_gate().is_ok() =>
+            {
                 self.client().contact(&id).ok()
             }
             _ => None,
@@ -8351,6 +8359,7 @@ impl Engine {
     /// (#1874). A `CreateFolder` goes through `create_folder` with it too,
     /// so a retry answered 409 adopts the folder its lost POST made (#2109).
     fn apply_op_with_retry(&mut self, row: &OutboxRow) -> Result<Applied, GraphError> {
+        self.graph_gate()?;
         // A `SendDraft`'s upload progress (#1941) goes out as it runs, from
         // a clone: the closure must not borrow `self` across `try_refresh`.
         let evt_tx = self.evt_tx.clone();
@@ -10492,15 +10501,39 @@ impl Engine {
 
     // --- Auth ------------------------------------------------------------
 
-    /// Runs a Graph call with the current token; on a 401, refreshes the token
-    /// once and retries. A 401 still escaping means refresh didn't help — the
-    /// caller treats that as "sign-in required". A refresh that failed
-    /// transiently (#2167) is a `Transport` error instead
-    /// (`refresh_transport`): the caller goes offline and keeps the token.
+    /// Whether a Graph call may go out now: not while the mailbox check is
+    /// owed (`mailbox_unchecked`), but for the check's own probe. Refused, it
+    /// is a zero-second throttle: the pass, drain or bulk loop that made the
+    /// call ends with its op kept, a command served between passes is
+    /// answered as throttled, and the next pass, brought forward, checks
+    /// first. Every Graph call passes here: [`Engine::with_auth`],
+    /// [`Engine::apply_op_with_retry`], and the contact re-read after a
+    /// refused write (`refuse_contact_write`).
+    fn graph_gate(&self) -> Result<(), GraphError> {
+        if self.mailbox_unchecked && !self.checking_mailbox {
+            return Err(GraphError::Throttled {
+                retry_after_secs: 0,
+            });
+        }
+        Ok(())
+    }
+
+    /// Runs a Graph call with the current token, once [`Engine::graph_gate`]
+    /// lets it. A brokered token near its expiry is asked of the broker first
+    /// (`renew_brokered_near_expiry`). On a 401 the token is renewed once
+    /// ([`Engine::try_refresh`]) and the call retried; a 401 still escaping
+    /// means that did not help, and the caller treats it as "sign-in
+    /// required". A renewal that swapped in the broker's token
+    /// ([`Refresh::Swapped`]) is not retried: it answers a zero-second
+    /// throttle, and the gate holds every later call until the check. A
+    /// refresh that failed transiently (#2167) is a `Transport` error
+    /// instead (`refresh_transport`): the caller goes offline and keeps the
+    /// token.
     fn with_auth<T>(
         &mut self,
         f: impl Fn(&GraphClient) -> Result<T, GraphError>,
     ) -> Result<T, GraphError> {
+        self.graph_gate()?;
         self.renew_brokered_near_expiry()?;
         let first = {
             let client = self.client();
@@ -10512,8 +10545,9 @@ impl Engine {
                     let client = self.client();
                     f(&client)
                 }
-                // The mailbox check first: the pass ends, to run again at
-                // once ([`Refresh::Swapped`]).
+                // Not retried: the gate holds every call until the mailbox
+                // check, which the next pass, brought forward, makes first
+                // ([`Refresh::Swapped`]).
                 Refresh::Swapped => Err(GraphError::Throttled {
                     retry_after_secs: 0,
                 }),
@@ -10632,9 +10666,14 @@ impl Engine {
         }
     }
 
-    /// Exchanges the refresh token for a fresh token set and persists it.
-    /// No token or refresh token to refresh, or an endpoint that refused
-    /// the grant (`AuthError::needs_sign_in`), is [`Refresh::SignIn`]; any
+    /// Renews the token. A brokered token is asked of the broker again
+    /// (never saved), and none from it is [`Refresh::SignIn`]. A saved token
+    /// exchanges its refresh token for a fresh token set and persists it. A
+    /// saved token with no refresh token, or whose grant the endpoint
+    /// refused (`AuthError::needs_sign_in`), gives way to the broker's token
+    /// when the broker gives one ([`Engine::broker_in_place`],
+    /// [`Refresh::Swapped`], the token file deleted), else is
+    /// [`Refresh::SignIn`]; no token at all is [`Refresh::SignIn`]. Any
     /// other failure (a dropped connection, a 5xx/429 page, a body that
     /// does not parse, `temporarily_unavailable`, #2167) is
     /// [`Refresh::Transient`], with the token kept in memory and on disk.
@@ -10707,9 +10746,10 @@ impl Engine {
     /// token is never saved), so the next start asks the broker too. The
     /// broker's account may hold another mailbox, so its check is owed, as
     /// after a sign-in, and the answer is [`Refresh::Swapped`]: a call that
-    /// asked for the refresh is not retried on the new token, but ends its
-    /// pass or drain, its op left queued, for the next pass to check first.
-    /// `None` with no broker or no token from it.
+    /// asked for the refresh is not retried on the new token, and
+    /// [`Engine::graph_gate`] refuses every later one until the check, which
+    /// the next pass, made due now, runs first. `None` with no broker or no
+    /// token from it.
     fn broker_in_place(&mut self) -> Option<Refresh> {
         let t = self.ask_broker()?;
         if let Err(e) = self.clear_token() {
@@ -10723,6 +10763,10 @@ impl Engine {
             )));
         }
         self.mailbox_unchecked = true;
+        // The check at once: the next pass is due now, whatever the tick.
+        let now = Instant::now();
+        self.next_fast = now;
+        self.next_full = now;
         self.token = Some(t);
         self.brokered = true;
         self.announce_scopes();
@@ -11021,7 +11065,10 @@ impl Engine {
             self.settle_state();
             return MailboxCheck::Blocked;
         }
-        let root = match self.with_auth(|c| c.mailbox_root_id()) {
+        self.checking_mailbox = true;
+        let probed = self.with_auth(|c| c.mailbox_root_id());
+        self.checking_mailbox = false;
+        let root = match probed {
             Ok(root) => root,
             Err(
                 e @ (GraphError::Unauthorized
@@ -11908,11 +11955,12 @@ fn numbered_sibling(path: &std::path::Path, n: u32) -> Option<PathBuf> {
 
 /// How a token refresh ended (#2167).
 enum Refresh {
-    /// A fresh token is in place (and saved).
+    /// A fresh token is in place (saved unless brokered).
     Done,
     /// The broker's token replaced a saved one it may not share a mailbox
-    /// with (`Engine::broker_in_place`): its mailbox check is owed, so no
-    /// call goes out on it before the next pass's check.
+    /// with (`Engine::broker_in_place`): its mailbox check is owed, and
+    /// `Engine::graph_gate` lets no call but the check's probe go out on it
+    /// until the check is made.
     Swapped,
     /// Nothing to refresh, or the endpoint refused the grant: sign in
     /// again, for this reason (#2169).
@@ -52498,6 +52546,140 @@ mod tests {
             assert!(!on_new.iter().any(|r| r.starts_with("PATCH")), "{on_new:?}");
             assert!(engine.store.pending_ops().unwrap().is_empty());
             assert_eq!(broker_calls(broker).len(), 1);
+        }
+
+        /// The bearer of `r`, empty without one.
+        fn bearer_of(r: &crate::testserver::RecordedRequest) -> String {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        }
+
+        /// The token endpoint refusing the saved token's grant.
+        fn refused_grant() -> (Route, Option<usize>) {
+            (
+                Route {
+                    method: "POST".into(),
+                    path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                    status: 400,
+                    headers: vec![],
+                    body: r#"{"error":"invalid_grant","error_description":"AADSTS70000: gone"}"#
+                        .into(),
+                },
+                None,
+            )
+        }
+
+        /// `ROOT_A`'s store, its saved token `AT` checked, with a broker whose
+        /// token `BROKERED` holds another mailbox, `ROOT_B`, on `first`
+        /// ahead of the mailbox's routes.
+        fn swap_engine(
+            first: Vec<(Route, Option<usize>)>,
+        ) -> (
+            FakeServer,
+            Engine,
+            mpsc::Sender<SyncCommand>,
+            &'static FakeBroker,
+        ) {
+            let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+            let mut all = first;
+            all.push(refused_grant());
+            all.extend(routes(&[(200, "ROOT_B")], "FA", "ROOT_A"));
+            let srv = FakeServer::start_limited(all);
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            store.set_mailbox_root("ROOT_A").unwrap();
+            let options = EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            };
+            let (mut engine, _evt_rx, cmd_tx) = engine_with(&srv, store, options);
+            engine.mailbox_unchecked = false;
+            (srv, engine, cmd_tx, broker)
+        }
+
+        /// A `FetchPresences` served at a pass's checkpoint 401s, the saved
+        /// token's refresh is refused and the broker's token, for another
+        /// mailbox, goes in: the presence handler takes the throttle as its
+        /// own, yet no folder delta and no other call goes out on the new
+        /// token before the next pass's probe, which the swap made due now.
+        #[test]
+        fn a_swap_at_a_checkpoint_sends_nothing_before_the_check() {
+            let (srv, mut engine, cmd_tx, broker) = swap_engine(vec![
+                (any_route("GET", "/users", 401, "{}"), None),
+                (any_route("POST", "/communications/", 401, "{}"), None),
+            ]);
+            cmd_tx
+                .send(SyncCommand::FetchPresences {
+                    addresses: vec!["ada@contoso.com".into()],
+                })
+                .unwrap();
+            engine.run_sync_pass(false);
+            assert!(engine.brokered && engine.mailbox_unchecked);
+            assert_eq!(broker_calls(broker).len(), 1);
+            assert!(
+                !srv.requests()
+                    .iter()
+                    .any(|r| bearer_of(r) == "Bearer BROKERED"),
+                "{:?}",
+                srv.requests()
+            );
+            assert!(engine.next_fast <= Instant::now() && engine.next_full <= Instant::now());
+            engine.run_sync_pass(false);
+            let on_new: Vec<String> = srv
+                .requests()
+                .iter()
+                .filter(|r| bearer_of(r) == "Bearer BROKERED")
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect();
+            assert_eq!(
+                on_new.first().map(String::as_str),
+                Some(&*format!("GET {PROBE}"))
+            );
+        }
+
+        /// A `SetAutomaticReplies` asked after such a swap is refused until
+        /// the check: no PATCH goes out before the probe, and none after the
+        /// probe's reset either (the command is not replayed).
+        #[test]
+        fn automatic_replies_after_a_swap_wait_for_the_check() {
+            use crate::graph::model::{AutomaticReplies, ExternalAudience, OofStatus};
+            let (srv, mut engine, _cmd_tx, _broker) = swap_engine(vec![(
+                any_route("PATCH", "/me/mailboxSettings", 200, "{}"),
+                None,
+            )]);
+            // As `broker_in_place` leaves it.
+            engine.token = Some(TokenSet {
+                access_token: "BROKERED".into(),
+                refresh_token: String::new(),
+                expires_at_unix: u64::MAX / 2,
+                account: "person@example.com".into(),
+                scopes: None,
+                cloud: Cloud::Global,
+            });
+            engine.brokered = true;
+            engine.mailbox_unchecked = true;
+            engine.handle_command(SyncCommand::SetAutomaticReplies {
+                replies: AutomaticReplies {
+                    status: OofStatus::Disabled,
+                    external_audience: ExternalAudience::All,
+                    internal_message: "x".into(),
+                    external_message: "y".into(),
+                    scheduled_start_utc: "".into(),
+                    scheduled_end_utc: "".into(),
+                },
+            });
+            assert!(
+                !srv.requests().iter().any(|r| r.method == "PATCH"),
+                "{:?}",
+                srv.requests()
+            );
+            engine.run_sync_pass(false);
+            let first = srv.requests().into_iter().next().map(|r| r.path);
+            assert_eq!(first.as_deref().map(|p| p.starts_with(PROBE)), Some(true));
+            assert!(!srv.requests().iter().any(|r| r.method == "PATCH"));
         }
 
         fn folder_ids(s: &Store) -> Vec<String> {
