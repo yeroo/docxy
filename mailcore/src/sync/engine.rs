@@ -2388,10 +2388,13 @@ pub struct EngineOptions {
 
 /// A token source outside the engine, such as an operating system's
 /// account broker. The engine asks it, on its own thread:
-/// - when it holds no saved token, at start and at a `SignIn`, before the
-///   browser sign-in;
+/// - when it holds no token: at start with none saved (and once a store
+///   that could not be reached answers with none), and at a `SignIn`,
+///   before the browser sign-in;
 /// - for a token it gave, near its expiry and on a 401, in place of a
-///   refresh.
+///   refresh;
+/// - when a saved token's refresh is refused, before a sign-in is asked
+///   for; its token then replaces the saved one, whose file goes.
 ///
 /// A token it gives has no refresh token and is kept in memory only, never
 /// in the token file.
@@ -3060,8 +3063,8 @@ impl Engine {
         }
     }
 
-    /// At start with no saved token: the broker's token, or a sign-in asked
-    /// for `reason`.
+    /// With no saved token (at start, or once its store answers): the
+    /// broker's token, or a sign-in asked for `reason`.
     fn broker_or_signin(&mut self, reason: SignInReason) {
         match self.ask_broker() {
             Some(t) => self.signed_in(t, true),
@@ -3163,10 +3166,10 @@ impl Engine {
             Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
                 self.saved_signin_unavailable(e.to_string(), always);
             }
-            Ok(None) => self.enter_signin(self.no_saved_token_reason()),
-            Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
+            Ok(None) => self.broker_or_signin(self.no_saved_token_reason()),
+            Err(e) => self.broker_or_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
             Ok(Some(Saved::OtherCloud(saved))) => {
-                self.enter_signin(SignInReason::OtherCloud { saved })
+                self.broker_or_signin(SignInReason::OtherCloud { saved })
             }
         }
     }
@@ -10630,10 +10633,12 @@ impl Engine {
             };
         }
         if token.refresh_token.is_empty() {
-            return Refresh::SignIn(SignInReason::Expired {
-                code: String::new(),
-                aadsts: None,
-            });
+            return self
+                .broker_in_place()
+                .unwrap_or(Refresh::SignIn(SignInReason::Expired {
+                    code: String::new(),
+                    aadsts: None,
+                }));
         }
         let (refresh_token, previous_scopes) = (token.refresh_token.clone(), token.scopes.clone());
         match auth::refresh(
@@ -10653,9 +10658,35 @@ impl Engine {
                 self.announce_scopes();
                 Refresh::Done
             }
-            Err(e) if e.needs_sign_in() => Refresh::SignIn(expired(&e)),
+            Err(e) if e.needs_sign_in() => self
+                .broker_in_place()
+                .unwrap_or_else(|| Refresh::SignIn(expired(&e))),
             Err(e) => Refresh::Transient(e.to_string()),
         }
+    }
+
+    /// A saved token that cannot be refreshed, replaced by the broker's: the
+    /// session goes on brokered, and the stale token file goes (a brokered
+    /// token is never saved), so the next start asks the broker too. The
+    /// broker's account may hold another mailbox, so its check is owed, as
+    /// after a sign-in. `None` with no broker or no token from it.
+    fn broker_in_place(&mut self) -> Option<Refresh> {
+        let t = self.ask_broker()?;
+        if let Err(e) = self.clear_token() {
+            self.emit(SyncEvent::Error(format!(
+                "cannot remove the saved sign-in: {e}"
+            )));
+        }
+        if let Err(e) = self.store.set_mailbox_check_owed() {
+            self.emit(SyncEvent::Error(format!(
+                "cannot record the mailbox check: {e}"
+            )));
+        }
+        self.mailbox_unchecked = true;
+        self.token = Some(t);
+        self.brokered = true;
+        self.announce_scopes();
+        Some(Refresh::Done)
     }
 
     /// The interactive sign-in seam: at most two attempts
@@ -27343,6 +27374,47 @@ mod tests {
         assert!(
             wait > Duration::from_secs(8) && wait <= Duration::from_secs(10),
             "{wait:?}"
+        );
+        drop(cmd_tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store that could not be reached at start and then answers with
+    /// the item gone: the broker is asked before a sign-in, as at start.
+    #[test]
+    fn a_store_that_answers_with_no_sign_in_asks_the_broker() {
+        let dir = unique_dir("store-retry-broker");
+        let token_path = dir.join("token.bin");
+        let (state, store) = saved_in_keyring(&token_path, Keyring::Unavailable);
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path,
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: HOUR,
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: Some(store),
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.saved_unavailable = Some("secret store unavailable: no keyring yet".into());
+        state.items.lock().unwrap().clear();
+        state.set(Keyring::Works);
+        engine.retry_saved_signin(false);
+        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert!(engine.brokered);
+        assert_eq!(
+            engine.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("BROKERED")
         );
         drop(cmd_tx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -53284,6 +53356,77 @@ mod tests {
         assert_eq!(broker_calls(broker).len(), 2);
         let used = bearers(&srv, "/me/mailFolders");
         assert_eq!(used, ["Bearer T0", "Bearer T1"], "{used:?}");
+        finish(handle, dir);
+    }
+
+    /// The token endpoint refusing every refresh: the grant is gone.
+    fn refused_refresh_route() -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: "/organizations/oauth2/v2.0/token".into(),
+            status: 400,
+            headers: vec![],
+            body:
+                r#"{"error":"invalid_grant","error_description":"AADSTS70000: the grant is gone"}"#
+                    .into(),
+        }
+    }
+
+    /// A saved token whose refresh is refused (issued to another client, say)
+    /// is replaced by the broker's: no sign-in asked, and the stale file goes
+    /// so the next start asks the broker too.
+    #[test]
+    fn a_saved_token_whose_refresh_is_refused_gives_way_to_the_broker() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-refused-refresh",
+            vec![
+                (refused_refresh_route(), None),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            broker,
+            |p| seed_token_with_scopes(p, 10, SEEDED),
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert!(!token_path.exists());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(
+            !used.is_empty() && used.iter().all(|b| b == "Bearer BROKERED"),
+            "{used:?}"
+        );
+        finish(handle, dir);
+    }
+
+    /// A 401 on a saved token whose refresh is then refused asks the broker
+    /// before a sign-in, and the call runs again on its token.
+    #[test]
+    fn a_401_on_a_saved_token_whose_refresh_is_refused_asks_the_broker() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-refused-401",
+            vec![
+                (refused_refresh_route(), None),
+                (empty_folders_route(401), Some(1)),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            broker,
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert!(!token_path.exists());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert_eq!(
+            used.first().map(String::as_str),
+            Some("Bearer AT"),
+            "{used:?}"
+        );
+        assert!(used[1..].iter().all(|b| b == "Bearer BROKERED"), "{used:?}");
         finish(handle, dir);
     }
 
