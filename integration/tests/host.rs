@@ -550,3 +550,83 @@ fn a_call_in_progress_has_a_marker_and_a_finished_one_none() {
     assert!(!marker.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_call_queued_behind_a_slow_one_has_its_whole_deadline() {
+    let dir = plugin_folder("queued", Some("slow-token 1000"));
+    let mut config = config(App::Mail);
+    config.deadlines.call = Duration::from_millis(600);
+    let plugin = load_from(&dir, &config);
+    std::thread::scope(|s| {
+        let token = s.spawn(|| plugin.token(&token_request()));
+        // The token call has the worker; branding waits longer than its
+        // deadline for its turn, then answers at once.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            plugin.branding(App::Mail).is_some(),
+            "{:?}",
+            plugin.status()
+        );
+        assert!(matches!(token.join().unwrap(), TokenAnswer::Token { .. }));
+    });
+    assert!(matches!(plugin.status(), Status::Loaded { .. }));
+    assert_eq!(plugin.take_notice(), None);
+    assert_eq!(methods(&dir), ["token", "branding"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_normal_quit_leaves_no_marker_and_makes_no_call_after() {
+    let dir = plugin_folder("marker-quit", Some("slow 1500"));
+    let markers = dir.join("markers");
+    let plugin = load_from(&dir, &marker_config(&markers));
+    let marker = markers.join(format!("dxi-mail-{}.marker", std::process::id()));
+    std::thread::scope(|s| {
+        let call = s.spawn(|| plugin.branding(App::Mail));
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(marker.exists());
+        plugin.shutdown();
+        assert!(!marker.exists());
+        assert!(call.join().unwrap().is_some());
+    });
+    assert_eq!(plugin.sign_in(App::Mail), None);
+    assert!(!marker.exists());
+    assert_eq!(methods(&dir), ["branding"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_quit_after_an_abandoned_call_keeps_its_marker() {
+    let dir = plugin_folder("marker-abandoned", Some("slow 1500"));
+    let markers = dir.join("markers");
+    let mut config = marker_config(&markers);
+    config.deadlines.call = Duration::from_millis(200);
+    let plugin = load_from(&dir, &config);
+    let marker = markers.join(format!("dxi-mail-{}.marker", std::process::id()));
+    assert_eq!(plugin.branding(App::Mail), None);
+    plugin.shutdown();
+    assert_eq!(
+        std::fs::read_to_string(&marker).ok().as_deref(),
+        Some("branding")
+    );
+    std::thread::sleep(Duration::from_millis(1_600));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn dxi_abi_runs_inside_its_own_marker() {
+    let dir = plugin_folder("marker-abi", Some("slow-abi 1500"));
+    let markers = dir.join("markers");
+    let marker = markers.join(format!("dxi-mail-{}.marker", std::process::id()));
+    let config = marker_config(&markers);
+    let (during, status) = std::thread::scope(|s| {
+        let load = s.spawn(|| load_from(&dir, &config).status());
+        std::thread::sleep(Duration::from_millis(500));
+        let during = std::fs::read_to_string(&marker).ok();
+        (during, load.join().unwrap())
+    });
+    assert_eq!(during.as_deref(), Some("abi"));
+    assert!(matches!(status, Status::Loaded { .. }), "{status:?}");
+    assert!(!marker.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}

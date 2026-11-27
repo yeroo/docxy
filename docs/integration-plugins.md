@@ -28,7 +28,8 @@ such library, or several, the host loads none and says why.
 
 On Windows the library is loaded with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
 LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`, so the libraries it needs are found in its own folder and the
-system's, never in the current directory or on `PATH`. A library is never unloaded.
+default folders (the host exe's folder, the system's, and any folder the host adds with
+`AddDllDirectory`), never in the current directory or on `PATH`. A library is never unloaded.
 
 ## The symbols
 
@@ -75,16 +76,19 @@ crosses the boundary.
 - One worker thread per process makes every call, one at a time, and never the host's UI thread.
   The library is loaded on that thread too.
 - Each wait has a deadline: 5 s for loading and `dxi_init`, 5 s for `branding`, `sign_in` and
-  `context`, 60 s for `token`. A call past its deadline is abandoned (its thread stays blocked), and
-  the host does not use the plugin again in that run and says so once.
+  `context`, 60 s for `token`. A call's deadline starts when the worker takes it, not while it waits
+  behind another caller's call. A call past its deadline is abandoned (its thread stays blocked),
+  and the host does not use the plugin again in that run and says so once.
 - A plugin must catch every panic or exception at each export and return an error code. A Rust panic
   that unwinds out of an `extern "C"` function aborts the process.
-- A crash inside the plugin ends the host. Before each call the host writes a marker file
-  `dxi-<app>-<pid>.marker`, holding the call's name, in the application's own config folder. It
-  removes the file after the call. A host that starts and finds a marker of its application whose
-  process no longer runs skips the plugin for that run, says why, and deletes the marker. A run that
-  ended during an abandoned call leaves its marker too. Markers of a process that still runs are
-  left alone, so several applications and processes can run at the same time.
+- A crash inside the plugin ends the host. Before loading, before `dxi_abi`, `dxi_init` and each
+  call, the host writes a marker file `dxi-<app>-<pid>.marker`, holding the step's name, in the
+  application's own config folder. It removes the file after the step, and at a normal quit unless a
+  call was abandoned (a call still in flight then leaves none; no call is made after the quit). A
+  host that starts and finds a marker of its application whose process no longer runs skips the
+  plugin for that run, says why, and deletes the marker. A run that crashed, or ended during an
+  abandoned call, leaves its marker. Markers of a process that still runs are left alone, so several
+  applications and processes can run at the same time.
 
 ## Methods
 

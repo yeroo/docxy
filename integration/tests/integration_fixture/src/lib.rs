@@ -6,6 +6,8 @@
 //! - `init-refuses`: `dxi_init` refuses the host;
 //! - `slow <ms>`: each `dxi_call` sleeps that long first;
 //! - `slow-init <ms>`: `dxi_init` sleeps that long first;
+//! - `slow-abi <ms>`: `dxi_abi` sleeps that long first;
+//! - `slow-token <ms>`: each `token` call sleeps that long first;
 //! - `interaction`: `token` answers `interaction_required`;
 //! - `panic`: each `dxi_call` panics, caught as INTERNAL_ERROR;
 //! - `only-branding`: `dxi_init` offers `branding` alone.
@@ -193,6 +195,9 @@ pub extern "C" fn dxi_abi() -> u32 {
     // SAFETY: no arguments; the import keeps the dependency in the import table.
     let _ = unsafe { fixture_needed_value() };
     let mode = mode();
+    if is(&mode, "slow-abi") {
+        sleep_ms(&mode);
+    }
     if is(&mode, "abi0") {
         0
     } else if is(&mode, "abi-above") {
@@ -261,7 +266,7 @@ pub unsafe extern "C" fn dxi_call(
 }
 
 fn answer(mode: &[String], method: &str, request: &str) -> Result<String, (i32, String)> {
-    if is(mode, "slow") {
+    if is(mode, "slow") || (is(mode, "slow-token") && method == "token") {
         sleep_ms(mode);
     }
     if is(mode, "panic") {

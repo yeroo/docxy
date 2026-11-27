@@ -2,7 +2,7 @@
 //! ([`load_from`]) on a worker thread of its own, and calling it there with a
 //! deadline, a crash marker written around each call.
 //!
-//! A process calls [`start`] once, before anything reads [`global`].
+//! A process calls [`start`] once, and [`shutdown`] at a normal quit.
 
 use crate::abi::{self, DxiBuf};
 use crate::protocol::{
@@ -196,6 +196,7 @@ pub enum Status {
 }
 
 static GLOBAL: OnceLock<Integration> = OnceLock::new();
+static NONE: OnceLock<Integration> = OnceLock::new();
 
 /// Load the plugin `config` names, once per process; a later call returns
 /// the first one's.
@@ -203,9 +204,19 @@ pub fn start(config: HostConfig) -> &'static Integration {
     GLOBAL.get_or_init(|| Integration::start(&config))
 }
 
-/// The process's plugin: [`Status::NotConfigured`] until [`start`] runs.
+/// The process's plugin: [`Status::NotConfigured`] until [`start`] runs. A
+/// read before it fixes nothing: a later [`start`] still loads.
 pub fn global() -> &'static Integration {
-    GLOBAL.get_or_init(Integration::not_configured)
+    GLOBAL
+        .get()
+        .unwrap_or_else(|| NONE.get_or_init(Integration::not_configured))
+}
+
+/// [`Integration::shutdown`] of the started plugin, for the host's quit hook.
+pub fn shutdown() {
+    if let Some(integration) = GLOBAL.get() {
+        integration.shutdown();
+    }
 }
 
 /// Load the one `dxi_*` library in `dir` for `config`, unless a crash
@@ -220,6 +231,7 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
         .marker_dir
         .as_ref()
         .map(|dir| Marker::new(dir, config.app));
+    let marker_path = marker.as_ref().map(|m| m.path.clone());
     if let Some(marker) = &marker
         && let Some(why) = marker.take_stale()
     {
@@ -247,7 +259,9 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
                 file,
                 methods: answer.methods,
                 stopped: AtomicBool::new(false),
+                turn: Mutex::new(()),
             }),
+            marker_path,
             deadlines: config.deadlines,
             branding: Mutex::default(),
             sign_in: Mutex::default(),
@@ -314,6 +328,8 @@ pub struct Integration {
     /// The refusal or the stop, until [`Integration::take_notice`] reads it.
     notice: Mutex<Option<String>>,
     worker: Option<Worker>,
+    /// This process's crash marker, for [`Integration::shutdown`].
+    marker_path: Option<PathBuf>,
     deadlines: Deadlines,
     branding: Mutex<HashMap<App, Option<Branding>>>,
     sign_in: Mutex<HashMap<App, Option<SignIn>>>,
@@ -325,6 +341,9 @@ struct Worker {
     file: String,
     methods: Vec<String>,
     stopped: AtomicBool,
+    /// Held by the one call the worker runs, so a call's deadline starts
+    /// when its turn does, not while it waits behind another.
+    turn: Mutex<()>,
 }
 
 type Job = Box<dyn FnOnce(&Loaded) + Send>;
@@ -352,6 +371,7 @@ impl Integration {
             status: Mutex::new(status),
             notice: Mutex::new(notice),
             worker: None,
+            marker_path: None,
             deadlines: Deadlines::default(),
             branding: Mutex::default(),
             sign_in: Mutex::default(),
@@ -436,6 +456,9 @@ impl Integration {
         if !worker.methods.iter().any(|m| m == method) {
             return Err(format!("{} offers no {method}", worker.file));
         }
+        // Waiting for the turn is bounded by the holder's own deadline; one
+        // that stopped the plugin leaves the next caller to fail below.
+        let _turn = lock(&worker.turn);
         if worker.stopped.load(Ordering::SeqCst) {
             return Err(format!("{} stopped answering", worker.file));
         }
@@ -458,6 +481,22 @@ impl Integration {
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err(self.stop(worker, format!("its worker thread ended in {method}")))
             }
+        }
+    }
+
+    /// At a normal quit: no call is made after this, and this process's
+    /// crash marker goes, so a call still in flight is not taken for a crash
+    /// at the next start. A plugin already stopped (an abandoned call) keeps
+    /// its marker, so the next start skips it.
+    pub fn shutdown(&self) {
+        let Some(worker) = &self.worker else {
+            return;
+        };
+        if worker.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Some(path) = &self.marker_path {
+            let _ = std::fs::remove_file(path);
         }
     }
 
@@ -541,8 +580,14 @@ fn open(
     // SAFETY: each symbol is looked up with the type the ABI declares for it;
     // the pointers stay valid because the library is never unloaded.
     let abi_fn: abi::AbiFn = unsafe { symbol(library, abi::SYMBOL_ABI)? };
+    if let Some(marker) = &marker {
+        marker.enter("abi");
+    }
     // SAFETY: an ABI call with no arguments.
     let version = unsafe { abi_fn() };
+    if let Some(marker) = &marker {
+        marker.leave();
+    }
     if !(abi::MIN_ABI_VERSION..=abi::ABI_VERSION).contains(&version) {
         return Err(format!(
             "it speaks interface version {version}; this host takes {} to {}",
@@ -580,9 +625,10 @@ fn load_library(path: &Path) -> Result<libloading::Library, String> {
     use libloading::os::windows::{
         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
     };
-    // SAFETY: loading runs the library's initialisers. The flags keep its
-    // own dependencies to its folder and the system's, never the current
-    // directory or PATH.
+    // SAFETY: loading runs the library's initialisers. The flags look for
+    // its own dependencies in its folder and the default folders (the
+    // exe's, the system's and any `AddDllDirectory` folder), never the
+    // current directory or PATH.
     unsafe {
         Library::load_with_flags(
             path,
