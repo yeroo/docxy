@@ -2396,6 +2396,11 @@ pub struct EngineOptions {
 /// - when a saved token's refresh is refused, before a sign-in is asked
 ///   for; its token then replaces the saved one, whose file goes.
 ///
+/// When it gives nothing near a token's expiry, the token is used until it
+/// expires. A token Graph refuses twice (a second 401) stops the engine
+/// asking it in that run until a browser sign-in completes. A token whose
+/// scopes it does not say is taken to hold the scopes asked for.
+///
 /// A token it gives has no refresh token and is kept in memory only, never
 /// in the token file.
 pub trait TokenBroker {
@@ -2674,6 +2679,10 @@ struct Engine {
     token: Option<TokenSet>,
     /// `token` came from the broker: it is renewed there, never saved.
     brokered: bool,
+    /// Graph refused a token the broker had just given again (a second 401):
+    /// the broker is not asked again in this run until a browser sign-in
+    /// completes, so a Sign in reaches the browser instead of looping.
+    broker_refused: bool,
     config: EngineConfig,
     evt_tx: Sender<SyncEvent>,
     state: SyncState,
@@ -2982,6 +2991,7 @@ impl Engine {
             store,
             token: None,
             brokered: false,
+            broker_refused: false,
             config,
             evt_tx,
             state: SyncState::Idle,
@@ -3075,15 +3085,24 @@ impl Engine {
     /// A token from [`EngineOptions::broker`]: asked for
     /// [`auth::sign_in_scope`], and once more for `AuthConfig::scope` alone
     /// when that needs the person, so a tenant that consented only to the
-    /// required scopes still gives one. `None` with no broker or no token.
+    /// required scopes still gives one. A token whose scopes the broker does
+    /// not say is taken to hold the scopes it was asked for (a scope it
+    /// lacks still shows as a 403). `None` with no broker, no token, or a
+    /// broker whose token Graph refused in this run (`broker_refused`).
     fn ask_broker(&self) -> Option<TokenSet> {
         let broker = self.config.options.broker?;
+        if self.broker_refused {
+            return None;
+        }
         let cfg = &self.config.cfg;
         let full = auth::sign_in_scope(cfg);
+        let mut asked = full.clone();
         let mut answer = broker.0.silent(&full);
         if matches!(answer, BrokerResult::InteractionRequired(_)) && full != cfg.scope {
-            answer = broker.0.silent(&cfg.scope);
+            asked = cfg.scope.clone();
+            answer = broker.0.silent(&asked);
         }
+        let asked = || asked.split_whitespace().map(str::to_string).collect();
         match answer {
             BrokerResult::Token {
                 access_token,
@@ -3095,7 +3114,7 @@ impl Engine {
                 refresh_token: String::new(),
                 expires_at_unix,
                 account,
-                scopes,
+                scopes: scopes.or_else(|| Some(asked())),
                 cloud: cfg.cloud,
             }),
             BrokerResult::InteractionRequired(_) | BrokerResult::Unavailable(_) => None,
@@ -10571,7 +10590,8 @@ impl Engine {
     }
 
     /// A token the broker gave, within the expiry skew, is asked for again
-    /// before a call. No token from the broker is a sign-in
+    /// before a call. No token from the broker keeps one still valid, asked
+    /// for again at the next call; an expired one is a sign-in
     /// (`refused_refresh`).
     fn renew_brokered_near_expiry(&mut self) -> Result<(), GraphError> {
         let near = self.brokered
@@ -10580,6 +10600,13 @@ impl Engine {
                 .as_ref()
                 .is_some_and(|t| t.expires_at_unix <= now_unix() + EXPIRY_SKEW_SECS);
         if near && let Refresh::SignIn(reason) = self.try_refresh() {
+            if self
+                .token
+                .as_ref()
+                .is_some_and(|t| t.expires_at_unix > now_unix())
+            {
+                return Ok(());
+            }
             self.refused_refresh = Some(reason);
             return Err(GraphError::Unauthorized);
         }
@@ -10779,6 +10806,9 @@ impl Engine {
         self.check_backoff = BACKOFF_MIN;
         if !brokered && let Ok(storage) = self.save_token(&t) {
             self.note_storage(storage);
+        }
+        if !brokered {
+            self.broker_refused = false;
         }
         self.token = Some(t);
         self.brokered = brokered;
@@ -11136,6 +11166,10 @@ impl Engine {
             .refused_refresh
             .take()
             .unwrap_or(SignInReason::Rejected);
+        // The broker's token, given again for the first 401, refused too.
+        if self.brokered && reason == SignInReason::Rejected {
+            self.broker_refused = true;
+        }
         self.enter_signin(reason);
     }
 
@@ -53427,6 +53461,88 @@ mod tests {
             "{used:?}"
         );
         assert!(used[1..].iter().all(|b| b == "Bearer BROKERED"), "{used:?}");
+        finish(handle, dir);
+    }
+
+    /// After a second 401 has signed a brokered session out, a Sign in goes
+    /// to the browser: the broker whose token Graph refused is not asked
+    /// again in this run.
+    #[test]
+    fn after_a_second_401_a_sign_in_reaches_the_browser() {
+        let broker = fake_broker(|_, n| brokered(&format!("T{n}"), 3600));
+        let (handle, dir, _token_path, _srv) = broker_engine(
+            "broker-401-browser",
+            vec![(empty_folders_route(401), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(broker_calls(broker).len(), 2);
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        next_sign_in_started(&handle);
+        assert_eq!(broker_calls(broker).len(), 2);
+        finish(handle, dir);
+    }
+
+    /// A brokered token whose scopes the broker does not say holds the
+    /// scopes it was asked for: its grant is announced, nothing missing.
+    #[test]
+    fn a_brokered_token_with_no_scopes_holds_the_scopes_asked_for() {
+        let broker = fake_broker(|_, _| BrokerResult::Token {
+            access_token: "BROKERED".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: "person@example.com".into(),
+            scopes: None,
+        });
+        let (handle, dir, _token_path, _srv) = broker_engine(
+            "broker-no-scopes",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        let scopes = events.iter().find_map(|e| match e {
+            SyncEvent::Scopes { granted, missing } => Some((granted.clone(), missing.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            scopes,
+            Some((strings(&["Mail.ReadWrite", "offline_access"]), Vec::new())),
+            "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    /// Near its expiry, a broker that gives nothing keeps a brokered token
+    /// still valid: no sign-in, and Graph is called with it.
+    #[test]
+    fn a_still_valid_brokered_token_stays_when_the_broker_gives_nothing() {
+        let broker = fake_broker(|_, n| {
+            if n == 0 {
+                brokered("FIRST", 120)
+            } else {
+                BrokerResult::Unavailable("the broker did not answer".into())
+            }
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-near-expiry-kept",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert!(broker_calls(broker).len() >= 2);
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(
+            !used.is_empty() && used.iter().all(|b| b == "Bearer FIRST"),
+            "{used:?}"
+        );
         finish(handle, dir);
     }
 
