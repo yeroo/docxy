@@ -8381,6 +8381,10 @@ impl Engine {
                     let client = self.client();
                     apply(&client, &self.store)
                 }
+                // The mailbox check first: the drain ends, the op kept.
+                Refresh::Swapped => Err(GraphError::Throttled {
+                    retry_after_secs: 0,
+                }),
                 Refresh::SignIn(reason) => {
                     self.refused_refresh = Some(reason);
                     Err(GraphError::Unauthorized)
@@ -10508,6 +10512,11 @@ impl Engine {
                     let client = self.client();
                     f(&client)
                 }
+                // The mailbox check first: the pass ends, to run again at
+                // once ([`Refresh::Swapped`]).
+                Refresh::Swapped => Err(GraphError::Throttled {
+                    retry_after_secs: 0,
+                }),
                 Refresh::SignIn(reason) => {
                     self.refused_refresh = Some(reason);
                     Err(GraphError::Unauthorized)
@@ -10577,7 +10586,8 @@ impl Engine {
             return true;
         }
         match self.try_refresh() {
-            Refresh::Done => true,
+            // A swap's check is the pass's first step.
+            Refresh::Done | Refresh::Swapped => true,
             Refresh::SignIn(reason) => {
                 self.enter_signin(reason);
                 false
@@ -10696,7 +10706,10 @@ impl Engine {
     /// session goes on brokered, and the stale token file goes (a brokered
     /// token is never saved), so the next start asks the broker too. The
     /// broker's account may hold another mailbox, so its check is owed, as
-    /// after a sign-in. `None` with no broker or no token from it.
+    /// after a sign-in, and the answer is [`Refresh::Swapped`]: a call that
+    /// asked for the refresh is not retried on the new token, but ends its
+    /// pass or drain, its op left queued, for the next pass to check first.
+    /// `None` with no broker or no token from it.
     fn broker_in_place(&mut self) -> Option<Refresh> {
         let t = self.ask_broker()?;
         if let Err(e) = self.clear_token() {
@@ -10713,7 +10726,7 @@ impl Engine {
         self.token = Some(t);
         self.brokered = true;
         self.announce_scopes();
-        Some(Refresh::Done)
+        Some(Refresh::Swapped)
     }
 
     /// The interactive sign-in seam: at most two attempts
@@ -11897,6 +11910,10 @@ fn numbered_sibling(path: &std::path::Path, n: u32) -> Option<PathBuf> {
 enum Refresh {
     /// A fresh token is in place (and saved).
     Done,
+    /// The broker's token replaced a saved one it may not share a mailbox
+    /// with (`Engine::broker_in_place`): its mailbox check is owed, so no
+    /// call goes out on it before the next pass's check.
+    Swapped,
     /// Nothing to refresh, or the endpoint refused the grant: sign in
     /// again, for this reason (#2169).
     SignIn(SignInReason),
@@ -52411,6 +52428,78 @@ mod tests {
                 .count()
         }
 
+        /// A saved token whose refresh is refused mid-drain gives way to the
+        /// broker's, whose account holds another mailbox: the drain ends, the
+        /// op is kept, and the next drain's first call on the new token is
+        /// the mailbox check, which empties the store; no op goes out on it.
+        #[test]
+        fn a_broker_token_swapped_in_mid_drain_is_checked_before_any_op() {
+            let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+            let srv = FakeServer::start_limited(vec![
+                (get_route(PROBE, 200, r#"{"id":"ROOT_B"}"#), None),
+                (
+                    Route {
+                        method: "POST".into(),
+                        path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                        status: 400,
+                        headers: vec![],
+                        body:
+                            r#"{"error":"invalid_grant","error_description":"AADSTS70000: gone"}"#
+                                .into(),
+                    },
+                    None,
+                ),
+                (any_route("PATCH", "/me/messages/", 401, "{}"), None),
+            ]);
+            let store = Store::open_in_memory().unwrap();
+            mailbox_a(&store, Some("ROOT_A"));
+            store.set_mailbox_root("ROOT_A").unwrap();
+            store
+                .enqueue_op(&OutboxOp::MarkRead {
+                    id: "MA1".into(),
+                    read: true,
+                })
+                .unwrap();
+            let options = EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            };
+            let (mut engine, _evt_rx, _cmd_tx) = engine_with(&srv, store, options);
+            // ROOT_A's own token, its mailbox checked.
+            engine.mailbox_unchecked = false;
+            assert!(matches!(engine.drain_outbox(), Drain::Aborted));
+            assert!(engine.brokered && engine.mailbox_unchecked);
+            assert_eq!(engine.store.pending_ops().unwrap().len(), 1);
+            let bearer = |r: &crate::testserver::RecordedRequest| {
+                r.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or_default()
+            };
+            assert!(
+                !srv.requests()
+                    .iter()
+                    .any(|r| bearer(r) == "Bearer BROKERED"),
+                "{:?}",
+                srv.requests()
+            );
+            engine.drain_outbox();
+            let on_new: Vec<String> = srv
+                .requests()
+                .iter()
+                .filter(|r| bearer(r) == "Bearer BROKERED")
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect();
+            assert_eq!(
+                on_new.first().map(String::as_str),
+                Some(&*format!("GET {PROBE}"))
+            );
+            assert!(!on_new.iter().any(|r| r.starts_with("PATCH")), "{on_new:?}");
+            assert!(engine.store.pending_ops().unwrap().is_empty());
+            assert_eq!(broker_calls(broker).len(), 1);
+        }
+
         fn folder_ids(s: &Store) -> Vec<String> {
             s.folders().unwrap().into_iter().map(|f| f.id).collect()
         }
@@ -53462,6 +53551,48 @@ mod tests {
         );
         assert!(used[1..].iter().all(|b| b == "Bearer BROKERED"), "{used:?}");
         finish(handle, dir);
+    }
+
+    /// A completed browser sign-in lifts `broker_refused`: the broker the
+    /// second 401 stopped is asked again afterwards (a later refused refresh
+    /// or a sign-out's Sign in reaches it).
+    #[test]
+    fn a_browser_sign_in_lets_the_broker_be_asked_again() {
+        let dir = unique_dir("broker-refused-cleared");
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: dir.join("token.bin"),
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: HOUR,
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: None,
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.broker_refused = true;
+        assert!(engine.ask_broker().is_none());
+        assert!(broker_calls(broker).is_empty());
+        let browser = TokenSet {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: "person@example.com".into(),
+            scopes: None,
+            cloud: Cloud::Global,
+        };
+        engine.signed_in(browser, false);
+        assert!(!engine.broker_refused);
+        assert!(engine.ask_broker().is_some());
+        assert_eq!(broker_calls(broker).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// After a second 401 has signed a brokered session out, a Sign in goes
