@@ -423,6 +423,18 @@ impl Integration {
         answer
     }
 
+    /// Asks and keeps `apps`' branding and sign-in settings now, on the
+    /// caller's thread: a host that starts the plugin before its first window
+    /// calls it there, so a later [`Integration::branding`] or
+    /// [`Integration::sign_in`] for one of them (a tab made on the UI thread)
+    /// reads the kept value and calls nothing.
+    pub fn ask_ahead(&self, apps: &[App]) {
+        for &app in apps {
+            let _ = self.branding(app);
+            let _ = self.sign_in(app);
+        }
+    }
+
     /// A token from the plugin, asked each time. Any failure is
     /// [`TokenAnswer::Unavailable`].
     pub fn token(&self, request: &TokenRequest) -> TokenAnswer {

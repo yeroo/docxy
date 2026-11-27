@@ -171,6 +171,29 @@ fn one_library_loads_and_answers_every_method() {
 }
 
 #[test]
+fn a_value_asked_ahead_is_kept_and_asked_no_more() {
+    let dir = plugin_folder("ahead", None);
+    let plugin = load_from(&dir, &config(App::Suite));
+    plugin.ask_ahead(&[App::Mail, App::Chat]);
+    assert_eq!(
+        methods(&dir),
+        ["branding", "sign_in", "branding", "sign_in"]
+    );
+    assert_eq!(
+        plugin
+            .branding(App::Chat)
+            .and_then(|b| b.product)
+            .as_deref(),
+        Some("Fixture chat")
+    );
+    assert!(plugin.sign_in(App::Mail).is_some());
+    assert!(plugin.branding(App::Mail).is_some());
+    assert!(plugin.sign_in(App::Chat).is_some());
+    assert_eq!(methods(&dir).len(), 4);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn branding_sign_in_and_context_are_asked_once_per_app() {
     let dir = plugin_folder("cached", None);
     let plugin = load_from(&dir, &config(App::Suite));
