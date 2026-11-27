@@ -61,8 +61,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   with sync) keeps only the formats it copied.
 - The X11 tests each start their own `Xvfb -displayfd` (never `DISPLAY`, and
   never one display for two tests); with no Xvfb they skip with a note,
-  except under `CI`, where they fail. The app's global clipboard is never
-  opened by a test.
+  except under `CI`, where they fail. No unit test opens the app's global
+  clipboard. Only the `rich_clip_api` integration test does (#2303), with a
+  text no clipboard holds.
 - Wayland is #1966's (below); headless does nothing.
 - A document paste takes our clip, else the RTF, else the HTML, else the text
   (`doc_paste_from`, on every platform): a browser's copy has HTML and no
@@ -228,7 +229,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing rich (RTF/HTML) 
   again (100 ms at most). It does something only when the suite's X11
   clipboard owns `CLIPBOARD`.
 - Under the UI harness the suite's own copies go to its private clipboard
-  (`main.rs` `Clipboard`, `if harness`), but an extension's
+  (`main.rs` `ClipboardStore`, `if harness`), but an extension's
   `write_to_clipboard` plus `write_html` reach the OS clipboard, so the
   harness's `clipboard` reads never see them.
 - `suite/docxy/tests/rich_clip_api.rs` is a crate of its own that calls both

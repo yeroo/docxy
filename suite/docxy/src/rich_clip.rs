@@ -675,8 +675,9 @@ mod imp {
     static CLIP: OnceLock<Option<X11Clip>> = OnceLock::new();
 
     /// The app's one X11 clipboard on `DISPLAY`, opened on first use, and
-    /// only when gpui runs on X11. Tests never open it: they own a private
-    /// display's.
+    /// only when gpui runs on X11. Unit tests never open it: they own a
+    /// private display's. Only the `rich_clip_api` integration test does
+    /// (#2303), with a text no clipboard holds.
     fn clip() -> Option<&'static X11Clip> {
         CLIP.get_or_init(|| {
             (gpui::guess_compositor() == "X11")
