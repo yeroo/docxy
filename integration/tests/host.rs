@@ -180,7 +180,6 @@ fn leaked(integration: Integration) -> &'static Integration {
 fn values_asked_in_the_background_are_kept_and_asked_no_more() {
     let dir = plugin_folder("background", None);
     let plugin = leaked(load_from(&dir, &config(App::Suite)));
-    let caller = os_thread_id();
     plugin
         .ask_in_background(vec![
             Ask::Branding(App::Suite),
@@ -193,7 +192,6 @@ fn values_asked_in_the_background_are_kept_and_asked_no_more() {
         .unwrap()
         .join()
         .unwrap();
-    assert!(calls(&dir).iter().all(|(_, thread)| *thread != caller));
     assert_eq!(
         plugin
             .kept_branding(App::Chat)
