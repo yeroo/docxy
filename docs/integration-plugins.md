@@ -31,9 +31,10 @@ platform's library extension (`.dll`, `.so`, `.dylib`). A Unix `lib` prefix does
 such library, or several, the host loads none and says why.
 
 On Windows the library is loaded with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`, so the libraries it needs are found in its own folder and the
-default folders (the host exe's folder, the system's, and any folder the host adds with
-`AddDllDirectory`), never in the current directory or on `PATH`. A library is never unloaded.
+LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`, so the libraries it imports are found, as it loads, in its own
+folder and the default folders (the host exe's folder, the system's, and any folder the host adds
+with `AddDllDirectory`), never in the current directory or on `PATH`. The flags cover only those
+imports: a plugin loads any library later by its full path. A library is never unloaded.
 
 ## The symbols
 
