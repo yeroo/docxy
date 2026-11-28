@@ -34,7 +34,11 @@ On Windows the library is loaded with `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
 LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`, so the libraries it imports are found, as it loads, in its own
 folder and the default folders (the host exe's folder, the system's, and any folder the host adds
 with `AddDllDirectory`), never in the current directory or on `PATH`. The flags cover only those
-imports: a plugin loads any library later by its full path. A library is never unloaded.
+imports: Windows searches a library's own imports by name even when the library was loaded by its
+full path. A plugin that loads a library after its own load must call `LoadLibraryExW` with that
+library's full path and `LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`, so
+that library's own imports are not looked for in the current directory or on `PATH`, and must use no
+delay-load. A library is never unloaded.
 
 ## The symbols
 
