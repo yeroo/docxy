@@ -61,9 +61,8 @@ pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
 }
 
 /// `color` for `role` on a theme whose background is `background`, or why
-/// the host keeps its own colour. A primary is always taken, with black or
-/// white text, whichever has the higher contrast on it: one of them always
-/// reaches [`MIN_CONTRAST`].
+/// the host keeps its own colour. A primary is always taken: the better of
+/// black and white text on it always reaches [`MIN_CONTRAST`].
 pub fn check(role: Role, color: Rgb, background: Rgb) -> Result<Accepted, String> {
     match role {
         Role::Primary => {

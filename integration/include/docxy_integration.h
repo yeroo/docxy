@@ -20,8 +20,7 @@ extern "C" {
 #define DXI_NOT_CONFIGURED 3
 #define DXI_INTERNAL_ERROR 4
 
-/* A buffer the plugin owns. The host passes {NULL, 0}, copies what the plugin
- * put in it, and gives it back through dxi_free. */
+/* A buffer the plugin owns. */
 typedef struct {
     uint8_t *ptr;
     size_t len;

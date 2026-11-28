@@ -10682,8 +10682,8 @@ impl Engine {
         }
     }
 
-    /// Renews the token. A brokered token is asked of the broker again
-    /// (never saved), and none from it is [`Refresh::SignIn`]. A saved token
+    /// Renews the token. A brokered token is asked of the broker again, and
+    /// none from it is [`Refresh::SignIn`]. A saved token
     /// exchanges its refresh token for a fresh token set and persists it. No
     /// token, no refresh token to refresh with, or an endpoint that refused
     /// the grant (`AuthError::needs_sign_in`), is [`Refresh::SignIn`]. Any

@@ -873,10 +873,8 @@ fn load_library(path: &Path) -> Result<libloading::Library, String> {
     use libloading::os::windows::{
         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, Library,
     };
-    // SAFETY: loading runs the library's initialisers. The flags look for
-    // its own dependencies in its folder and the default folders (the
-    // exe's, the system's and any `AddDllDirectory` folder), never the
-    // current directory or PATH.
+    // SAFETY: loading runs the library's initialisers; the folders the flags
+    // search are in `docs/integration-plugins.md`.
     unsafe {
         Library::load_with_flags(
             path,

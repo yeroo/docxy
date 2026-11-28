@@ -41,8 +41,7 @@ pub fn code_name(code: i32) -> &'static str {
     }
 }
 
-/// A byte buffer the plugin owns. The host passes [`DxiBuf::empty`], copies
-/// what the plugin put in it, and gives it back through `dxi_free`.
+/// A byte buffer the plugin owns.
 #[repr(C)]
 #[derive(Debug)]
 pub struct DxiBuf {

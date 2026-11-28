@@ -8,8 +8,7 @@
   (`host.rs`), and change it with them.
 - `host.rs`: `start` once per process, `global()`, `shutdown()` from each host's quit hook;
   `ask_at_start` and `ask_in_background` (thread `integration-asks`); `Integration`'s doc says
-  which reads wait and which the UI thread makes. `app()` names the application the process
-  started the plugin for.
+  which reads wait and which the UI thread makes.
 - `accent.rs` holds the colour rule every host applies to the plugin's accents (`check` per role on
   the theme's background); `win_icon.rs` sets a window's icon (Windows).
 - The hosts: the suite (`suite/docxy/src/brand.rs`, `docs/claude/suite-shell.md`); mailcore takes
