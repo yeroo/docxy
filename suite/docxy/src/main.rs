@@ -55114,6 +55114,44 @@ fn open_docxy_window(
                     this.window_should_close(ask, window, cx)
                 })
             });
+            // A stop of the integration plugin after the start (a call past
+            // its deadline, on the asks' thread or in a tab) goes to the
+            // status line (#2317). No loop runs with no plugin loaded, and
+            // it ends once the plugin is stopped and said. `update_in` only,
+            // as for AutoRecover below.
+            if brand::may_stop() {
+                let watcher = view.downgrade();
+                window
+                    .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+                        let mut line = None;
+                        loop {
+                            cx.background_executor().timer(brand::STOP_POLL).await;
+                            // Read before the notice: a stop sets its notice first.
+                            let stopped = !brand::may_stop();
+                            line = line.or_else(brand::take_stop_notice);
+                            if line.is_none() {
+                                if stopped {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let shown = watcher.update_in(cx, |this, _, cx| {
+                                if let Some(line) = line.take() {
+                                    if this.tabs.is_empty() {
+                                        this.pending_status = Some(line.into());
+                                    } else {
+                                        this.set_status(line);
+                                    }
+                                    cx.notify();
+                                }
+                            });
+                            if shown.is_err() && watcher.upgrade().is_none() {
+                                break;
+                            }
+                        }
+                    })
+                    .detach();
+            }
             // AutoRecover (#632): wake when the interval is up (and at least
             // every `recover::POLL`), and write the hot-exit state when a
             // whole interval has passed since the last write or check while

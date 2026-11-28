@@ -8,6 +8,7 @@
 //! - `slow-init <ms>`: `dxi_init` sleeps that long first;
 //! - `slow-abi <ms>`: `dxi_abi` sleeps that long first;
 //! - `slow-token <ms>`: each `token` call sleeps that long first;
+//! - `slow-on <method> <ms>`: each call of `<method>` sleeps that long first;
 //! - `interaction`: `token` answers `interaction_required`;
 //! - `panic`: each `dxi_call` panics, caught as INTERNAL_ERROR;
 //! - `only-branding`: `dxi_init` offers `branding` alone.
@@ -278,6 +279,9 @@ pub unsafe extern "C" fn dxi_call(
 fn answer(mode: &[String], method: &str, request: &str) -> Result<String, (i32, String)> {
     if is(mode, "slow") || (is(mode, "slow-token") && method == "token") {
         sleep_ms(mode);
+    }
+    if is(mode, "slow-on") && mode.get(1).is_some_and(|m| m == method) {
+        sleep_ms(&mode[1..]);
     }
     if is(mode, "panic") {
         panic!("the fixture panics on purpose");

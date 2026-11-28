@@ -84,10 +84,15 @@ crosses the boundary.
   `context`, 60 s for `token`. A call's deadline starts when the worker takes it, not while it waits
   behind another caller's call. A call past its deadline is abandoned (its thread stays blocked),
   and the host does not use the plugin again in that run and says so once.
-- A host may ask some values ahead, before its first window, within a budget of its own. It waits
-  no longer than the budget: a call the budget cuts short stays in flight and is waited for, up to
-  its own deadline, when the host next asks the plugin for a value or a token, and the values the
-  budget does not reach are asked when first read. The budget stops no plugin.
+- Before its first window a host waits for loading, `dxi_init` and its own application's
+  `branding`, each within its own deadline. It asks the other values it uses (another
+  application's `branding` and `sign_in`, then `context`) on a thread of its own, right after.
+- The UI thread never waits on the plugin: it reads the values kept so far, and a value not yet
+  answered shows the host's own until a later draw or open. A read that needs the answer (sign-in
+  settings before an engine signs in, a `token`) is made on another thread, which waits for the
+  call in flight.
+- A host says a stop (a call past its deadline) where it says the plugin's refusal at start, on
+  whichever thread the call was made.
 - A plugin must catch every panic or exception at each export and return an error code. A Rust panic
   that unwinds out of an `extern "C"` function aborts the process.
 - A crash inside the plugin ends the host. Before loading, before `dxi_abi`, `dxi_init` and each

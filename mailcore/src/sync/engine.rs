@@ -2503,6 +2503,39 @@ pub fn spawn_with_options(
     )
 }
 
+/// [`spawn_with_options`] with the sign-in's settings and the options that
+/// `resolve` makes on the engine's own thread before it starts, so a host
+/// whose settings wait on another source (an integration plugin's answer)
+/// spawns from its UI thread without waiting (#2317). Commands sent before
+/// then wait in the queue.
+pub fn spawn_resolving(
+    store_path: PathBuf,
+    token_path: PathBuf,
+    backfill_days: i64,
+    tick: Duration,
+    resolve: impl FnOnce() -> (AuthConfig, EngineOptions) + Send + 'static,
+) -> SyncHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (evt_tx, evt_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (cfg, options) = resolve();
+        let (graph_base, auth_base) = production_bases(&cfg);
+        let config = EngineConfig {
+            store_path,
+            token_path,
+            cfg,
+            backfill_days,
+            graph_base,
+            auth_base,
+            tick,
+            options,
+            token_store: tokencache::platform_store(),
+        };
+        run(config, cmd_rx, evt_tx)
+    });
+    SyncHandle { cmd_tx, evt_rx }
+}
+
 /// The Graph base and the auth base a host's engine uses (#2225):
 /// `cfg.cloud`'s Graph root + `/v1.0` and its login host.
 fn production_bases(cfg: &AuthConfig) -> (String, String) {
@@ -2912,8 +2945,9 @@ struct Engine {
     /// [`Engine::ask_broker_after_refusal`] asks a sign-in for when the broker
     /// gives no token.
     broker_after_refusal: Option<SignInReason>,
-    /// A brokered token's renewal gave a token whose account cannot be
-    /// compared with the session's (one of them names none): the refusal
+    /// A brokered token's renewal that a 401 asked for, or of an expired
+    /// token, gave a token whose account cannot be compared with the
+    /// session's (one of them names none): the refusal
     /// that `try_refresh` answered goes to the broker again, through
     /// [`Engine::ask_broker_after_refusal`] and its mailbox check, not to a
     /// sign-in.
@@ -10615,21 +10649,22 @@ impl Engine {
     }
 
     /// A token the broker gave, within the expiry skew, is asked for again
-    /// before a call. No token from the broker keeps one still valid, asked
-    /// for again at the next call; an expired one is a sign-in
-    /// (`refused_refresh`).
+    /// before a call. No token from the broker, or one naming no account,
+    /// keeps one still valid, asked for again at the next call, and owes no
+    /// recheck; an expired one is a sign-in (`refused_refresh`).
     fn renew_brokered_near_expiry(&mut self) -> Result<(), GraphError> {
         let near = self.brokered
             && self
                 .token
                 .as_ref()
                 .is_some_and(|t| t.expires_at_unix <= now_unix() + EXPIRY_SKEW_SECS);
-        if near && let Refresh::SignIn(reason) = self.try_refresh() {
+        if near && let Refresh::SignIn(reason) = self.try_refresh_with(false) {
             if self
                 .token
                 .as_ref()
                 .is_some_and(|t| t.expires_at_unix > now_unix())
             {
+                self.broker_recheck = false;
                 return Ok(());
             }
             self.refused_refresh = Some(reason);
@@ -10670,12 +10705,21 @@ impl Engine {
     /// which is not taken: claiming scopes the server never named would hide
     /// a missing one until a 403.
     fn try_refresh(&mut self) -> Refresh {
+        self.try_refresh_with(true)
+    }
+
+    /// [`Engine::try_refresh`]; `forced` is false for a renewal no 401
+    /// asked for. Such a renewal of a still-valid brokered token whose
+    /// answer names no account sets neither `broker_recheck` nor
+    /// `broker_refused`: Graph has refused nothing.
+    fn try_refresh_with(&mut self, forced: bool) -> Refresh {
         self.refused_refresh = None;
         let Some(token) = self.token.as_ref() else {
             return Refresh::SignIn(SignInReason::NotSignedIn);
         };
         if self.brokered {
             let held = token.account.clone();
+            let held_valid = token.expires_at_unix > now_unix();
             let refused = || {
                 Refresh::SignIn(SignInReason::Expired {
                     code: String::new(),
@@ -10691,6 +10735,7 @@ impl Engine {
                     }
                     // Another account's token is not used.
                     Some(false) => refused(),
+                    None if !forced && held_valid => refused(),
                     None => {
                         if self.broker_recheck_unconfirmed {
                             self.broker_refused = true;
@@ -17831,6 +17876,34 @@ mod tests {
     fn finish(handle: SyncHandle, dir: PathBuf) {
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resolving spawn returns while its settings are still being made,
+    /// makes them on another thread, and then runs on them.
+    #[test]
+    fn a_resolving_spawn_returns_before_its_settings_are_made() {
+        let dir = unique_dir("spawn-resolving");
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let handle = spawn_resolving(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            30,
+            Duration::from_secs(3600),
+            move || {
+                let _ = thread_tx.send(thread::current().id());
+                let _ = go_rx.recv();
+                (test_cfg(), EngineOptions::without_prefetch())
+            },
+        );
+        let resolver = thread_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(resolver, thread::current().id());
+        assert!(handle.evt_rx.try_recv().is_err());
+        go_tx.send(()).unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        finish(handle, dir);
     }
 
     #[test]
@@ -54049,6 +54122,69 @@ mod tests {
                 .iter()
                 .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer OTHER")),
             "a request carried the other account's token"
+        );
+    }
+
+    /// Near its expiry, a renewal no 401 asked for whose token names no
+    /// account keeps the still-valid token: no recheck is owed (a stale one
+    /// is cleared), the broker is not stopped, and a later refusal for
+    /// another account is a sign-in, not the broker's.
+    #[test]
+    fn a_near_expiry_unnamed_renewal_keeps_a_still_valid_token() {
+        let broker = fake_broker(|_, _| BrokerResult::Token {
+            access_token: "UNNAMED".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: String::new(),
+            scopes: Some(strings(SEEDED)),
+        });
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: PathBuf::from("unused-token.json"),
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: Duration::from_secs(3600),
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: None,
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.token = Some(TokenSet {
+            access_token: "HELD".into(),
+            refresh_token: String::new(),
+            expires_at_unix: now_unix() + 60,
+            account: "person@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+            cloud: crate::auth::Cloud::Global,
+        });
+        engine.brokered = true;
+        engine.broker_recheck = true;
+        engine.broker_recheck_unconfirmed = true;
+        assert!(engine.renew_brokered_near_expiry().is_ok());
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert_eq!(
+            engine.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("HELD")
+        );
+        assert!(!engine.broker_refused);
+        assert!(!engine.broker_recheck);
+        assert!(evt_rx.try_iter().all(|e| !is_sign_in_event(&e)));
+        engine.signin_after_refusal(SignInReason::Expired {
+            code: String::new(),
+            aadsts: None,
+        });
+        assert_eq!(engine.broker_after_refusal, None);
+        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+            "{events:?}"
         );
     }
 

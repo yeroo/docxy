@@ -6453,7 +6453,9 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   sign-in completes.
 - A brokered token's renewal is used only when its account is the session's (`same_account`,
   ASCII case ignored); `try_refresh` keeps the held token either way, so only the refusal path
-  drops it. Another account's is a refusal. When either token names no account, the refusal sets
+  drops it. Another account's is a refusal. When either token names no account, a renewal no 401
+  asked for (`renew_brokered_near_expiry`) keeps a still-valid token and owes nothing
+  (`try_refresh_with`), so `broker_refused` counts only 401s; otherwise the refusal sets
   `broker_recheck`, so `signin_after_refusal` asks the broker again through
   `ask_broker_after_refusal`, whose `signed_in` makes the mailbox check before any other call; until
   a pass has listed the folders on that sign-in (`broker_recheck_unconfirmed`), the next such
@@ -6462,6 +6464,9 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `Debug` and `SyncEvent::SignInStarted`'s (`auth::AuthorizeUrl`) hide it.
 - `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
   terminal client's.
+- `spawn_resolving` makes the `AuthConfig` and `EngineOptions` on the engine's thread, so a host
+  whose sign-in settings come from its integration plugin spawns from its UI thread without waiting
+  (`a_resolving_spawn_returns_before_its_settings_are_made`).
 - mailcore does not depend on `docxy-integration`: a host wraps its plugin's `token` method as the
   broker.
 - Tests: `auth::tests::a_login_hint_replaces_the_account_picker`; engine `tests::a_brokered_token_*`,
@@ -6477,5 +6482,6 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `a_renewed_brokered_token_naming_no_account_checks_the_mailbox_first`,
   `an_unnamed_broker_whose_tokens_graph_refuses_ends_in_a_sign_in`,
   `a_refused_renewal_a_caller_swallows_still_ends_in_a_sign_in`,
+  `a_near_expiry_unnamed_renewal_keeps_a_still_valid_token`,
   `a_sign_in_started_debug_print_hides_the_login_hint`;
   `auth::tests::a_debug_print_hides_the_login_hint`.

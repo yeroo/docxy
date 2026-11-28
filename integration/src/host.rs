@@ -13,7 +13,7 @@ use std::ffi::{CString, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The registry key that holds the folder on Windows, under HKLM.
 pub const REGISTRY_KEY: &str = r"SOFTWARE\docxy\Integration";
@@ -225,15 +225,17 @@ pub fn shutdown() {
 /// Load the one `dxi_*` library in `dir` for `config`, unless a crash
 /// marker of `config.app` says the last run ended in a plugin call.
 pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
+    let app = config.app;
     if !dir.is_absolute() {
         return Integration::refused(
+            app,
             dir.display().to_string(),
             "the folder is not an absolute path".into(),
         );
     }
     let library = match find_library(dir) {
         Ok(library) => library,
-        Err(why) => return Integration::refused(dir.display().to_string(), why),
+        Err(why) => return Integration::refused(app, dir.display().to_string(), why),
     };
     let file = file_name(&library);
     let marker = config
@@ -244,7 +246,7 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
     if let Some(marker) = &marker
         && let Some(why) = marker.take_stale()
     {
-        return Integration::refused(file, why);
+        return Integration::refused(app, file, why);
     }
     let info = HostInfo {
         abi: abi::ABI_VERSION,
@@ -254,10 +256,11 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
     };
     let (jobs, ready) = match spawn_worker(library, info, marker) {
         Ok(started) => started,
-        Err(e) => return Integration::refused(file, format!("no worker thread: {e}")),
+        Err(e) => return Integration::refused(app, file, format!("no worker thread: {e}")),
     };
     match ready.recv_timeout(config.deadlines.init) {
         Ok(Ok(answer)) => Integration {
+            app: Some(app),
             status: Mutex::new(Status::Loaded {
                 file: file.clone(),
                 version: answer.version,
@@ -275,10 +278,10 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
             branding: Mutex::default(),
             sign_in: Mutex::default(),
             context: OnceLock::new(),
-            pending: Mutex::default(),
         },
-        Ok(Err(why)) => Integration::refused(file, why),
+        Ok(Err(why)) => Integration::refused(app, file, why),
         Err(mpsc::RecvTimeoutError::Timeout) => Integration::refused(
+            app,
             file,
             format!(
                 "it did not start within {} s",
@@ -286,7 +289,7 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
             ),
         ),
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Integration::refused(file, "its worker thread ended while it started".into())
+            Integration::refused(app, file, "its worker thread ended while it started".into())
         }
     }
 }
@@ -333,7 +336,16 @@ fn file_name(path: &Path) -> String {
 }
 
 /// The loaded plugin, for the calls the host makes and for About.
+///
+/// A read that waits ([`Integration::branding`], [`Integration::sign_in`],
+/// [`Integration::context`], [`Integration::token`]) is for a thread other
+/// than the UI's; the UI thread reads what is kept
+/// ([`Integration::kept_branding`] and the other `kept_` reads), which never
+/// calls the plugin.
 pub struct Integration {
+    /// The application [`HostConfig::app`] named; `None` with no plugin
+    /// configured.
+    app: Option<App>,
     status: Mutex<Status>,
     /// The refusal or the stop, until [`Integration::take_notice`] reads it.
     notice: Mutex<Option<String>>,
@@ -344,11 +356,9 @@ pub struct Integration {
     branding: Mutex<HashMap<App, Option<Branding>>>,
     sign_in: Mutex<HashMap<App, Option<SignIn>>>,
     context: OnceLock<Option<Context>>,
-    /// The call [`Integration::ask_ahead_by`] left in flight.
-    pending: Mutex<Option<Pending>>,
 }
 
-/// A value a host asks before its first window ([`Integration::ask_ahead_by`]).
+/// A value [`Integration::ask_in_background`] asks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ask {
     Branding(App),
@@ -373,11 +383,28 @@ impl Ask {
     }
 }
 
-struct Pending {
-    ask: Ask,
-    answer: mpsc::Receiver<Result<String, String>>,
-    /// Its own deadline.
-    until: Instant,
+/// What a read that does not wait finds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Kept<T> {
+    /// No answer yet: its call is in flight or still to be made.
+    NotYet,
+    /// The answer: `None` when the plugin gave none, failed, is stopped or
+    /// offers no such method, or no plugin is loaded.
+    Answered(Option<T>),
+}
+
+impl<T> Kept<T> {
+    /// The answer's value; `None` until there is one.
+    pub fn value(self) -> Option<T> {
+        match self {
+            Kept::Answered(value) => value,
+            Kept::NotYet => None,
+        }
+    }
+
+    pub fn is_answered(&self) -> bool {
+        matches!(self, Kept::Answered(_))
+    }
 }
 
 struct Worker {
@@ -388,6 +415,12 @@ struct Worker {
     /// Held by the one call the worker runs, so a call's deadline starts
     /// when its turn does, not while it waits behind another.
     turn: Mutex<()>,
+}
+
+impl Worker {
+    fn offers(&self, method: &str) -> bool {
+        self.methods.iter().any(|m| m == method)
+    }
 }
 
 type Job = Box<dyn FnOnce(&Loaded) + Send>;
@@ -402,16 +435,17 @@ impl Integration {
     }
 
     pub fn not_configured() -> Integration {
-        Integration::with_status(Status::NotConfigured, None)
+        Integration::with_status(None, Status::NotConfigured, None)
     }
 
-    fn refused(file: String, why: String) -> Integration {
+    fn refused(app: App, file: String, why: String) -> Integration {
         let notice = format!("Integration plugin {file} not loaded: {why}");
-        Integration::with_status(Status::Refused { file, why }, Some(notice))
+        Integration::with_status(Some(app), Status::Refused { file, why }, Some(notice))
     }
 
-    fn with_status(status: Status, notice: Option<String>) -> Integration {
+    fn with_status(app: Option<App>, status: Status, notice: Option<String>) -> Integration {
         Integration {
+            app,
             status: Mutex::new(status),
             notice: Mutex::new(notice),
             worker: None,
@@ -420,8 +454,13 @@ impl Integration {
             branding: Mutex::default(),
             sign_in: Mutex::default(),
             context: OnceLock::new(),
-            pending: Mutex::default(),
         }
+    }
+
+    /// The application the process started the plugin for
+    /// ([`HostConfig::app`]); `None` with no plugin configured.
+    pub fn app(&self) -> Option<App> {
+        self.app
     }
 
     pub fn status(&self) -> Status {
@@ -434,62 +473,83 @@ impl Integration {
         lock(&self.notice).take()
     }
 
-    /// The plugin's names and icons for `app`, asked once and kept.
+    /// The plugin's names and icons for `app`, asked once and kept; this
+    /// waits for the call ([`Integration::kept_branding`] does not).
     pub fn branding(&self, app: App) -> Option<Branding> {
         self.value(Ask::Branding(app));
         lock(&self.branding).get(&app).cloned().flatten()
     }
 
-    /// The plugin's sign-in settings for `app`, asked once and kept.
+    /// The plugin's sign-in settings for `app`, asked once and kept; this
+    /// waits for the call, a background one included.
     pub fn sign_in(&self, app: App) -> Option<SignIn> {
         self.value(Ask::SignIn(app));
         lock(&self.sign_in).get(&app).cloned().flatten()
     }
 
-    /// Asks and keeps `asks` now, on the caller's thread, in order, by `end`:
-    /// a host that starts the plugin before its first window calls it there,
-    /// so a later read of a value asked (a tab made on the UI thread) reads
-    /// the kept value and calls nothing. An ask that `end` cuts short stays
-    /// in flight, and the next read of a value not kept, or the next token,
-    /// waits for it up to its own deadline; the asks after it are made when
-    /// their values are first read. `end` stops no plugin.
-    pub fn ask_ahead_by(&self, asks: &[Ask], end: Instant) {
-        let Some(worker) = &self.worker else {
-            return;
-        };
-        for &ask in asks {
-            if self.known(ask) {
-                continue;
-            }
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return;
-            }
-            let _turn = lock(&worker.turn);
-            let answer = match self.send(worker, ask.method(), ask.request()) {
-                Ok(answer) => answer,
-                Err(why) => {
-                    self.keep(ask, Err(why));
-                    continue;
-                }
-            };
-            let sent = Instant::now();
-            match answer.recv_timeout(left.min(self.deadlines.call)) {
-                Ok(result) => self.keep(ask, result),
-                Err(mpsc::RecvTimeoutError::Timeout) if left < self.deadlines.call => {
-                    *lock(&self.pending) = Some(Pending {
-                        ask,
-                        answer,
-                        until: sent + self.deadlines.call,
-                    });
-                    return;
-                }
-                Err(e) => {
-                    let why = self.unanswered(worker, ask.method(), e);
-                    self.keep(ask, Err(why));
-                }
-            }
+    /// The kept answer to [`Integration::branding`], without calling or
+    /// waiting.
+    pub fn kept_branding(&self, app: App) -> Kept<Branding> {
+        let kept = lock(&self.branding).get(&app).cloned();
+        self.kept(Ask::Branding(app), kept)
+    }
+
+    /// The kept answer to [`Integration::sign_in`], without calling or
+    /// waiting.
+    pub fn kept_sign_in(&self, app: App) -> Kept<SignIn> {
+        let kept = lock(&self.sign_in).get(&app).cloned();
+        self.kept(Ask::SignIn(app), kept)
+    }
+
+    /// The kept answer to [`Integration::context`], without calling or
+    /// waiting.
+    pub fn kept_context(&self) -> Kept<Context> {
+        self.kept(Ask::Context, self.context.get().cloned())
+    }
+
+    /// `kept` as a [`Kept`]: a value not kept is [`Kept::NotYet`] only while
+    /// a call can still give it.
+    fn kept<T>(&self, ask: Ask, kept: Option<Option<T>>) -> Kept<T> {
+        match kept {
+            Some(value) => Kept::Answered(value),
+            None if self.may_answer(ask) => Kept::NotYet,
+            None => Kept::Answered(None),
         }
+    }
+
+    /// Whether a call for `ask` can still be made: a plugin loaded, not
+    /// stopped, that offers its method.
+    fn may_answer(&self, ask: Ask) -> bool {
+        self.worker
+            .as_ref()
+            .is_some_and(|w| !w.stopped.load(Ordering::SeqCst) && w.offers(ask.method()))
+    }
+
+    /// What a host asks before its first window, on the thread that opens
+    /// it: `app`'s branding, waited for within its own deadline; then
+    /// `rest` with [`Integration::ask_in_background`].
+    pub fn ask_at_start(
+        &'static self,
+        app: App,
+        rest: Vec<Ask>,
+    ) -> Option<std::thread::JoinHandle<()>> {
+        let _ = self.branding(app);
+        self.ask_in_background(rest)
+    }
+
+    /// Asks and keeps `asks` on a thread of its own, in order, each within
+    /// its own deadline, skipping those kept, so the UI thread finds them
+    /// with the `kept_` reads. With no plugin loaded no thread starts.
+    pub fn ask_in_background(&'static self, asks: Vec<Ask>) -> Option<std::thread::JoinHandle<()>> {
+        self.worker.as_ref()?;
+        std::thread::Builder::new()
+            .name("integration-asks".into())
+            .spawn(move || {
+                for ask in asks {
+                    self.value(ask);
+                }
+            })
+            .ok()
     }
 
     /// A token from the plugin, asked each time. Any failure is
@@ -502,26 +562,43 @@ impl Integration {
         }
     }
 
-    /// The person's organization and desktop, asked once and kept.
+    /// The person's organization and desktop, asked once and kept; this
+    /// waits for the call.
     pub fn context(&self) -> Option<Context> {
         self.value(Ask::Context);
         self.context.get().cloned().flatten()
     }
 
-    /// Keeps `ask`'s value, asking for it unless it is kept or the call in
-    /// flight answers it.
+    /// Keeps `ask`'s value, asking for it unless it is kept, or the call
+    /// that held the turn kept it.
     fn value(&self, ask: Ask) {
         if self.known(ask) {
             return;
         }
-        if let Some(worker) = &self.worker {
-            let _turn = lock(&worker.turn);
-            self.settle(worker);
+        let Some(worker) = &self.worker else {
+            self.keep(ask, Err("no integration plugin".into()));
+            return;
+        };
+        if !worker.offers(ask.method()) {
+            self.keep(
+                ask,
+                Err(format!("{} offers no {}", worker.file, ask.method())),
+            );
+            return;
         }
-        if !self.known(ask) {
-            let result = self.call(ask.method(), ask.request(), self.deadlines.call);
-            self.keep(ask, result);
+        // Waiting for the turn is bounded by the holder's own deadline.
+        let _turn = lock(&worker.turn);
+        if self.known(ask) {
+            return;
         }
+        let result = self
+            .send(worker, ask.method(), ask.request())
+            .and_then(|answer| {
+                answer
+                    .recv_timeout(self.deadlines.call)
+                    .unwrap_or_else(|e| Err(self.unanswered(worker, ask.method(), e)))
+            });
+        self.keep(ask, result);
     }
 
     fn known(&self, ask: Ask) -> bool {
@@ -551,20 +628,6 @@ impl Integration {
         }
     }
 
-    /// Waits for the call [`Integration::ask_ahead_by`] left in flight, up to
-    /// its own deadline, and keeps its answer. The caller holds the turn lock.
-    fn settle(&self, worker: &Worker) {
-        let Some(pending) = lock(&self.pending).take() else {
-            return;
-        };
-        let wait = pending.until.saturating_duration_since(Instant::now());
-        let result = pending
-            .answer
-            .recv_timeout(wait)
-            .unwrap_or_else(|e| Err(self.unanswered(worker, pending.ask.method(), e)));
-        self.keep(pending.ask, result);
-    }
-
     fn call(
         &self,
         method: &'static str,
@@ -577,7 +640,6 @@ impl Integration {
         // Waiting for the turn is bounded by the holder's own deadline; one
         // that stopped the plugin leaves the next caller to fail below.
         let _turn = lock(&worker.turn);
-        self.settle(worker);
         let answer = self.send(worker, method, request)?;
         answer
             .recv_timeout(deadline)
@@ -592,7 +654,7 @@ impl Integration {
         method: &'static str,
         request: String,
     ) -> Result<mpsc::Receiver<Result<String, String>>, String> {
-        if !worker.methods.iter().any(|m| m == method) {
+        if !worker.offers(method) {
             return Err(format!("{} offers no {method}", worker.file));
         }
         if worker.stopped.load(Ordering::SeqCst) {

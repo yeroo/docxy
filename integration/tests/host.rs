@@ -3,7 +3,7 @@
 #![cfg(feature = "host")]
 
 use docxy_integration::host::{
-    Ask, Deadlines, HostConfig, Integration, Source, Status, load_from, plugin_dir,
+    Ask, Deadlines, HostConfig, Integration, Kept, Source, Status, load_from, plugin_dir,
 };
 use docxy_integration::protocol::{AccentSet, App, Rgb, TokenAnswer, TokenRequest};
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
@@ -170,21 +170,40 @@ fn one_library_loads_and_answers_every_method() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `integration` for the rest of the test binary, as `ask_in_background`
+/// takes it.
+fn leaked(integration: Integration) -> &'static Integration {
+    Box::leak(Box::new(integration))
+}
+
 #[test]
-fn a_value_asked_ahead_is_kept_and_asked_no_more() {
-    let dir = plugin_folder("ahead", None);
-    let plugin = load_from(&dir, &config(App::Suite));
-    plugin.ask_ahead_by(
-        &[
+fn values_asked_in_the_background_are_kept_and_asked_no_more() {
+    let dir = plugin_folder("background", None);
+    let plugin = leaked(load_from(&dir, &config(App::Suite)));
+    let caller = os_thread_id();
+    plugin
+        .ask_in_background(vec![
             Ask::Branding(App::Suite),
             Ask::Branding(App::Mail),
             Ask::SignIn(App::Mail),
             Ask::Branding(App::Chat),
             Ask::SignIn(App::Chat),
             Ask::Context,
-        ],
-        std::time::Instant::now() + Duration::from_secs(60),
+        ])
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(calls(&dir).iter().all(|(_, thread)| *thread != caller));
+    assert_eq!(
+        plugin
+            .kept_branding(App::Chat)
+            .value()
+            .and_then(|b| b.product)
+            .as_deref(),
+        Some("Fixture chat")
     );
+    assert!(plugin.kept_sign_in(App::Mail).value().is_some());
+    assert!(plugin.kept_context().value().is_some());
     assert_eq!(
         methods(&dir),
         [
@@ -203,6 +222,118 @@ fn a_value_asked_ahead_is_kept_and_asked_no_more() {
     assert!(plugin.sign_in(App::Chat).is_some());
     assert!(plugin.context().is_some());
     assert_eq!(methods(&dir).len(), 6);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Before its first window a host waits for `init` and its own branding
+/// alone: a slow `sign_in` asked after them holds nothing up.
+#[test]
+fn the_first_window_waits_only_for_init_and_its_own_branding() {
+    let dir = plugin_folder("at-start", Some("slow-on sign_in 1500"));
+    let started = std::time::Instant::now();
+    let plugin = leaked(load_from(&dir, &config(App::Suite)));
+    let asks = plugin.ask_at_start(App::Suite, vec![Ask::SignIn(App::Mail), Ask::Context]);
+    let spent = started.elapsed();
+    assert!(spent < Duration::from_millis(1_000), "{spent:?}");
+    assert!(plugin.kept_branding(App::Suite).value().is_some());
+    assert_eq!(plugin.kept_sign_in(App::Mail), Kept::NotYet);
+    asks.unwrap().join().unwrap();
+    assert_eq!(methods(&dir), ["branding", "sign_in", "context"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// While the background `sign_in` and then `context` are out, a kept read
+/// of each returns at once, not yet answered; once they are answered it
+/// finds them.
+#[test]
+fn a_kept_read_while_a_slow_call_is_out_returns_at_once() {
+    for method in ["sign_in", "context"] {
+        let dir = plugin_folder(
+            &format!("kept-{method}"),
+            Some(&format!("slow-on {method} 1500")),
+        );
+        let plugin = leaked(load_from(&dir, &config(App::Suite)));
+        let asks = plugin
+            .ask_in_background(vec![Ask::SignIn(App::Mail), Ask::Context])
+            .unwrap();
+        wait_until("the slow call", || {
+            methods(&dir).last().map(String::as_str) == Some(method)
+        });
+        let started = std::time::Instant::now();
+        assert_eq!(
+            plugin.kept_sign_in(App::Mail).is_answered(),
+            method != "sign_in"
+        );
+        assert_eq!(plugin.kept_context(), Kept::NotYet);
+        assert_eq!(plugin.kept_branding(App::Suite), Kept::NotYet);
+        let spent = started.elapsed();
+        assert!(spent < Duration::from_millis(200), "{method}: {spent:?}");
+        asks.join().unwrap();
+        assert!(plugin.kept_sign_in(App::Mail).value().is_some());
+        assert!(plugin.kept_context().value().is_some());
+        assert!(matches!(plugin.status(), Status::Loaded { .. }));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// A read that waits (an engine's sign-in settings) while the background
+/// `sign_in` is out gets that call's answer, and the plugin is asked once.
+#[test]
+fn a_waiting_read_takes_the_background_answer() {
+    let dir = plugin_folder("waits", Some("slow-on sign_in 500"));
+    let plugin = leaked(load_from(&dir, &config(App::Suite)));
+    let asks = plugin
+        .ask_in_background(vec![Ask::SignIn(App::Mail)])
+        .unwrap();
+    wait_until("the background sign_in", || methods(&dir) == ["sign_in"]);
+    let sign_in = plugin.sign_in(App::Mail).unwrap();
+    assert_eq!(sign_in.client_id.as_deref(), Some("fixture-client"));
+    asks.join().unwrap();
+    assert_eq!(methods(&dir), ["sign_in"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A background call past its deadline stops the plugin and leaves the
+/// notice for the host; the values not kept then read as answered, none.
+#[test]
+fn a_background_call_past_its_deadline_stops_the_plugin_with_a_notice() {
+    let dir = plugin_folder("background-stop", Some("slow-on sign_in 1500"));
+    let mut config = config(App::Suite);
+    config.deadlines.call = Duration::from_millis(200);
+    let plugin = leaked(load_from(&dir, &config));
+    plugin
+        .ask_in_background(vec![Ask::SignIn(App::Mail), Ask::Context])
+        .unwrap()
+        .join()
+        .unwrap();
+    let notice = plugin.take_notice().unwrap();
+    assert!(
+        notice.contains("stopped") && notice.contains("sign_in"),
+        "{notice}"
+    );
+    assert_eq!(plugin.kept_sign_in(App::Mail), Kept::Answered(None));
+    assert_eq!(plugin.kept_context(), Kept::Answered(None));
+    assert_eq!(methods(&dir), ["sign_in"]);
+    std::thread::sleep(Duration::from_millis(1_400));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// With no plugin, or for a method the plugin does not offer, a kept read
+/// is answered, none, and starts no thread.
+#[test]
+fn a_kept_read_with_nothing_to_ask_is_answered_none() {
+    let none = leaked(Integration::not_configured());
+    assert_eq!(none.app(), None);
+    assert_eq!(none.kept_branding(App::Suite), Kept::Answered(None));
+    assert_eq!(none.kept_sign_in(App::Mail), Kept::Answered(None));
+    assert_eq!(none.kept_context(), Kept::Answered(None));
+    assert!(none.ask_in_background(vec![Ask::Context]).is_none());
+    let dir = plugin_folder("kept-not-offered", Some("only-branding"));
+    let plugin = load_from(&dir, &config(App::Chat));
+    assert_eq!(plugin.app(), Some(App::Chat));
+    assert_eq!(plugin.kept_context(), Kept::Answered(None));
+    assert_eq!(plugin.kept_sign_in(App::Chat), Kept::Answered(None));
+    assert_eq!(plugin.kept_branding(App::Chat), Kept::NotYet);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -452,52 +583,6 @@ fn a_relative_folder_is_refused() {
             "the folder is not an absolute path".to_string()
         )
     );
-}
-
-/// Four calls of 300 ms within each 5 s deadline, asked ahead with a 500 ms
-/// budget: the caller waits no longer than the budget, the plugin is not
-/// stopped, and the values the budget did not cover are asked when read.
-#[test]
-fn a_slow_plugin_within_each_deadline_outlasts_the_budget() {
-    let dir = plugin_folder("budget", Some("slow 300"));
-    let plugin = load_from(&dir, &config(App::Suite));
-    let started = std::time::Instant::now();
-    plugin.ask_ahead_by(
-        &[
-            Ask::Branding(App::Mail),
-            Ask::SignIn(App::Mail),
-            Ask::Branding(App::Chat),
-            Ask::SignIn(App::Chat),
-        ],
-        started + Duration::from_millis(500),
-    );
-    let spent = started.elapsed();
-    assert!(spent < Duration::from_millis(800), "{spent:?}");
-    assert!(
-        matches!(plugin.status(), Status::Loaded { .. }),
-        "{:?}",
-        plugin.status()
-    );
-    assert!(plugin.sign_in(App::Mail).is_some());
-    assert!(plugin.branding(App::Chat).is_some());
-    assert!(plugin.sign_in(App::Chat).is_some());
-    assert!(matches!(plugin.status(), Status::Loaded { .. }));
-    assert_eq!(plugin.take_notice(), None);
-    let _ = std::fs::remove_dir_all(dir);
-}
-
-#[test]
-fn nothing_is_asked_ahead_once_the_budget_is_spent() {
-    let dir = plugin_folder("budget-spent", None);
-    let plugin = load_from(&dir, &config(App::Suite));
-    plugin.ask_ahead_by(
-        &[Ask::Branding(App::Suite), Ask::SignIn(App::Mail)],
-        std::time::Instant::now(),
-    );
-    assert!(calls(&dir).is_empty());
-    assert!(matches!(plugin.status(), Status::Loaded { .. }));
-    assert!(plugin.branding(App::Suite).is_some());
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 /// Polls `ready` until it holds, failing after 5 s.

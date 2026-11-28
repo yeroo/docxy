@@ -32,7 +32,8 @@ pub(crate) fn about_label_of(branding: Option<&Branding>) -> String {
     format!("About {}", product_of(branding))
 }
 
-/// The suite's branding, asked of the process's plugin once.
+/// The suite's branding, asked of the process's plugin once: [`start`]
+/// waits for it before the first window, so a later read finds it kept.
 fn branding() -> Option<&'static Branding> {
     static BRANDING: OnceLock<Option<Branding>> = OnceLock::new();
     BRANDING
@@ -100,19 +101,20 @@ pub(crate) fn about_rows_of(
     rows
 }
 
-/// [`about_rows_of`] for this run.
+/// [`about_rows_of`] for this run, with the context kept so far: About
+/// opened before the plugin answers shows it at its next open.
 pub(crate) fn about_rows() -> Vec<(&'static str, &'static str, String)> {
     let integration = docxy_integration::global();
     let status = integration.status();
     let context = match status {
-        Status::Loaded { .. } => integration.context(),
+        Status::Loaded { .. } => integration.kept_context().value(),
         _ => None,
     };
     about_rows_of(&status, about_line(), context.as_ref())
 }
 
 /// `app-info`'s `integration`: its state, and the organization and desktop
-/// it reports.
+/// it reports, as kept so far.
 pub(crate) fn app_info_json() -> ctlcore::json::Json {
     use ctlcore::json::Json;
     let integration = docxy_integration::global();
@@ -133,7 +135,7 @@ pub(crate) fn app_info_json() -> ctlcore::json::Json {
             ("reason", Json::Str(why)),
         ]),
         Status::Loaded { file, version } => {
-            let context = integration.context();
+            let context = integration.kept_context().value();
             Json::obj(vec![
                 ("status", Json::Str("loaded".into())),
                 ("file", Json::Str(file)),
@@ -273,9 +275,9 @@ pub(crate) fn apply_accents_to_theme(cx: &mut gpui::App) {
 static STARTUP_NOTICE: OnceLock<Option<String>> = OnceLock::new();
 
 /// Start the integration plugin for this process (before anything reads its
-/// branding), ask [`asks_ahead`] for the tab kinds the suite has, and return
-/// what it has to say, for stderr and the crash log. A harness instance loads
-/// none.
+/// branding), wait for the suite's branding, ask [`asks_after_start`] for
+/// the tab kinds the suite has on a thread of its own, and return what it has
+/// to say, for stderr and the crash log. A harness instance loads none.
 pub(crate) fn start(
     config_root: &std::path::Path,
     harness: bool,
@@ -288,30 +290,44 @@ pub(crate) fn start(
             env!("CARGO_PKG_VERSION"),
             Some(config_root.join("docxy")),
         );
-        // Loading and the asks before the first window share the load's
-        // deadline.
-        let end = std::time::Instant::now() + config.deadlines.init;
-        let integration = docxy_integration::start(config);
-        integration.ask_ahead_by(&asks_ahead(mail, other_kinds), end);
-        let _ = branding();
+        docxy_integration::start(config)
+            .ask_at_start(App::Suite, asks_after_start(mail, other_kinds));
     }
     let notice = docxy_integration::global().take_notice();
     STARTUP_NOTICE.get_or_init(|| notice.clone());
     notice
 }
 
-/// What the first window needs: the suite's branding, and the branding and
+/// What the suite asks once its own branding is kept: the branding and
 /// sign-in settings of Mail with a Mail tab kind and of Chat with a further
-/// tab kind (the interface's one other app), which their tabs' factories read
-/// on gpui's thread.
-pub(crate) fn asks_ahead(mail: bool, other_kinds: bool) -> Vec<Ask> {
-    let mut asks = vec![Ask::Branding(App::Suite)];
+/// tab kind (the interface's one other app), then the context, for the tabs
+/// and About to find kept.
+pub(crate) fn asks_after_start(mail: bool, other_kinds: bool) -> Vec<Ask> {
+    let mut asks = Vec::new();
     for (has, app) in [(mail, App::Mail), (other_kinds, App::Chat)] {
         if has {
             asks.extend([Ask::Branding(app), Ask::SignIn(app)]);
         }
     }
+    asks.push(Ask::Context);
     asks
+}
+
+/// How often a window looks for a stop of the plugin ([`take_stop_notice`]).
+pub(crate) const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Whether the plugin is loaded and not stopped, so a stop may still come.
+pub(crate) fn may_stop() -> bool {
+    matches!(docxy_integration::global().status(), Status::Loaded { .. })
+}
+
+/// A stop of the plugin since [`start`] (a call past its deadline, on the
+/// asks' thread or in a tab), once, for a window's status line; reported as
+/// [`report`] does.
+pub(crate) fn take_stop_notice() -> Option<String> {
+    let notice = docxy_integration::global().take_notice()?;
+    report(&format!("docxy: {notice}"));
+    Some(notice)
 }
 
 /// The notice [`start`] returned, for the first window's status line.
@@ -333,22 +349,22 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn nothing_is_asked_ahead_for_a_tab_kind_the_suite_lacks() {
-        assert_eq!(asks_ahead(false, false), [Ask::Branding(App::Suite)]);
+    fn nothing_is_asked_after_the_start_for_a_tab_kind_the_suite_lacks() {
+        assert_eq!(asks_after_start(false, false), [Ask::Context]);
         assert_eq!(
-            asks_ahead(true, false),
+            asks_after_start(true, false),
             [
-                Ask::Branding(App::Suite),
                 Ask::Branding(App::Mail),
-                Ask::SignIn(App::Mail)
+                Ask::SignIn(App::Mail),
+                Ask::Context
             ]
         );
         assert_eq!(
-            asks_ahead(false, true),
+            asks_after_start(false, true),
             [
-                Ask::Branding(App::Suite),
                 Ask::Branding(App::Chat),
-                Ask::SignIn(App::Chat)
+                Ask::SignIn(App::Chat),
+                Ask::Context
             ]
         );
     }

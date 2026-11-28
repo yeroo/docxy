@@ -7,9 +7,12 @@
   before changing the ABI (`integration/src/abi.rs`), the protocol (`protocol.rs`) or the loader
   (`host.rs`), and change it with them.
 - `host.rs`: `start` once per process, `global()`, `shutdown()` from each host's quit hook;
-  `ask_ahead_by` asks a list of `Ask`s within a budget that ends at a given instant, leaving the
-  call the budget cuts short in flight (`Pending`, settled by the next `token` or read of a value
-  not kept).
+  `ask_at_start` waits for the host's own branding and asks the rest with `ask_in_background`
+  (thread `integration-asks`). The waiting reads (`branding`, `sign_in`, `context`, `token`) are
+  for threads other than the UI's; the UI thread reads `kept_branding`, `kept_sign_in` and
+  `kept_context` (`Kept::NotYet` while a call can still answer). `app()` names the application
+  the process started the plugin for: Looksy and Folksy wait and take notices only when it is
+  theirs, the suite in the suite.
 - `accent.rs` holds the colour rule every host applies to the plugin's accents (`check` per role on
   the theme's background); `win_icon.rs` sets a window's icon (Windows).
 - The hosts: the suite (`suite/docxy/src/brand.rs`, `docs/claude/suite-shell.md`); mailcore takes
