@@ -196,7 +196,7 @@ pub enum Status {
         file: String,
         why: String,
     },
-    /// Loaded, then stopped for a call past its deadline.
+    /// Loaded, then stopped for a call that got no answer.
     Stopped {
         file: String,
         why: String,

@@ -556,7 +556,6 @@ fn a_call_past_its_deadline_stops_the_plugin_for_the_run() {
     };
     assert_eq!(file, fixture_file());
     assert_eq!(why, "it did not answer branding within 0.2 s");
-    // A read that leaves the notice, then the one that takes it.
     let notice = plugin.notice().unwrap();
     assert!(
         notice.contains("stopped") && notice.contains(&why),
