@@ -6452,10 +6452,12 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   asks for a sign-in at once. A second 401 on a brokered token sets `broker_refused` until a browser
   sign-in completes.
 - A brokered token's renewal is used only when its account is the session's (`same_account`,
-  ASCII case ignored). Another account's ends the session as a refusal does, with a sign-in asked.
-  When either token names no account, the refusal sets `broker_recheck`, so `signin_after_refusal`
-  asks the broker again through `ask_broker_after_refusal`, whose `signed_in` makes the mailbox
-  check before any other call.
+  ASCII case ignored); `try_refresh` keeps the held token either way, so only the refusal path
+  drops it. Another account's is a refusal. When either token names no account, the refusal sets
+  `broker_recheck`, so `signin_after_refusal` asks the broker again through
+  `ask_broker_after_refusal`, whose `signed_in` makes the mailbox check before any other call; until
+  a pass has listed the folders on that sign-in (`broker_recheck_unconfirmed`), the next such
+  renewal sets `broker_refused`, so a broker Graph keeps refusing ends in a sign-in.
 - `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL. `AuthConfig`'s
   `Debug` and `SyncEvent::SignInStarted`'s (`auth::AuthorizeUrl`) hide it.
 - `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
@@ -6473,5 +6475,7 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `a_browser_sign_in_lets_the_broker_be_asked_again`,
   `a_renewed_brokered_token_of_another_account_is_not_used`,
   `a_renewed_brokered_token_naming_no_account_checks_the_mailbox_first`,
+  `an_unnamed_broker_whose_tokens_graph_refuses_ends_in_a_sign_in`,
+  `a_refused_renewal_a_caller_swallows_still_ends_in_a_sign_in`,
   `a_sign_in_started_debug_print_hides_the_login_hint`;
   `auth::tests::a_debug_print_hides_the_login_hint`.

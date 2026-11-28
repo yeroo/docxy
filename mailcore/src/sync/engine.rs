@@ -2400,9 +2400,7 @@ pub struct EngineOptions {
 ///   sign-in is asked for, as with no broker.
 ///
 /// When it gives nothing near a token's expiry, the token is used until it
-/// expires. A token Graph refuses twice (a second 401) stops the engine
-/// asking it in that run until a browser sign-in completes. A token whose
-/// scopes it does not say is taken to hold the scopes asked for.
+/// expires.
 ///
 /// A token it gives has no refresh token and is kept in memory only, never
 /// in the token file.
@@ -2920,6 +2918,10 @@ struct Engine {
     /// [`Engine::ask_broker_after_refusal`] and its mailbox check, not to a
     /// sign-in.
     broker_recheck: bool,
+    /// A sign-in through the broker for `broker_recheck` that no pass has yet
+    /// listed the folders on: a renewal that cannot compare accounts then
+    /// sets `broker_refused` in place of asking the broker again.
+    broker_recheck_unconfirmed: bool,
     /// A probe that failed for a reason `react` does not handle (a 5xx, a
     /// 4xx, a parse error, a store error) holds the next one off until this
     /// instant (#1946), so a fast tick does not probe every few seconds.
@@ -3051,6 +3053,7 @@ impl Engine {
             mailbox_unchecked,
             broker_after_refusal: None,
             broker_recheck: false,
+            broker_recheck_unconfirmed: false,
             check_retry: None,
             check_backoff: BACKOFF_MIN,
         }
@@ -3289,8 +3292,6 @@ impl Engine {
         self.follow_saved_signin_backoff();
         self.next_tick = Instant::now() + self.config.tick;
         loop {
-            // The broker after a refused refresh (#2317), once the step that
-            // met it has ended.
             if !self.shutting_down {
                 self.ask_broker_after_refusal();
             }
@@ -4105,6 +4106,7 @@ impl Engine {
         if !self.sync_folders(full) {
             return;
         }
+        self.broker_recheck_unconfirmed = false;
         let folders = match self.store.folders() {
             Ok(f) => f,
             Err(e) => {
@@ -10687,15 +10689,14 @@ impl Engine {
                         self.announce_scopes();
                         Refresh::Done
                     }
-                    // Another account's token is not used: the held one goes
-                    // too, so the refusal ends the session.
-                    Some(false) => {
-                        self.token = None;
-                        refused()
-                    }
+                    // Another account's token is not used.
+                    Some(false) => refused(),
                     None => {
-                        self.token = None;
-                        self.broker_recheck = true;
+                        if self.broker_recheck_unconfirmed {
+                            self.broker_refused = true;
+                        } else {
+                            self.broker_recheck = true;
+                        }
                         refused()
                     }
                 },
@@ -11204,6 +11205,7 @@ impl Engine {
             && self.config.options.broker.is_some()
             && !self.broker_refused
         {
+            self.broker_recheck_unconfirmed = recheck;
             self.drop_session();
             self.broker_after_refusal = Some(reason);
         } else {
@@ -11238,6 +11240,7 @@ impl Engine {
     /// the tick again, and the next session's back-off starts at
     /// `BACKOFF_MIN`.
     fn enter_signin(&mut self, reason: SignInReason) {
+        self.broker_recheck_unconfirmed = false;
         self.drop_session();
         self.emit(SyncEvent::SignInRequired { reason });
         self.set_state(SyncState::SignInRequired);
@@ -53870,7 +53873,7 @@ mod tests {
     fn a_renewed_brokered_token_of_another_account_is_not_used() {
         let broker = fake_broker(|_, n| {
             if n == 0 {
-                brokered("FIRST", 10)
+                brokered("FIRST", 0)
             } else {
                 BrokerResult::Token {
                     access_token: "OTHER".into(),
@@ -53918,7 +53921,7 @@ mod tests {
             scopes: Some(strings(SEEDED)),
         };
         let broker = fake_broker(move |_, n| match n {
-            0 => unnamed("FIRST", 10),
+            0 => unnamed("FIRST", 0),
             1 => unnamed("SECOND", 3600),
             _ => unnamed("THIRD", 3600),
         });
@@ -53953,6 +53956,99 @@ mod tests {
             "{sent:?}"
         );
         finish(handle, dir);
+    }
+
+    /// A broker whose tokens name no account, and which Graph refuses: the
+    /// renewal signs in again through the broker once, and the next refusal
+    /// stops the broker and asks for a sign-in.
+    #[test]
+    fn an_unnamed_broker_whose_tokens_graph_refuses_ends_in_a_sign_in() {
+        let broker = fake_broker(|_, n| BrokerResult::Token {
+            access_token: format!("U{n}"),
+            expires_at_unix: now_unix() + 3600,
+            account: String::new(),
+            scopes: Some(strings(SEEDED)),
+        });
+        let (handle, dir, _token_path, _srv) = broker_engine(
+            "broker-unnamed-refused",
+            vec![(empty_folders_route(401), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInStarted { .. })),
+            "{events:?}"
+        );
+        let asked = broker_calls(broker).len();
+        assert!((2..=4).contains(&asked), "{asked} broker asks");
+        finish(handle, dir);
+    }
+
+    /// A renewal for another account that a caller swallows (the categories'
+    /// read) keeps the token, so the next pass's refusal still asks for a
+    /// sign-in.
+    #[test]
+    fn a_refused_renewal_a_caller_swallows_still_ends_in_a_sign_in() {
+        let broker = fake_broker(|_, _| BrokerResult::Token {
+            access_token: "OTHER".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: "someone.else@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+        });
+        let srv = FakeServer::start(Vec::new());
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: PathBuf::from("unused-token.json"),
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: srv.base_url.clone(),
+            auth_base: srv.base_url.clone(),
+            tick: Duration::from_secs(3600),
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: None,
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.token = Some(TokenSet {
+            access_token: "FIRST".into(),
+            refresh_token: String::new(),
+            expires_at_unix: now_unix().saturating_sub(1),
+            account: "person@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+            cloud: crate::auth::Cloud::Global,
+        });
+        engine.brokered = true;
+        engine.mailbox_unchecked = false;
+        engine.refresh_master_categories();
+        assert!(
+            engine.token.is_some(),
+            "a swallowed refusal keeps the token"
+        );
+        engine.sync_pass(true);
+        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !srv.requests().iter().any(|r| r
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer OTHER")),
+            "a request carried the other account's token"
+        );
     }
 
     /// Near its expiry, a broker that gives nothing keeps a brokered token
