@@ -509,26 +509,18 @@ fn a_plugin_that_refuses_the_host_is_not_used() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A load the deadline ended before the library was found goes no further:
-/// the worker takes no stale marker and loads nothing.
+/// A load whose deadline ends during `dxi_abi` (1.5 s against 0.2 s) goes
+/// no further: the worker never calls `dxi_init`. The sleep only lets the
+/// worker finish its `dxi_abi`.
 #[test]
-fn a_load_ended_before_the_library_is_found_touches_nothing() {
-    let dir = plugin_folder("load-ended", None);
-    let markers = dir.join("markers");
-    std::fs::create_dir_all(&markers).unwrap();
-    let stale = markers.join(format!("dxi-mail-{}.marker", ended_process_id()));
-    std::fs::write(&stale, "branding").unwrap();
-    let mut config = marker_config(&markers);
-    config.deadlines.init = Duration::ZERO;
+fn a_load_the_deadline_ended_never_calls_dxi_init() {
+    let dir = plugin_folder("load-ended", Some("slow-abi 1500"));
+    let mut config = config(App::Suite);
+    config.deadlines.init = Duration::from_millis(200);
     let plugin = load_from(&dir, &config);
-    assert!(
-        matches!(plugin.status(), Status::Refused { .. }),
-        "{:?}",
-        plugin.status()
-    );
-    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(refusal(&plugin).1, "it did not start within 0.2 s");
+    std::thread::sleep(Duration::from_millis(1_800));
     assert_eq!(inits(&dir), 0);
-    assert!(stale.exists());
     let _ = std::fs::remove_dir_all(dir);
 }
 

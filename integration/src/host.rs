@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
 /// The registry key that holds the folder on Windows, under HKLM.
@@ -246,7 +246,8 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
         app_version: config.app_version.clone(),
         os: std::env::consts::OS.into(),
     };
-    let (jobs, ready) = match spawn_worker(dir.to_path_buf(), info, marker) {
+    let gave_up = Arc::new(AtomicBool::new(false));
+    let (jobs, ready) = match spawn_worker(dir.to_path_buf(), info, marker, gave_up.clone()) {
         Ok(started) => started,
         Err(e) => return Integration::refused(app, file, format!("no worker thread: {e}")),
     };
@@ -288,6 +289,7 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
                 "its worker thread ended while it started".into()
             }
         };
+        gave_up.store(true, Ordering::SeqCst);
         return Integration::refused(app, file, refused);
     }
 }
@@ -750,11 +752,14 @@ enum Start {
 type Ready = mpsc::Receiver<Start>;
 
 /// The worker: it finds the one library in `dir`, skips it for a stale
-/// marker, loads it and calls `dxi_init`, then runs the jobs.
+/// marker, loads it and calls `dxi_init`, then runs the jobs. Once
+/// `gave_up` is set (`load_from` refused the plugin) it starts no further
+/// step.
 fn spawn_worker(
     dir: PathBuf,
     info: HostInfo,
     marker: Option<Marker>,
+    gave_up: Arc<AtomicBool>,
 ) -> std::io::Result<(mpsc::Sender<Job>, Ready)> {
     let (jobs, queue) = mpsc::channel::<Job>();
     let (ready_tx, ready) = mpsc::channel();
@@ -768,8 +773,8 @@ fn spawn_worker(
                     return;
                 }
             };
-            // `load_from` gave up waiting: the plugin is refused, so it is not touched.
-            if ready_tx.send(Start::Found(file_name(&library))).is_err() {
+            let _ = ready_tx.send(Start::Found(file_name(&library)));
+            if gave_up.load(Ordering::SeqCst) {
                 return;
             }
             if let Some(marker) = &marker
@@ -778,7 +783,7 @@ fn spawn_worker(
                 let _ = ready_tx.send(Start::Refused(why));
                 return;
             }
-            let loaded = match open(&library, &info, marker) {
+            let loaded = match open(&library, &info, marker, &gave_up) {
                 Ok((loaded, answer)) => {
                     let _ = ready_tx.send(Start::Ready(answer));
                     loaded
@@ -799,7 +804,12 @@ fn open(
     path: &Path,
     info: &HostInfo,
     marker: Option<Marker>,
+    gave_up: &AtomicBool,
 ) -> Result<(Loaded, InitAnswer), String> {
+    let refused = || "the host gave up waiting".to_string();
+    if gave_up.load(Ordering::SeqCst) {
+        return Err(refused());
+    }
     let path = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
     if let Some(marker) = &marker {
         marker.enter("load");
@@ -845,6 +855,9 @@ fn open(
         last_error,
         marker,
     };
+    if gave_up.load(Ordering::SeqCst) {
+        return Err(refused());
+    }
     let host = info.to_json();
     let text = loaded.guarded("init", |out| {
         // SAFETY: `host` outlives the call; `out` is an empty buffer.
