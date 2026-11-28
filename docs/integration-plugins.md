@@ -86,8 +86,8 @@ crosses the boundary.
   and the host does not use the plugin again in that run and says so once.
 - A host may ask some values ahead, before its first window, within a budget of its own. It waits
   no longer than the budget: a call the budget cuts short stays in flight and is waited for, up to
-  its own deadline, when the host next reads a value, and the values the budget does not reach are
-  asked when first read. The budget stops no plugin; only a call past its own deadline does.
+  its own deadline, when the host next asks the plugin for a value or a token, and the values the
+  budget does not reach are asked when first read. The budget stops no plugin.
 - A plugin must catch every panic or exception at each export and return an error code. A Rust panic
   that unwinds out of an `extern "C"` function aborts the process.
 - A crash inside the plugin ends the host. Before loading, before `dxi_abi`, `dxi_init` and each

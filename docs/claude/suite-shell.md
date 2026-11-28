@@ -190,10 +190,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   its id, so `SHEET_RIBBON` stays a `const` table) and the About dialog's title use
   `brand::about_label()` ("About" and the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
   titles use `brand::short()`. With no plugin, both name the suite ("About docxy suite", "docxy").
-- `brand::start` asks before the first window only what it needs (`brand::asks_ahead`): the suite's
-  branding, and Mail's and Chat's branding and sign-in when the suite has their tab kinds, so their
-  factories, on gpui's thread, read kept values. The asks share the load's deadline as a budget;
-  what it does not cover is asked when first read.
+- `brand::start` asks what `brand::asks_ahead` lists before the first window (`ask_ahead_by`).
 - The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
   failed, the first window's status line (`brand::startup_notice`). An accent refusal (once per
   theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds

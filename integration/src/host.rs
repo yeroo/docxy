@@ -450,9 +450,9 @@ impl Integration {
     /// a host that starts the plugin before its first window calls it there,
     /// so a later read of a value asked (a tab made on the UI thread) reads
     /// the kept value and calls nothing. An ask that `end` cuts short stays
-    /// in flight, and the first read of any value waits for it up to its own
-    /// deadline; the asks after it are made when their values are first
-    /// read. Only a call past its own deadline stops the plugin.
+    /// in flight, and the next read of a value not kept, or the next token,
+    /// waits for it up to its own deadline; the asks after it are made when
+    /// their values are first read. `end` stops no plugin.
     pub fn ask_ahead_by(&self, asks: &[Ask], end: Instant) {
         let Some(worker) = &self.worker else {
             return;

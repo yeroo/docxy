@@ -11193,8 +11193,9 @@ impl Engine {
     /// Where every refusal of the session's token ends (a 401 the renewal
     /// did not help, `signin_after_401`, from a pass, a drain, a bulk loop, a
     /// fill or a command; or the start's refresh, `refresh_if_near_expiry`).
-    /// A saved token whose refresh was refused (or that has none) with a
-    /// broker set drops the session as any refusal does, and leaves the
+    /// A saved token whose refresh was refused (or that has none), or a
+    /// refusal that set `broker_recheck`, with a broker set and not
+    /// `broker_refused`, drops the session as any refusal does, and leaves the
     /// broker to the main loop, once the work that met the refusal has
     /// ended ([`Engine::ask_broker_after_refusal`]); anything else is a
     /// sign-in asked for `reason` at once.
