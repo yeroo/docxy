@@ -13,7 +13,7 @@ use std::ffi::{CString, OsString};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The registry key that holds the folder on Windows, under HKLM.
 pub const REGISTRY_KEY: &str = r"SOFTWARE\docxy\Integration";
@@ -190,9 +190,14 @@ pub enum Status {
         file: String,
         version: String,
     },
-    /// Not loaded, or stopped since: `file` is the library, or the folder
-    /// when no single library was found.
+    /// Not loaded: `file` is the library, or the folder when no single
+    /// library was found.
     Refused {
+        file: String,
+        why: String,
+    },
+    /// Loaded, then stopped for a call past its deadline.
+    Stopped {
         file: String,
         why: String,
     },
@@ -226,71 +231,64 @@ pub fn shutdown() {
 /// marker of `config.app` says the last run ended in a plugin call.
 pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
     let app = config.app;
+    let mut file = dir.display().to_string();
     if !dir.is_absolute() {
-        return Integration::refused(
-            app,
-            dir.display().to_string(),
-            "the folder is not an absolute path".into(),
-        );
+        return Integration::refused(app, file, "the folder is not an absolute path".into());
     }
-    let library = match find_library(dir) {
-        Ok(library) => library,
-        Err(why) => return Integration::refused(app, dir.display().to_string(), why),
-    };
-    let file = file_name(&library);
     let marker = config
         .marker_dir
         .as_ref()
         .map(|dir| Marker::new(dir, config.app));
     let marker_path = marker.as_ref().map(|m| m.path.clone());
-    if let Some(marker) = &marker
-        && let Some(why) = marker.take_stale()
-    {
-        return Integration::refused(app, file, why);
-    }
     let info = HostInfo {
         abi: abi::ABI_VERSION,
         app: config.app,
         app_version: config.app_version.clone(),
         os: std::env::consts::OS.into(),
     };
-    let (jobs, ready) = match spawn_worker(library, info, marker) {
+    let (jobs, ready) = match spawn_worker(dir.to_path_buf(), info, marker) {
         Ok(started) => started,
         Err(e) => return Integration::refused(app, file, format!("no worker thread: {e}")),
     };
-    match ready.recv_timeout(config.deadlines.init) {
-        Ok(Ok(answer)) => Integration {
-            app: Some(app),
-            status: Mutex::new(Status::Loaded {
-                file: file.clone(),
-                version: answer.version,
-            }),
-            notice: Mutex::new(None),
-            worker: Some(Worker {
-                jobs,
-                file,
-                methods: answer.methods,
-                stopped: AtomicBool::new(false),
-                turn: Mutex::new(()),
-            }),
-            marker_path,
-            deadlines: config.deadlines,
-            branding: Mutex::default(),
-            sign_in: Mutex::default(),
-            context: OnceLock::new(),
-        },
-        Ok(Err(why)) => Integration::refused(app, file, why),
-        Err(mpsc::RecvTimeoutError::Timeout) => Integration::refused(
-            app,
-            file,
-            format!(
+    let end = Instant::now() + config.deadlines.init;
+    loop {
+        let refused = match ready.recv_timeout(end.saturating_duration_since(Instant::now())) {
+            Ok(Start::Found(name)) => {
+                file = name;
+                continue;
+            }
+            Ok(Start::Ready(answer)) => {
+                return Integration {
+                    app: Some(app),
+                    status: Mutex::new(Status::Loaded {
+                        file: file.clone(),
+                        version: answer.version,
+                    }),
+                    notice: Mutex::new(None),
+                    worker: Some(Worker {
+                        jobs,
+                        file,
+                        methods: answer.methods,
+                        stopped: AtomicBool::new(false),
+                        turn: Mutex::new(()),
+                    }),
+                    marker_path,
+                    deadlines: config.deadlines,
+                    branding: Mutex::default(),
+                    sign_in: Mutex::default(),
+                    context: OnceLock::new(),
+                };
+            }
+            Ok(Start::Refused(why)) => why,
+            Err(mpsc::RecvTimeoutError::Timeout) => format!(
                 "it did not start within {} s",
                 config.deadlines.init.as_secs_f32()
             ),
-        ),
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            Integration::refused(app, file, "its worker thread ended while it started".into())
-        }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                "its worker thread ended while it started".into()
+            }
+        };
+        return Integration::refused(app, file, refused);
     }
 }
 
@@ -473,6 +471,11 @@ impl Integration {
         lock(&self.notice).take()
     }
 
+    /// The notice [`Integration::take_notice`] would give, left in place.
+    pub fn notice(&self) -> Option<String> {
+        lock(&self.notice).clone()
+    }
+
     /// The plugin's names and icons for `app`, asked once and kept; this
     /// waits for the call ([`Integration::kept_branding`] does not).
     pub fn branding(&self, app: App) -> Option<Branding> {
@@ -636,6 +639,9 @@ impl Integration {
         let Some(worker) = &self.worker else {
             return Err("no integration plugin".into());
         };
+        if !worker.offers(method) {
+            return Err(format!("{} offers no {method}", worker.file));
+        }
         // Waiting for the turn is bounded by the holder's own deadline; one
         // that stopped the plugin leaves the next caller to fail below.
         let _turn = lock(&worker.turn);
@@ -688,7 +694,8 @@ impl Integration {
     /// At a normal quit: no call is made after this, and this process's
     /// crash marker goes, so a call still in flight is not taken for a crash
     /// at the next start. A plugin already stopped (an abandoned call) keeps
-    /// its marker, so the next start skips it.
+    /// the marker while that call runs, so a quit during it makes the next
+    /// start skip the plugin.
     pub fn shutdown(&self) {
         let Some(worker) = &self.worker else {
             return;
@@ -709,7 +716,7 @@ impl Integration {
                 "Integration plugin {} stopped: {why}; it is not used again in this run",
                 worker.file
             ));
-            *lock(&self.status) = Status::Refused {
+            *lock(&self.status) = Status::Stopped {
                 file: worker.file.clone(),
                 why: why.clone(),
             };
@@ -732,10 +739,21 @@ struct Loaded {
     marker: Option<Marker>,
 }
 
-type Ready = mpsc::Receiver<Result<InitAnswer, String>>;
+/// What the worker tells [`load_from`] while it starts.
+enum Start {
+    /// The one library in the folder, by file name.
+    Found(String),
+    Ready(InitAnswer),
+    Refused(String),
+}
 
+type Ready = mpsc::Receiver<Start>;
+
+/// The worker: it finds the one library in `dir`, skips it for a stale
+/// marker, loads it and calls `dxi_init`, all within [`load_from`]'s
+/// deadline, then runs the jobs.
 fn spawn_worker(
-    library: PathBuf,
+    dir: PathBuf,
     info: HostInfo,
     marker: Option<Marker>,
 ) -> std::io::Result<(mpsc::Sender<Job>, Ready)> {
@@ -744,13 +762,27 @@ fn spawn_worker(
     std::thread::Builder::new()
         .name("integration-plugin".into())
         .spawn(move || {
+            let library = match find_library(&dir) {
+                Ok(library) => library,
+                Err(why) => {
+                    let _ = ready_tx.send(Start::Refused(why));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Start::Found(file_name(&library)));
+            if let Some(marker) = &marker
+                && let Some(why) = marker.take_stale()
+            {
+                let _ = ready_tx.send(Start::Refused(why));
+                return;
+            }
             let loaded = match open(&library, &info, marker) {
                 Ok((loaded, answer)) => {
-                    let _ = ready_tx.send(Ok(answer));
+                    let _ = ready_tx.send(Start::Ready(answer));
                     loaded
                 }
                 Err(why) => {
-                    let _ = ready_tx.send(Err(why));
+                    let _ = ready_tx.send(Start::Refused(why));
                     return;
                 }
             };

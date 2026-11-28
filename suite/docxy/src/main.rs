@@ -55114,38 +55114,31 @@ fn open_docxy_window(
                     this.window_should_close(ask, window, cx)
                 })
             });
-            // A stop of the integration plugin after the start goes to the
-            // status line (#2317); the loop ends once the plugin is stopped
-            // and said. `update_in` only, as for AutoRecover below.
-            if brand::may_stop() {
+            // A stop of the integration plugin goes to the status line
+            // (#2317): the notice stays until a window has shown it, and each
+            // window's poll ends when the window is gone. `update_in` only, as
+            // for AutoRecover below.
+            if brand::configured() {
                 let watcher = view.downgrade();
                 window
                     .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-                        let mut line = None;
                         loop {
                             cx.background_executor().timer(brand::STOP_POLL).await;
-                            // Read before the notice: a stop sets its notice first.
-                            let stopped = !brand::may_stop();
-                            line = line.or_else(brand::take_stop_notice);
-                            if line.is_none() {
-                                if stopped {
-                                    break;
+                            let line = match brand::stop_poll_now(watcher.upgrade().is_some()) {
+                                brand::StopPoll::End => break,
+                                brand::StopPoll::Wait => continue,
+                                brand::StopPoll::Show(line) => line,
+                            };
+                            // Busy: the notice stays for the next wake.
+                            let _ = watcher.update_in(cx, |this, _, cx| {
+                                if this.tabs.is_empty() {
+                                    this.pending_status = Some(line.into());
+                                } else {
+                                    this.set_status(line);
                                 }
-                                continue;
-                            }
-                            let shown = watcher.update_in(cx, |this, _, cx| {
-                                if let Some(line) = line.take() {
-                                    if this.tabs.is_empty() {
-                                        this.pending_status = Some(line.into());
-                                    } else {
-                                        this.set_status(line);
-                                    }
-                                    cx.notify();
-                                }
+                                brand::stop_notice_shown();
+                                cx.notify();
                             });
-                            if shown.is_err() && watcher.upgrade().is_none() {
-                                break;
-                            }
                         }
                     })
                     .detach();

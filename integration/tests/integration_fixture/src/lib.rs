@@ -11,7 +11,8 @@
 //! - `slow-on <method> <ms>`: each call of `<method>` sleeps that long first;
 //! - `interaction`: `token` answers `interaction_required`;
 //! - `panic`: each `dxi_call` panics, caught as INTERNAL_ERROR;
-//! - `only-branding`: `dxi_init` offers `branding` alone.
+//! - `only-branding`: `dxi_init` offers `branding` alone;
+//! - `only-branding-slow <ms>`: as `only-branding`, each `branding` sleeping that long first.
 //!
 //! Each `dxi_call` appends `<method> <OS thread id>` to `fixture-calls`
 //! beside the library, and each `dxi_init` a line to `fixture-inits`.
@@ -232,7 +233,7 @@ pub unsafe extern "C" fn dxi_init(_host: *const u8, _len: usize, out: *mut DxiBu
     if is(&mode, "init-refuses") {
         return fail(NOT_CONFIGURED, "the fixture refuses this host");
     }
-    let methods = if is(&mode, "only-branding") {
+    let methods = if is(&mode, "only-branding") || is(&mode, "only-branding-slow") {
         r#"["branding"]"#
     } else {
         r#"["branding","sign_in","token","context"]"#
@@ -277,7 +278,10 @@ pub unsafe extern "C" fn dxi_call(
 }
 
 fn answer(mode: &[String], method: &str, request: &str) -> Result<String, (i32, String)> {
-    if is(mode, "slow") || (is(mode, "slow-token") && method == "token") {
+    if is(mode, "slow")
+        || (is(mode, "slow-token") && method == "token")
+        || is(mode, "only-branding-slow")
+    {
         sleep_ms(mode);
     }
     if is(mode, "slow-on") && mode.get(1).is_some_and(|m| m == method) {

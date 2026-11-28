@@ -316,6 +316,27 @@ fn a_background_call_past_its_deadline_stops_the_plugin_with_a_notice() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A `token` from a plugin that offers none fails at once, without waiting
+/// for the call that holds the turn.
+#[test]
+fn a_method_not_offered_waits_for_no_turn() {
+    let dir = plugin_folder("not-offered-turn", Some("only-branding-slow 1500"));
+    let plugin = leaked(load_from(&dir, &config(App::Mail)));
+    let asks = plugin
+        .ask_in_background(vec![Ask::Branding(App::Mail)])
+        .unwrap();
+    wait_until("the slow branding", || methods(&dir) == ["branding"]);
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        plugin.token(&token_request()),
+        TokenAnswer::Unavailable { .. }
+    ));
+    let spent = started.elapsed();
+    assert!(spent < Duration::from_millis(500), "{spent:?}");
+    asks.join().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// With no plugin, or for a method the plugin does not offer, a kept read
 /// is answered, none; with no plugin, `ask_in_background` starts no thread.
 #[test]
@@ -507,9 +528,13 @@ fn a_call_past_its_deadline_stops_the_plugin_for_the_run() {
     let plugin = load_from(&dir, &config);
     let started = std::time::Instant::now();
     assert_eq!(plugin.branding(App::Suite), None);
-    let (file, why) = refusal(&plugin);
+    let Status::Stopped { file, why } = plugin.status() else {
+        panic!("not stopped: {:?}", plugin.status());
+    };
     assert_eq!(file, fixture_file());
     assert_eq!(why, "it did not answer branding within 0.2 s");
+    // A read that leaves the notice, then the one that takes it.
+    assert_eq!(plugin.notice(), plugin.notice());
     let notice = plugin.take_notice().unwrap();
     assert!(
         notice.contains("stopped") && notice.contains(&why),

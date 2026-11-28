@@ -97,6 +97,9 @@ pub(crate) fn about_rows_of(
         Status::Refused { why, .. } => {
             rows.push(("integration", "Integration", format!("not loaded: {why}")));
         }
+        Status::Stopped { why, .. } => {
+            rows.push(("integration", "Integration", format!("stopped: {why}")));
+        }
     }
     rows
 }
@@ -131,6 +134,11 @@ pub(crate) fn app_info_json() -> ctlcore::json::Json {
         Status::NotConfigured => Json::obj(vec![("status", Json::Str("not configured".into()))]),
         Status::Refused { file, why } => Json::obj(vec![
             ("status", Json::Str("refused".into())),
+            ("file", Json::Str(file)),
+            ("reason", Json::Str(why)),
+        ]),
+        Status::Stopped { file, why } => Json::obj(vec![
+            ("status", Json::Str("stopped".into())),
             ("file", Json::Str(file)),
             ("reason", Json::Str(why)),
         ]),
@@ -298,36 +306,74 @@ pub(crate) fn start(
     notice
 }
 
-/// What the suite asks once its own branding is kept: the branding and
-/// sign-in settings of Mail with a Mail tab kind and of Chat with a further
-/// tab kind (the interface's one other app), then the context, for the tabs
-/// and About to find kept.
+/// What the suite asks once its own branding is kept, for the tabs and
+/// About to find kept: Mail's branding with a Mail tab kind and Chat's with
+/// a further tab kind (the interface's one other app), then their sign-in
+/// settings in the same order, then the context. Every branding comes before
+/// any sign-in: a plugin's first `sign_in` may wait on the desktop.
 pub(crate) fn asks_after_start(mail: bool, other_kinds: bool) -> Vec<Ask> {
-    let mut asks = Vec::new();
-    for (has, app) in [(mail, App::Mail), (other_kinds, App::Chat)] {
-        if has {
-            asks.extend([Ask::Branding(app), Ask::SignIn(app)]);
-        }
-    }
+    let apps: Vec<App> = [(mail, App::Mail), (other_kinds, App::Chat)]
+        .into_iter()
+        .filter_map(|(has, app)| has.then_some(app))
+        .collect();
+    let mut asks: Vec<Ask> = apps.iter().map(|&app| Ask::Branding(app)).collect();
+    asks.extend(apps.iter().map(|&app| Ask::SignIn(app)));
     asks.push(Ask::Context);
     asks
 }
 
-/// How often a window looks for a stop of the plugin ([`take_stop_notice`]).
+/// How often a window looks for a stop of the plugin ([`stop_poll_now`]).
 pub(crate) const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Whether the plugin is loaded and not stopped, so a stop may still come.
-pub(crate) fn may_stop() -> bool {
-    matches!(docxy_integration::global().status(), Status::Loaded { .. })
+/// Whether a plugin is configured, loaded or not: each window then polls for
+/// its notice.
+pub(crate) fn configured() -> bool {
+    !matches!(docxy_integration::global().status(), Status::NotConfigured)
 }
 
-/// A stop of the plugin since [`start`] (a call past its deadline, on the
-/// asks' thread or in a tab), once, for a window's status line; reported as
-/// [`report`] does.
-pub(crate) fn take_stop_notice() -> Option<String> {
-    let notice = docxy_integration::global().take_notice()?;
-    report(&format!("docxy: {notice}"));
-    Some(notice)
+/// A window's poll's next step ([`stop_poll`]).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopPoll {
+    /// Put the notice on the status line, then take it
+    /// ([`stop_notice_shown`]).
+    Show(String),
+    Wait,
+    End,
+}
+
+/// The poll's next step: none once its window is gone; the notice while one
+/// waits, left in place until a window shows it; another wait while the
+/// plugin is loaded, as a stop may still come.
+pub(crate) fn stop_poll(window_open: bool, status: &Status, notice: Option<String>) -> StopPoll {
+    if !window_open {
+        return StopPoll::End;
+    }
+    match notice {
+        Some(line) => StopPoll::Show(line),
+        None if matches!(status, Status::Loaded { .. }) => StopPoll::Wait,
+        None => StopPoll::End,
+    }
+}
+
+/// [`stop_poll`] for this run's plugin. The notice goes to stderr and the
+/// crash log ([`report`]) the first time a poll reads it.
+pub(crate) fn stop_poll_now(window_open: bool) -> StopPoll {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let integration = docxy_integration::global();
+    // The status before the notice: a stop sets its notice first.
+    let status = integration.status();
+    let step = stop_poll(window_open, &status, integration.notice());
+    if let StopPoll::Show(line) = &step
+        && !REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        report(&format!("docxy: {line}"));
+    }
+    step
+}
+
+/// A window has shown the notice: no other window shows it again.
+pub(crate) fn stop_notice_shown() {
+    let _ = docxy_integration::global().take_notice();
 }
 
 /// The notice [`start`] returned, for the first window's status line.
@@ -367,6 +413,43 @@ pub(crate) mod tests {
                 Ask::Context
             ]
         );
+        assert_eq!(
+            asks_after_start(true, true),
+            [
+                Ask::Branding(App::Mail),
+                Ask::Branding(App::Chat),
+                Ask::SignIn(App::Mail),
+                Ask::SignIn(App::Chat),
+                Ask::Context
+            ]
+        );
+    }
+
+    /// A stop before the first window is shown by it; a closed window's poll
+    /// ends and takes nothing; a poll waits only while a stop may come.
+    #[test]
+    fn a_stop_waits_for_an_open_window_to_show_it() {
+        let stopped = Status::Stopped {
+            file: "dxi_x.dll".into(),
+            why: "why".into(),
+        };
+        let loaded = Status::Loaded {
+            file: "dxi_x.dll".into(),
+            version: "1".into(),
+        };
+        let refused = Status::Refused {
+            file: "dxi_x.dll".into(),
+            why: "why".into(),
+        };
+        let line = || Some("Integration plugin dxi_x.dll stopped: why".to_string());
+        assert_eq!(
+            stop_poll(true, &stopped, line()),
+            StopPoll::Show(line().unwrap())
+        );
+        assert_eq!(stop_poll(false, &stopped, line()), StopPoll::End);
+        assert_eq!(stop_poll(true, &loaded, None), StopPoll::Wait);
+        assert_eq!(stop_poll(true, &stopped, None), StopPoll::End);
+        assert_eq!(stop_poll(true, &refused, None), StopPoll::End);
     }
 
     /// A refusal or a failed icon reaches the crash log too.
@@ -458,6 +541,18 @@ pub(crate) mod tests {
                 "integration",
                 "Integration",
                 "not loaded: it speaks interface version 0; this host takes 1 to 1".to_string()
+            )]
+        );
+        let stopped = Status::Stopped {
+            file: "dxi_x.dll".into(),
+            why: "it did not answer context within 5 s".into(),
+        };
+        assert_eq!(
+            about_rows_of(&stopped, None, None),
+            [(
+                "integration",
+                "Integration",
+                "stopped: it did not answer context within 5 s".to_string()
             )]
         );
         let loaded = Status::Loaded {
