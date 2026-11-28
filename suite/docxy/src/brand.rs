@@ -3,7 +3,7 @@
 //! suite's own.
 
 use docxy_integration::accent::{self as rule, Role};
-use docxy_integration::host::Status;
+use docxy_integration::host::{Ask, Status};
 use docxy_integration::protocol::{AccentSet, App, Branding, Context, Rgb};
 use std::sync::OnceLock;
 
@@ -273,32 +273,45 @@ pub(crate) fn apply_accents_to_theme(cx: &mut gpui::App) {
 static STARTUP_NOTICE: OnceLock<Option<String>> = OnceLock::new();
 
 /// Start the integration plugin for this process (before anything reads its
-/// branding), ask its branding, the Mail and Chat tabs' sign-in settings and
-/// its context once, and return what it has to say, for stderr and the crash
-/// log. A harness instance loads none.
-pub(crate) fn start(config_root: &std::path::Path, harness: bool) -> Option<String> {
+/// branding), ask [`asks_ahead`] for the tab kinds the suite has, and return
+/// what it has to say, for stderr and the crash log. A harness instance loads
+/// none.
+pub(crate) fn start(
+    config_root: &std::path::Path,
+    harness: bool,
+    mail: bool,
+    other_kinds: bool,
+) -> Option<String> {
     if !harness {
         let config = docxy_integration::host::HostConfig::new(
             App::Suite,
             env!("CARGO_PKG_VERSION"),
             Some(config_root.join("docxy")),
         );
-        // Loading and every call before the first window share the load's
+        // Loading and the asks before the first window share the load's
         // deadline.
         let end = std::time::Instant::now() + config.deadlines.init;
         let integration = docxy_integration::start(config);
-        // The Mail and Chat tabs' values too: their factories run on gpui's
-        // thread, which then reads them kept.
-        integration.ask_ahead_by(
-            &[App::Suite, App::Mail, App::Chat],
-            &[App::Mail, App::Chat],
-            end,
-        );
+        integration.ask_ahead_by(&asks_ahead(mail, other_kinds), end);
         let _ = branding();
     }
     let notice = docxy_integration::global().take_notice();
     STARTUP_NOTICE.get_or_init(|| notice.clone());
     notice
+}
+
+/// What the first window needs: the suite's branding, and the branding and
+/// sign-in settings of Mail with a Mail tab kind and of Chat with a further
+/// tab kind (the interface's one other app), which their tabs' factories read
+/// on gpui's thread.
+pub(crate) fn asks_ahead(mail: bool, other_kinds: bool) -> Vec<Ask> {
+    let mut asks = vec![Ask::Branding(App::Suite)];
+    for (has, app) in [(mail, App::Mail), (other_kinds, App::Chat)] {
+        if has {
+            asks.extend([Ask::Branding(app), Ask::SignIn(app)]);
+        }
+    }
+    asks
 }
 
 /// The notice [`start`] returned, for the first window's status line.
@@ -317,6 +330,27 @@ pub(crate) mod tests {
             short: short.map(str::to_string),
             ..Branding::default()
         }
+    }
+
+    #[test]
+    fn nothing_is_asked_ahead_for_a_tab_kind_the_suite_lacks() {
+        assert_eq!(asks_ahead(false, false), [Ask::Branding(App::Suite)]);
+        assert_eq!(
+            asks_ahead(true, false),
+            [
+                Ask::Branding(App::Suite),
+                Ask::Branding(App::Mail),
+                Ask::SignIn(App::Mail)
+            ]
+        );
+        assert_eq!(
+            asks_ahead(false, true),
+            [
+                Ask::Branding(App::Suite),
+                Ask::Branding(App::Chat),
+                Ask::SignIn(App::Chat)
+            ]
+        );
     }
 
     /// A refusal or a failed icon reaches the crash log too.

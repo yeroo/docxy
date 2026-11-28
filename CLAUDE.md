@@ -151,7 +151,7 @@ issue number to find its notes.
   F1 on a focused pane, `pane:<id>` (#2077).
 - `docs/claude/integration.md`: before changing the `integration/` crate (the integration
   plugin's host side, #2317): the contract `docs/integration-plugins.md`, `start`, `global` and
-  `shutdown`, the worker's turn lock and deadlines, the crash markers, the fixture plugin's modes.
+  `shutdown`, the asks before a host's first window (`ask_ahead_by`), the hosts, the tests.
 - `docs/claude/ui-plugins.md`: before changing the UI plugin ABI, the plan's formatting
   model (`projcore::formatting`, `formatting.xml`) or the plugin dialogs and their layout:
   UI plugins (#1532, #1553, #1572, #1609), dialog values that follow (#1670), overlay text

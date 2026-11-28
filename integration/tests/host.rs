@@ -3,7 +3,7 @@
 #![cfg(feature = "host")]
 
 use docxy_integration::host::{
-    Deadlines, HostConfig, Integration, Source, Status, load_from, plugin_dir,
+    Ask, Deadlines, HostConfig, Integration, Source, Status, load_from, plugin_dir,
 };
 use docxy_integration::protocol::{AccentSet, App, Rgb, TokenAnswer, TokenRequest};
 use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
@@ -175,14 +175,20 @@ fn a_value_asked_ahead_is_kept_and_asked_no_more() {
     let dir = plugin_folder("ahead", None);
     let plugin = load_from(&dir, &config(App::Suite));
     plugin.ask_ahead_by(
-        &[App::Suite, App::Mail, App::Chat],
-        &[App::Mail, App::Chat],
+        &[
+            Ask::Branding(App::Suite),
+            Ask::Branding(App::Mail),
+            Ask::SignIn(App::Mail),
+            Ask::Branding(App::Chat),
+            Ask::SignIn(App::Chat),
+            Ask::Context,
+        ],
         std::time::Instant::now() + Duration::from_secs(60),
     );
     assert_eq!(
         methods(&dir),
         [
-            "branding", "branding", "branding", "sign_in", "sign_in", "context"
+            "branding", "branding", "sign_in", "branding", "sign_in", "context"
         ]
     );
     assert_eq!(
@@ -440,35 +446,62 @@ fn a_relative_folder_is_refused() {
     );
 }
 
+/// Four calls of 300 ms within each 5 s deadline, asked ahead with a 500 ms
+/// budget: the caller waits no longer than the budget, the plugin is not
+/// stopped, and the values the budget did not cover are asked when read.
 #[test]
-fn the_calls_ahead_share_one_budget() {
+fn a_slow_plugin_within_each_deadline_outlasts_the_budget() {
     let dir = plugin_folder("budget", Some("slow 300"));
     let plugin = load_from(&dir, &config(App::Suite));
     let started = std::time::Instant::now();
     plugin.ask_ahead_by(
-        &[App::Mail, App::Chat],
-        &[App::Mail, App::Chat],
+        &[
+            Ask::Branding(App::Mail),
+            Ask::SignIn(App::Mail),
+            Ask::Branding(App::Chat),
+            Ask::SignIn(App::Chat),
+        ],
         started + Duration::from_millis(500),
     );
     let spent = started.elapsed();
-    assert!(spent < Duration::from_millis(900), "{spent:?}");
-    let (_, why) = refusal(&plugin);
+    assert!(spent < Duration::from_millis(800), "{spent:?}");
     assert!(
-        why.starts_with("it did not answer branding within"),
-        "{why}"
+        matches!(plugin.status(), Status::Loaded { .. }),
+        "{:?}",
+        plugin.status()
     );
-    assert_eq!(plugin.sign_in(App::Mail), None);
+    assert!(plugin.sign_in(App::Mail).is_some());
+    assert!(plugin.branding(App::Chat).is_some());
+    assert!(plugin.sign_in(App::Chat).is_some());
+    assert!(matches!(plugin.status(), Status::Loaded { .. }));
+    assert_eq!(plugin.take_notice(), None);
     let _ = std::fs::remove_dir_all(dir);
 }
 
 #[test]
-fn no_call_is_made_once_the_budget_is_spent() {
+fn nothing_is_asked_ahead_once_the_budget_is_spent() {
     let dir = plugin_folder("budget-spent", None);
     let plugin = load_from(&dir, &config(App::Suite));
-    plugin.ask_ahead_by(&[App::Suite], &[App::Mail], std::time::Instant::now());
-    assert_eq!(refusal(&plugin).1, "no time was left for branding");
+    plugin.ask_ahead_by(
+        &[Ask::Branding(App::Suite), Ask::SignIn(App::Mail)],
+        std::time::Instant::now(),
+    );
     assert!(calls(&dir).is_empty());
+    assert!(matches!(plugin.status(), Status::Loaded { .. }));
+    assert!(plugin.branding(App::Suite).is_some());
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Polls `ready` until it holds, failing after 5 s.
+fn wait_until(what: &str, mut ready: impl FnMut() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(5);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -649,7 +682,9 @@ fn a_call_in_progress_has_a_marker_and_a_finished_one_none() {
     assert!(!marker.exists());
     let during = std::thread::scope(|s| {
         let call = s.spawn(|| plugin.branding(App::Mail));
-        std::thread::sleep(Duration::from_millis(500));
+        wait_until("the call's marker", || {
+            std::fs::read_to_string(&marker).is_ok_and(|m| m == "branding")
+        });
         let during = std::fs::read_to_string(&marker).ok();
         assert!(call.join().unwrap().is_some());
         during
@@ -667,9 +702,9 @@ fn a_call_queued_behind_a_slow_one_has_its_whole_deadline() {
     let plugin = load_from(&dir, &config);
     std::thread::scope(|s| {
         let token = s.spawn(|| plugin.token(&token_request()));
-        // The token call has the worker; branding waits longer than its
-        // deadline for its turn, then answers at once.
-        std::thread::sleep(Duration::from_millis(200));
+        // In the plugin, the token call holds the turn: branding waits longer
+        // than its deadline for it, then answers at once.
+        wait_until("the token call", || methods(&dir) == ["token"]);
         assert!(
             plugin.branding(App::Mail).is_some(),
             "{:?}",
@@ -691,7 +726,7 @@ fn a_normal_quit_leaves_no_marker_and_makes_no_call_after() {
     let marker = markers.join(format!("dxi-mail-{}.marker", std::process::id()));
     std::thread::scope(|s| {
         let call = s.spawn(|| plugin.branding(App::Mail));
-        std::thread::sleep(Duration::from_millis(500));
+        wait_until("the call", || methods(&dir) == ["branding"]);
         assert!(marker.exists());
         plugin.shutdown();
         assert!(!marker.exists());
@@ -729,7 +764,9 @@ fn dxi_abi_runs_inside_its_own_marker() {
     let config = marker_config(&markers);
     let (during, status) = std::thread::scope(|s| {
         let load = s.spawn(|| load_from(&dir, &config).status());
-        std::thread::sleep(Duration::from_millis(500));
+        wait_until("the abi step's marker", || {
+            std::fs::read_to_string(&marker).is_ok_and(|m| m == "abi")
+        });
         let during = std::fs::read_to_string(&marker).ok();
         (during, load.join().unwrap())
     });

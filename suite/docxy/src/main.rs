@@ -55260,7 +55260,10 @@ pub fn run(extensions: ext::Extensions) {
         eprintln!("{msg}");
         crashlog::startup(&config_root(), &msg);
     }
-    if let Some(notice) = brand::start(&config_root(), want_harness) {
+    let (mail, other_kinds) = extensions
+        .as_ref()
+        .map_or((false, false), |e| (e.mail.is_some(), !e.kinds.is_empty()));
+    if let Some(notice) = brand::start(&config_root(), want_harness, mail, other_kinds) {
         let msg = format!("docxy: {notice}");
         eprintln!("{msg}");
         crashlog::startup(&config_root(), &msg);

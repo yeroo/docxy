@@ -275,6 +275,7 @@ pub fn load_from(dir: &Path, config: &HostConfig) -> Integration {
             branding: Mutex::default(),
             sign_in: Mutex::default(),
             context: OnceLock::new(),
+            pending: Mutex::default(),
         },
         Ok(Err(why)) => Integration::refused(file, why),
         Err(mpsc::RecvTimeoutError::Timeout) => Integration::refused(
@@ -343,6 +344,40 @@ pub struct Integration {
     branding: Mutex<HashMap<App, Option<Branding>>>,
     sign_in: Mutex<HashMap<App, Option<SignIn>>>,
     context: OnceLock<Option<Context>>,
+    /// The call [`Integration::ask_ahead_by`] left in flight.
+    pending: Mutex<Option<Pending>>,
+}
+
+/// A value a host asks before its first window ([`Integration::ask_ahead_by`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ask {
+    Branding(App),
+    SignIn(App),
+    Context,
+}
+
+impl Ask {
+    fn method(self) -> &'static str {
+        match self {
+            Ask::Branding(_) => abi::METHOD_BRANDING,
+            Ask::SignIn(_) => abi::METHOD_SIGN_IN,
+            Ask::Context => abi::METHOD_CONTEXT,
+        }
+    }
+
+    fn request(self) -> String {
+        match self {
+            Ask::Branding(app) | Ask::SignIn(app) => AppRequest { app }.to_json(),
+            Ask::Context => "{}".into(),
+        }
+    }
+}
+
+struct Pending {
+    ask: Ask,
+    answer: mpsc::Receiver<Result<String, String>>,
+    /// Its own deadline.
+    until: Instant,
 }
 
 struct Worker {
@@ -385,6 +420,7 @@ impl Integration {
             branding: Mutex::default(),
             sign_in: Mutex::default(),
             context: OnceLock::new(),
+            pending: Mutex::default(),
         }
     }
 
@@ -400,59 +436,60 @@ impl Integration {
 
     /// The plugin's names and icons for `app`, asked once and kept.
     pub fn branding(&self, app: App) -> Option<Branding> {
-        self.branding_within(app, self.deadlines.call)
-    }
-
-    fn branding_within(&self, app: App, deadline: Duration) -> Option<Branding> {
-        if let Some(known) = lock(&self.branding).get(&app) {
-            return known.clone();
-        }
-        let answer = self
-            .call(abi::METHOD_BRANDING, AppRequest { app }.to_json(), deadline)
-            .ok()
-            .and_then(|text| Branding::from_json(&text).ok());
-        lock(&self.branding).insert(app, answer.clone());
-        answer
+        self.value(Ask::Branding(app));
+        lock(&self.branding).get(&app).cloned().flatten()
     }
 
     /// The plugin's sign-in settings for `app`, asked once and kept.
     pub fn sign_in(&self, app: App) -> Option<SignIn> {
-        self.sign_in_within(app, self.deadlines.call)
+        self.value(Ask::SignIn(app));
+        lock(&self.sign_in).get(&app).cloned().flatten()
     }
 
-    fn sign_in_within(&self, app: App, deadline: Duration) -> Option<SignIn> {
-        if let Some(known) = lock(&self.sign_in).get(&app) {
-            return known.clone();
-        }
-        let answer = self
-            .call(abi::METHOD_SIGN_IN, AppRequest { app }.to_json(), deadline)
-            .ok()
-            .and_then(|text| SignIn::from_json(&text).ok());
-        lock(&self.sign_in).insert(app, answer.clone());
-        answer
-    }
-
-    /// Asks and keeps the branding of `branding`'s apps, the sign-in
-    /// settings of `sign_in`'s, and the context, now, on the caller's thread,
-    /// all by `end`: a host that starts the plugin before its first window
-    /// calls it there, so a later [`Integration::branding`],
-    /// [`Integration::sign_in`] or [`Integration::context`] (a tab made on
-    /// the UI thread) reads the kept value and calls nothing. Each call waits
-    /// for what is left until `end`, at most its own deadline; past `end`,
-    /// the plugin is stopped for the run, as at any call's deadline.
-    pub fn ask_ahead_by(&self, branding: &[App], sign_in: &[App], end: Instant) {
-        let left = || {
-            self.deadlines
-                .call
-                .min(end.saturating_duration_since(Instant::now()))
+    /// Asks and keeps `asks` now, on the caller's thread, in order, by `end`:
+    /// a host that starts the plugin before its first window calls it there,
+    /// so a later read of a value asked (a tab made on the UI thread) reads
+    /// the kept value and calls nothing. An ask that `end` cuts short stays
+    /// in flight, and the first read of any value waits for it up to its own
+    /// deadline; the asks after it are made when their values are first
+    /// read. Only a call past its own deadline stops the plugin.
+    pub fn ask_ahead_by(&self, asks: &[Ask], end: Instant) {
+        let Some(worker) = &self.worker else {
+            return;
         };
-        for &app in branding {
-            let _ = self.branding_within(app, left());
+        for &ask in asks {
+            if self.known(ask) {
+                continue;
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            let _turn = lock(&worker.turn);
+            let answer = match self.send(worker, ask.method(), ask.request()) {
+                Ok(answer) => answer,
+                Err(why) => {
+                    self.keep(ask, Err(why));
+                    continue;
+                }
+            };
+            let sent = Instant::now();
+            match answer.recv_timeout(left.min(self.deadlines.call)) {
+                Ok(result) => self.keep(ask, result),
+                Err(mpsc::RecvTimeoutError::Timeout) if left < self.deadlines.call => {
+                    *lock(&self.pending) = Some(Pending {
+                        ask,
+                        answer,
+                        until: sent + self.deadlines.call,
+                    });
+                    return;
+                }
+                Err(e) => {
+                    let why = self.unanswered(worker, ask.method(), e);
+                    self.keep(ask, Err(why));
+                }
+            }
         }
-        for &app in sign_in {
-            let _ = self.sign_in_within(app, left());
-        }
-        let _ = self.context_within(left());
     }
 
     /// A token from the plugin, asked each time. Any failure is
@@ -467,17 +504,65 @@ impl Integration {
 
     /// The person's organization and desktop, asked once and kept.
     pub fn context(&self) -> Option<Context> {
-        self.context_within(self.deadlines.call)
+        self.value(Ask::Context);
+        self.context.get().cloned().flatten()
     }
 
-    fn context_within(&self, deadline: Duration) -> Option<Context> {
-        self.context
-            .get_or_init(|| {
-                self.call(abi::METHOD_CONTEXT, "{}".into(), deadline)
-                    .ok()
-                    .and_then(|text| Context::from_json(&text).ok())
-            })
-            .clone()
+    /// Keeps `ask`'s value, asking for it unless it is kept or the call in
+    /// flight answers it.
+    fn value(&self, ask: Ask) {
+        if self.known(ask) {
+            return;
+        }
+        if let Some(worker) = &self.worker {
+            let _turn = lock(&worker.turn);
+            self.settle(worker);
+        }
+        if !self.known(ask) {
+            let result = self.call(ask.method(), ask.request(), self.deadlines.call);
+            self.keep(ask, result);
+        }
+    }
+
+    fn known(&self, ask: Ask) -> bool {
+        match ask {
+            Ask::Branding(app) => lock(&self.branding).contains_key(&app),
+            Ask::SignIn(app) => lock(&self.sign_in).contains_key(&app),
+            Ask::Context => self.context.get().is_some(),
+        }
+    }
+
+    fn keep(&self, ask: Ask, result: Result<String, String>) {
+        let text = result.ok();
+        match ask {
+            Ask::Branding(app) => {
+                let value = text.and_then(|t| Branding::from_json(&t).ok());
+                lock(&self.branding).insert(app, value);
+            }
+            Ask::SignIn(app) => {
+                let value = text.and_then(|t| SignIn::from_json(&t).ok());
+                lock(&self.sign_in).insert(app, value);
+            }
+            Ask::Context => {
+                let _ = self
+                    .context
+                    .set(text.and_then(|t| Context::from_json(&t).ok()));
+            }
+        }
+    }
+
+    /// Waits for the call [`Integration::ask_ahead_by`] left in flight, up to
+    /// its own deadline, and keeps its answer. The caller holds the turn lock.
+    fn settle(&self, worker: &Worker) {
+        let Some(pending) = lock(&self.pending).take() else {
+            return;
+        };
+        let wait = pending.until.saturating_duration_since(Instant::now());
+        let result = pending
+            .answer
+            .recv_timeout(wait)
+            .unwrap_or_else(|e| Err(self.unanswered(worker, pending.ask.method(), e)));
+        self.keep(pending.ask, result);
     }
 
     fn call(
@@ -489,17 +574,29 @@ impl Integration {
         let Some(worker) = &self.worker else {
             return Err("no integration plugin".into());
         };
-        if !worker.methods.iter().any(|m| m == method) {
-            return Err(format!("{} offers no {method}", worker.file));
-        }
         // Waiting for the turn is bounded by the holder's own deadline; one
         // that stopped the plugin leaves the next caller to fail below.
         let _turn = lock(&worker.turn);
+        self.settle(worker);
+        let answer = self.send(worker, method, request)?;
+        answer
+            .recv_timeout(deadline)
+            .unwrap_or_else(|e| Err(self.unanswered(worker, method, e)))
+    }
+
+    /// Hands `method` to the worker, unless the plugin offers none or is
+    /// stopped. The caller holds the turn lock.
+    fn send(
+        &self,
+        worker: &Worker,
+        method: &'static str,
+        request: String,
+    ) -> Result<mpsc::Receiver<Result<String, String>>, String> {
+        if !worker.methods.iter().any(|m| m == method) {
+            return Err(format!("{} offers no {method}", worker.file));
+        }
         if worker.stopped.load(Ordering::SeqCst) {
             return Err(format!("{} stopped answering", worker.file));
-        }
-        if deadline.is_zero() {
-            return Err(self.stop(worker, format!("no time was left for {method}")));
         }
         let (reply, answer) = mpsc::channel();
         let job: Job = Box::new(move |loaded: &Loaded| {
@@ -508,19 +605,23 @@ impl Integration {
         if worker.jobs.send(job).is_err() {
             return Err(self.stop(worker, format!("its worker thread ended in {method}")));
         }
-        match answer.recv_timeout(deadline) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(self.stop(
-                worker,
-                format!(
-                    "it did not answer {method} within {} s",
-                    deadline.as_secs_f32()
-                ),
-            )),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(self.stop(worker, format!("its worker thread ended in {method}")))
-            }
-        }
+        Ok(answer)
+    }
+
+    /// Stops the plugin for a call that got no answer, and says why.
+    fn unanswered(&self, worker: &Worker, method: &str, e: mpsc::RecvTimeoutError) -> String {
+        let why = match e {
+            mpsc::RecvTimeoutError::Timeout => format!(
+                "it did not answer {method} within {} s",
+                match method {
+                    abi::METHOD_TOKEN => self.deadlines.token,
+                    _ => self.deadlines.call,
+                }
+                .as_secs_f32()
+            ),
+            mpsc::RecvTimeoutError::Disconnected => format!("its worker thread ended in {method}"),
+        };
+        self.stop(worker, why)
     }
 
     /// At a normal quit: no call is made after this, and this process's
