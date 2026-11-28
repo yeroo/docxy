@@ -193,7 +193,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
 - The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
   failed, the first window's status line (`brand::startup_notice`). A later stop goes there too:
   each window polls `brand::stop_poll_now` every `brand::STOP_POLL` while a plugin is configured,
-  until the window is gone; the notice stays until a window has shown it (`brand::stop_poll`). An accent refusal (once per
+  until `brand::stop_poll` ends it; the notice stays until a window has shown it. An accent refusal (once per
   theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds
   the integration's rows (`brand::about_rows`) only when a plugin is configured, and its Copy
   names `brand::product()` and ends with those rows. `app-info` carries `integration`. The quit

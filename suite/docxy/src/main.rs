@@ -55115,9 +55115,7 @@ fn open_docxy_window(
                 })
             });
             // A stop of the integration plugin goes to the status line
-            // (#2317): the notice stays until a window has shown it, and each
-            // window's poll ends when the window is gone. `update_in` only, as
-            // for AutoRecover below.
+            // (#2317). `update_in` only, as for AutoRecover below.
             if brand::configured() {
                 let watcher = view.downgrade();
                 window

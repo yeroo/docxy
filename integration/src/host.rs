@@ -139,7 +139,7 @@ fn registry_string(_hive: Hive, _key: &str, _value: &str) -> Option<OsString> {
 /// How long the host waits for the plugin.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Deadlines {
-    /// Loading the library and `dxi_init`.
+    /// Finding the library in its folder, loading it and `dxi_init`.
     pub init: Duration,
     /// `branding`, `sign_in` and `context`.
     pub call: Duration,
@@ -345,7 +345,7 @@ pub struct Integration {
     /// configured.
     app: Option<App>,
     status: Mutex<Status>,
-    /// The refusal or the stop, until [`Integration::take_notice`] reads it.
+    /// The refusal or the stop, until [`Integration::take_notice`] takes it.
     notice: Mutex<Option<String>>,
     worker: Option<Worker>,
     /// This process's crash marker, for [`Integration::shutdown`].
@@ -750,8 +750,7 @@ enum Start {
 type Ready = mpsc::Receiver<Start>;
 
 /// The worker: it finds the one library in `dir`, skips it for a stale
-/// marker, loads it and calls `dxi_init`, all within [`load_from`]'s
-/// deadline, then runs the jobs.
+/// marker, loads it and calls `dxi_init`, then runs the jobs.
 fn spawn_worker(
     dir: PathBuf,
     info: HostInfo,

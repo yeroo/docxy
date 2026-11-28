@@ -140,7 +140,7 @@ keeps the answers. It asks `token` each time it needs a token. An `ok` answer wi
 
 ## What the host shows and keeps
 
-- **Status:** not configured, loaded (the file and the plugin's version), or refused (the file or
-  folder, and why). A plugin that stopped answering is refused from then on.
-- **The notice:** the message about a refusal or a stop, given once, for the host to show.
+- **Status:** not configured, loaded (the file and the plugin's version), refused (the file or
+  folder, and why), or stopped (the file, and why) for a plugin that stopped answering.
+- **The notice:** the message about a refusal or a stop, for the host to show.
 - **Not to be logged or shown:** the access token and the login hint.

@@ -309,8 +309,7 @@ pub(crate) fn start(
 /// What the suite asks once its own branding is kept, for the tabs and
 /// About to find kept: Mail's branding with a Mail tab kind and Chat's with
 /// a further tab kind (the interface's one other app), then their sign-in
-/// settings in the same order, then the context. Every branding comes before
-/// any sign-in: a plugin's first `sign_in` may wait on the desktop.
+/// settings in the same order, then the context.
 pub(crate) fn asks_after_start(mail: bool, other_kinds: bool) -> Vec<Ask> {
     let apps: Vec<App> = [(mail, App::Mail), (other_kinds, App::Chat)]
         .into_iter()
