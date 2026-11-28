@@ -79,18 +79,30 @@ pub enum Error {
     UnsafeAsset(String),
 }
 
+/// The product the texts name by default ([`Error`]'s `Display`,
+/// [`check_html_target`]); a host that shows another name passes its own to
+/// [`Error::text_for`] and [`check_html_target_for`].
+pub const PRODUCT: &str = "docxy";
+
+impl Error {
+    /// The error's text with `app` as the product's name; a file name or a
+    /// cause in it stays as it is.
+    pub fn text_for(&self, app: &str) -> String {
+        match self {
+            Error::NotABundle => format!("not a {app} editable HTML file (no payload block)"),
+            Error::Malformed(why) => format!("damaged {app} HTML payload: {why}"),
+            Error::IntegrityMismatch { expected, actual } => format!(
+                "the embedded document fails its integrity check \
+                 (payloadSha256 {expected}, actual {actual}); the file was altered outside {app}"
+            ),
+            Error::UnsafeAsset(why) => format!("cannot inline web asset: {why}"),
+        }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::NotABundle => write!(f, "not a docxy editable HTML file (no payload block)"),
-            Error::Malformed(why) => write!(f, "damaged docxy HTML payload: {why}"),
-            Error::IntegrityMismatch { expected, actual } => write!(
-                f,
-                "the embedded document fails its integrity check \
-                 (payloadSha256 {expected}, actual {actual}); the file was altered outside docxy"
-            ),
-            Error::UnsafeAsset(why) => write!(f, "cannot inline web asset: {why}"),
-        }
+        f.write_str(&self.text_for(PRODUCT))
     }
 }
 
@@ -502,6 +514,12 @@ pub fn is_html_path(path: &str) -> bool {
 ///   windows-1252 "Web Page"), a page that is not a bundle, or a bundle of
 ///   another format. A user's own page is never replaced by a bundle.
 pub fn check_html_target(path: &std::path::Path) -> Result<Option<String>, String> {
+    check_html_target_for(path, PRODUCT)
+}
+
+/// [`check_html_target`] with `app` as the product its refusals name; the
+/// file's name stays as it is.
+pub fn check_html_target_for(path: &std::path::Path, app: &str) -> Result<Option<String>, String> {
     let file = path
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -512,8 +530,9 @@ pub fn check_html_target(path: &std::path::Path) -> Result<Option<String>, Strin
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return refuse(&e.to_string()),
     };
+    let not_ours = format!("it is not a {app} editable HTML file");
     let Ok(html) = String::from_utf8(bytes) else {
-        return refuse("it is not a docxy editable HTML file");
+        return refuse(&not_ours);
     };
     match unwrap(&html) {
         Ok(b) if b.meta.format() == "docx" => Ok(Some(html)),
@@ -521,8 +540,8 @@ pub fn check_html_target(path: &std::path::Path) -> Result<Option<String>, Strin
             "it holds a {} file, not a Word document",
             b.meta.format()
         )),
-        Err(Error::NotABundle) => refuse("it is not a docxy editable HTML file"),
-        Err(e) => refuse(&e.to_string()),
+        Err(Error::NotABundle) => refuse(&not_ours),
+        Err(e) => refuse(&e.text_for(app)),
     }
 }
 

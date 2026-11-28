@@ -179,3 +179,42 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
 - No test runs a real Windows dialog. The crash fix is guarded by the source
   scan and the route tests (`dialog_route_per_os`, and that the two routes
   agree off Linux). The step tests guard the split of the workbook save.
+
+## The integration plugin's names, icon and context (#2317)
+
+- `brand.rs` is the one place the suite reads its integration plugin (`docs/integration-plugins.md`).
+  `run()` calls `brand::start` after the harness gate and the format plugins, before the app loop
+  and so before any `docxy_integration::global()`. A harness instance loads no integration plugin:
+  `brand::start` skips the load for it, whatever folder the registry or the environment names.
+- Names: the About commands (the sheet ribbon's through `SheetCmd::label` and `text`, keyed by
+  its id, so `SHEET_RIBBON` stays a `const` table) and the About dialog's title use
+  `brand::about_label()` ("About" and the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
+  titles use `brand::short()`. With no plugin, both name the suite ("About docxy suite", "docxy").
+- The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
+  failed, the first window's status line (`brand::startup_notice`). A later stop goes there too:
+  each window polls `brand::stop_poll_now` every `brand::STOP_POLL` while a plugin is configured,
+  until `brand::stop_poll` ends it; the notice stays until a window has shown it. An accent refusal (once per
+  theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds
+  the integration's rows (`brand::about_rows`) only when a plugin is configured, and its Copy
+  names `brand::product()` and ends with those rows. `app-info` carries `integration`. The quit
+  hook calls `docxy_integration::host::shutdown()`.
+- Each window gets the plugin's icon in `open_docxy_window` (`brand::set_window_icon`, Windows).
+- Accents: the brand's colour (every tab kind but sheet and project, which keep their own, and an
+  extension tab with no accent of its own) has four roles, the fields of `accent::Drawn`
+  (`fill`, `on_fill`, `mark`, `text`), whose docs say what each draws. `accent::drawn` gives
+  them the plugin's `primary`, its text, `highlight` and `link` that `brand::accents` takes for the
+  theme (`docxy_integration::accent::check`).
+  The rest of the chrome draws `accent::chrome()`; `BRAND` itself stays only at the sites
+  `accent::tests::BRAND_KEPT` lists.
+  `brand::apply_accents_to_theme`, after every `Theme::change`, sets gpui-component's `primary`,
+  `ring`, `selection` and `link` tokens.
+- Every other text that names the suite takes `brand::short()` too: the macOS menu bar
+  (`macos_menu::shown` fills `{app}`), messages, the Document Recovery dialog, a kind's
+  placeholder, and the default author of comments and the AUTHOR field, and the PDF worker's
+  link texts through `worker::APP_NAME`. Left as they are: identifiers (config folders, environment
+  variables, `app_id`, temp names), stderr and crash-log lines, `--version` and the title-bar
+  label per tab type. `brand::tests::the_product_name_is_written_only_here` fails on any other
+  product-name literal in non-test source outside `brand.rs` that `kept_name_literal` does not
+  keep; its doc says what it does not see. htmlbundle's refusals and
+  errors take the name as a parameter (`check_html_target_for`, `Error::text_for`, filled with
+  `brand::short()` in `html_bundle`).

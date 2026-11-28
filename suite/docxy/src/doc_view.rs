@@ -2068,7 +2068,9 @@ impl DocView {
             .items_center()
             .text_size(px(13.))
             .text_color(pal.fg)
-            .when(f.sel && len > 0, |d| d.bg(hsla_u(BRAND).opacity(0.25)))
+            .when(f.sel && len > 0, |d| {
+                d.bg(hsla_u(crate::accent::chrome().fill).opacity(0.25))
+            })
             .child(SharedString::from(f.query[..at].to_string()))
             .when(focused, |d| d.child(caret_bar()))
             .child(SharedString::from(f.query[at..].to_string()));
@@ -2084,7 +2086,11 @@ impl DocView {
             .overflow_hidden()
             .rounded(px(4.))
             .border_1()
-            .border_color(if focused { hsla_u(BRAND) } else { pal.border })
+            .border_color(if focused {
+                hsla_u(crate::accent::chrome().fill)
+            } else {
+                pal.border
+            })
             .bg(field_bg)
             .cursor_text()
             .when(f.query.is_empty() && !focused, |d| {

@@ -15,8 +15,7 @@ use buildinfo::BuildInfo;
 use ctlcore::json::Json;
 use std::sync::Arc;
 
-/// The product name `--version` and the About dialog print.
-pub(crate) const PRODUCT: &str = "docxy suite";
+use crate::brand::PRODUCT;
 
 /// This binary's build info; the suite's own `CARGO_PKG_VERSION`, not the
 /// terminal editors'.
@@ -24,7 +23,7 @@ pub(crate) fn info() -> &'static BuildInfo {
     buildinfo::get(env!("CARGO_PKG_VERSION"))
 }
 
-/// What `--version` prints, and the first part of what Copy copies.
+/// What `--version` prints: the suite's own name, plugin or not.
 pub(crate) fn version_text(info: &BuildInfo) -> String {
     info.version_block(PRODUCT)
 }
@@ -95,11 +94,23 @@ pub(crate) fn manuals_json(load: impl Fn(Editor) -> Option<Arc<Bundle>>) -> Json
     )
 }
 
-/// What the About dialog's Copy button puts on the clipboard: the `--version`
-/// block plus the one-line summary, then the manuals, ready to paste into a
-/// bug report. The manual rows' labels are padded among themselves.
-pub(crate) fn copy_text(info: &BuildInfo, manuals: &[ManualRow]) -> String {
-    let mut s = format!("{}summary:     {}\n", version_text(info), info.short_line());
+/// What the About dialog's Copy button puts on the clipboard: the build's
+/// block under `product` (the name About shows, `brand::product`) plus the
+/// one-line summary, then the manuals, then the integration's rows
+/// (`brand::about_rows`) by their names, ready to paste into a bug report.
+/// The manual rows' labels are padded among themselves, and so are the
+/// integration's.
+pub(crate) fn copy_text(
+    info: &BuildInfo,
+    manuals: &[ManualRow],
+    product: &str,
+    integration: &[(&'static str, &'static str, String)],
+) -> String {
+    let mut s = format!(
+        "{}summary:     {}\n",
+        info.version_block(product),
+        info.short_line()
+    );
     for row in manuals {
         s.push_str(&format!(
             "{:<16}{}\n",
@@ -107,16 +118,29 @@ pub(crate) fn copy_text(info: &BuildInfo, manuals: &[ManualRow]) -> String {
             row.value
         ));
     }
+    let width = integration
+        .iter()
+        .map(|(name, _, _)| name.len() + 2)
+        .max()
+        .unwrap_or(0);
+    for (name, _, value) in integration {
+        s.push_str(&format!("{:<width$}{value}\n", format!("{name}:")));
+    }
     s
 }
 
-/// The About docxy suite dialog: every field of the build as a labelled row,
-/// the "Manual build" marker when it is one, each editor's manual, and Copy /
-/// Close. Enter and Escape press Close.
-pub(crate) fn dialog(info: &BuildInfo, manuals: &[ManualRow]) -> Dialog {
+/// The About dialog: every field of the build as a labelled row, the
+/// "Manual build" marker when it is one, each editor's manual, the
+/// integration's rows (`brand::about_rows`), and Copy / Close. Enter and
+/// Escape press Close.
+pub(crate) fn dialog(
+    info: &BuildInfo,
+    manuals: &[ManualRow],
+    integration: &[(&'static str, &'static str, String)],
+) -> Dialog {
     let mut d = Dialog::message(
         catalog::ABOUT,
-        &format!("About {PRODUCT} {}", info.version),
+        &format!("{} {}", crate::brand::about_label(), info.version),
         String::new(),
         &[("Copy", ButtonRole::Apply), ("Close", ButtonRole::Cancel)],
         DialogOwner::About,
@@ -147,6 +171,14 @@ pub(crate) fn dialog(info: &BuildInfo, manuals: &[ManualRow]) -> Dialog {
             Value::Text(row.value.clone()),
         ));
     }
+    for (name, label, value) in integration {
+        controls.push(Field::new(
+            name,
+            label,
+            ControlKind::Label,
+            Value::Text(value.clone()),
+        ));
+    }
     d.controls = controls;
     for b in &mut d.buttons {
         b.default = b.label == "Close";
@@ -161,7 +193,8 @@ impl Docxy {
     pub(crate) fn open_about(&mut self) -> Result<(), String> {
         let manuals = manual_rows(|e| self.help_bundle(e));
         let tab = self.tabs.get_mut(self.active).ok_or(NONE_OPEN)?;
-        tab.dialogs.push(dialog(info(), &manuals));
+        tab.dialogs
+            .push(dialog(info(), &manuals, &crate::brand::about_rows()));
         Ok(())
     }
 
@@ -187,7 +220,13 @@ impl Docxy {
         Some(done.map(|copy| {
             if copy {
                 let manuals = manual_rows(|e| self.help_bundle(e));
-                self.clipboard_write(copy_text(info(), &manuals), cx);
+                let text = copy_text(
+                    info(),
+                    &manuals,
+                    crate::brand::product(),
+                    &crate::brand::about_rows(),
+                );
+                self.clipboard_write(text, cx);
             }
         }))
     }
@@ -392,7 +431,7 @@ mod tests {
     #[test]
     fn copy_text_is_the_version_block_plus_a_summary_and_the_manuals() {
         let i = info();
-        let copy = copy_text(i, &mixed());
+        let copy = copy_text(i, &mixed(), PRODUCT, &[]);
         assert!(copy.starts_with(&version_text(i)));
         let summary = format!("summary:     {}\n", i.short_line());
         let manuals = format!(
@@ -401,6 +440,32 @@ mod tests {
              project manual: none\n"
         );
         assert_eq!(copy, format!("{}{summary}{manuals}", version_text(i)));
+    }
+
+    /// Under a plugin, Copy names its product as About does, and ends with
+    /// the integration's rows.
+    #[test]
+    fn copy_text_names_the_plugins_product_and_holds_the_integration_rows() {
+        let i = info();
+        let rows = [
+            ("integration line", "", "From the plugin".to_string()),
+            ("organization", "Organization", "Org".to_string()),
+            ("integration", "Integration", "dxi_x.dll 1.0".to_string()),
+        ];
+        let copy = copy_text(i, &[], "Plugin Product", &rows);
+        assert!(
+            copy.starts_with(&i.version_block("Plugin Product")),
+            "{copy}"
+        );
+        assert!(!copy.contains(PRODUCT), "{copy}");
+        assert!(
+            copy.ends_with(
+                "integration line: From the plugin\n\
+                 organization:     Org\n\
+                 integration:      dxi_x.dll 1.0\n"
+            ),
+            "{copy}"
+        );
     }
 
     /// `app-info` is the buildinfo JSON; the harness and normal control both parse it.
@@ -437,9 +502,21 @@ mod tests {
     }
 
     #[test]
+    fn the_dialog_shows_the_integrations_rows_after_the_manuals() {
+        let rows = [("organization", "Organization", "Org".to_string())];
+        let d = dialog(info(), &mixed(), &rows);
+        let last = d.controls.last().unwrap();
+        assert_eq!(
+            (last.name, last.label.as_str()),
+            ("organization", "Organization")
+        );
+        assert_eq!(last.value, Value::Text("Org".into()));
+    }
+
+    #[test]
     fn the_dialog_lists_every_field_with_copy_and_close() {
         let i = info();
-        let d = dialog(i, &mixed());
+        let d = dialog(i, &mixed(), &[]);
         let names: Vec<&str> = d.controls.iter().map(|c| c.name).collect();
         for want in [
             "commit",

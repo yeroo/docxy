@@ -295,7 +295,7 @@ impl Docxy {
                     .border_1()
                     .border_color(dim)
                     .cursor_pointer()
-                    .hover(|d| d.border_color(rgb(crate::accent::brand())))
+                    .hover(|d| d.border_color(rgb(crate::accent::mark())))
                     .child(
                         div()
                             .text_color(fg)

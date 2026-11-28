@@ -6432,3 +6432,37 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   PATCHed in the same drain, a local answer draft, an offline PATCH, a 400
   and a 404, a plain send, a moved original, a moved draft, and no reminder
   dedupe).
+
+## A token broker and a login hint (#2317)
+
+- `EngineOptions::broker` (`TokenBroker`, `Broker`) is a token source outside the engine; the
+  trait's doc says when it is asked, and `ask_broker`'s for which scopes (#2218's fallback). An
+  explicit `SignIn` asks the broker only with no token held, so a re-consent with a token held
+  (#2213) still goes to the browser.
+- A refusal of the session's token with a broker set: `signin_after_refusal` and
+  `ask_broker_after_refusal` say when the broker is asked and what its answer leads to, and
+  `broker_refused` when it is not asked again.
+- A brokered token's renewal is used only when its account is the session's (`same_account`);
+  `try_refresh_with`, `renew_brokered_near_expiry` and the `broker_recheck` and
+  `broker_recheck_unconfirmed` fields say what a renewal of another account, or of none, leads to.
+- `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL. `AuthConfig`'s
+  `Debug` and `SyncEvent::SignInStarted`'s (`auth::AuthorizeUrl`) hide it.
+- `EngineOptions::app_name` names the browser tab's pages (`SignInPages`).
+- `spawn_resolving` makes the `AuthConfig` and `EngineOptions` on the engine's thread
+  (`a_resolving_spawn_returns_before_its_settings_are_made`).
+- Tests: `auth::tests::a_login_hint_replaces_the_account_picker`; engine `tests::a_brokered_token_*`,
+  `a_saved_token_comes_before_the_broker`, `the_required_scopes_alone_*`,
+  `a_broker_without_a_token_leads_to_the_browser`, `a_401_asks_the_broker_once_*`,
+  `the_sign_in_pages_name_the_app_when_told`, `a_sign_in_ends_on_the_named_app_page`,
+  `mailbox_change::a_refused_refresh_mid_drain_signs_in_with_the_broker_and_checks_first`,
+  `mailbox_change::a_refused_refresh_with_no_broker_asks_for_a_sign_in`,
+  `mailbox_change::a_refused_refresh_whose_broker_gives_no_token_asks_for_a_sign_in`,
+  `mailbox_change::a_command_while_offline_with_the_check_owed_stays_offline`,
+  `a_browser_sign_in_lets_the_broker_be_asked_again`,
+  `a_renewed_brokered_token_of_another_account_is_not_used`,
+  `a_renewed_brokered_token_naming_no_account_checks_the_mailbox_first`,
+  `an_unnamed_broker_whose_tokens_graph_refuses_ends_in_a_sign_in`,
+  `a_refused_renewal_a_caller_swallows_still_ends_in_a_sign_in`,
+  `a_near_expiry_unnamed_renewal_keeps_a_still_valid_token`,
+  `a_sign_in_started_debug_print_hides_the_login_hint`;
+  `auth::tests::a_debug_print_hides_the_login_hint`.

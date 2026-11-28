@@ -75,8 +75,9 @@ impl Cloud {
     }
 }
 
-/// Which tenant/app registration/scopes to authenticate against.
-#[derive(Debug, Clone)]
+/// Which tenant/app registration/scopes to authenticate against. Its
+/// `Debug` hides the login hint.
+#[derive(Clone)]
 pub struct AuthConfig {
     /// Names the tenant: its last path segment (`…/organizations`,
     /// `…/<tenant id>`). Its host is not used; the login host is
@@ -97,6 +98,82 @@ pub struct AuthConfig {
     /// The Microsoft cloud to sign in to and sync with (#2225): its login
     /// host and Graph root. [`Cloud::Global`] by default.
     pub cloud: Cloud,
+    /// The account the interactive sign-in proposes (`login_hint`). With a
+    /// non-empty one, the sign-in does not ask the person to pick an account
+    /// first.
+    pub login_hint: Option<String>,
+}
+
+impl fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("authority", &self.authority)
+            .field("client_id", &self.client_id)
+            .field("scope", &self.scope)
+            .field("optional_scope", &self.optional_scope)
+            .field("cloud", &self.cloud)
+            .field("login_hint", &self.login_hint.as_ref().map(|_| "<hidden>"))
+            .finish()
+    }
+}
+
+/// An `/authorize` URL as the browser opens it: `Display`, `Deref` and
+/// [`AuthorizeUrl::into_string`] give it whole, and its `Debug` gives it
+/// with the `login_hint` parameter's value hidden.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct AuthorizeUrl(String);
+
+impl AuthorizeUrl {
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::ops::Deref for AuthorizeUrl {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<String> for AuthorizeUrl {
+    fn from(url: String) -> AuthorizeUrl {
+        AuthorizeUrl(url)
+    }
+}
+
+impl From<&str> for AuthorizeUrl {
+    fn from(url: &str) -> AuthorizeUrl {
+        AuthorizeUrl(url.to_string())
+    }
+}
+
+impl fmt::Display for AuthorizeUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for AuthorizeUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shown = match self.0.split_once('?') {
+            Some((path, query)) => {
+                let params: Vec<&str> = query
+                    .split('&')
+                    .map(|p| {
+                        if p.starts_with("login_hint=") {
+                            "login_hint=<hidden>"
+                        } else {
+                            p
+                        }
+                    })
+                    .collect();
+                format!("{path}?{}", params.join("&"))
+            }
+            None => self.0.clone(),
+        };
+        f.debug_tuple("AuthorizeUrl").field(&shown).finish()
+    }
 }
 
 impl Default for AuthConfig {
@@ -110,6 +187,7 @@ impl Default for AuthConfig {
             scope: "Mail.ReadWrite People.Read offline_access".to_string(),
             optional_scope: String::new(),
             cloud: Cloud::Global,
+            login_hint: None,
         }
     }
 }
@@ -332,7 +410,7 @@ pub fn begin_auth_with_scope(cfg: &AuthConfig, redirect_uri: &str, scope: &str) 
     // used, the paired challenge is simply discarded.
     let state = Pkce::generate().verifier;
 
-    let query = pkce::form_urlencode(&[
+    let mut params = vec![
         ("client_id", cfg.client_id.as_str()),
         ("response_type", "code"),
         ("redirect_uri", redirect_uri),
@@ -341,8 +419,12 @@ pub fn begin_auth_with_scope(cfg: &AuthConfig, redirect_uri: &str, scope: &str) 
         ("state", state.as_str()),
         ("code_challenge", pkce.challenge.as_str()),
         ("code_challenge_method", "S256"),
-        ("prompt", "select_account"),
-    ]);
+    ];
+    match cfg.login_hint.as_deref().filter(|hint| !hint.is_empty()) {
+        Some(hint) => params.push(("login_hint", hint)),
+        None => params.push(("prompt", "select_account")),
+    }
+    let query = pkce::form_urlencode(&params);
     let authorize_url = format!(
         "{}/{tenant}/oauth2/v2.0/authorize?{query}",
         cfg.cloud.login_host()
@@ -737,7 +819,31 @@ mod tests {
             scope: "Mail.ReadWrite People.Read offline_access".into(),
             optional_scope: String::new(),
             cloud: Cloud::Global,
+            login_hint: None,
         }
+    }
+
+    #[test]
+    fn a_debug_print_hides_the_login_hint() {
+        let cfg = AuthConfig {
+            login_hint: Some("person@example.test".into()),
+            ..AuthConfig::default()
+        };
+        let printed = format!("{cfg:?}");
+        assert!(!printed.contains("person"), "{printed}");
+        assert!(printed.contains("<hidden>"), "{printed}");
+        let url =
+            AuthorizeUrl::from("https://h/a?client_id=c&login_hint=person%40example.test&state=s");
+        let printed = format!("{url:?}");
+        assert!(!printed.contains("person"), "{printed}");
+        assert!(
+            printed.contains("client_id=c&login_hint=<hidden>&state=s"),
+            "{printed}"
+        );
+        assert_eq!(
+            url.to_string(),
+            "https://h/a?client_id=c&login_hint=person%40example.test&state=s"
+        );
     }
 
     #[test]
@@ -761,6 +867,28 @@ mod tests {
             "&{}&",
             pkce::form_urlencode(&[("scope", cfg().scope.as_str())])
         )));
+    }
+
+    #[test]
+    fn a_login_hint_replaces_the_account_picker() {
+        let hinted = AuthConfig {
+            login_hint: Some("person@example.com".into()),
+            ..cfg()
+        };
+        let url = begin_auth(&hinted, "http://localhost:8400").authorize_url;
+        assert!(url.contains("&login_hint=person%40example.com"), "{url}");
+        assert!(!url.contains("prompt="), "{url}");
+        for plain in [
+            cfg(),
+            AuthConfig {
+                login_hint: Some(String::new()),
+                ..cfg()
+            },
+        ] {
+            let url = begin_auth(&plain, "http://localhost:8400").authorize_url;
+            assert!(url.contains("&prompt=select_account"), "{url}");
+            assert!(!url.contains("login_hint="), "{url}");
+        }
     }
 
     #[test]

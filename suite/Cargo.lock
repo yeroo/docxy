@@ -2215,6 +2215,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "docxy-integration"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "libloading",
+ "projcore",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "docxy-suite"
 version = "0.1.0"
 dependencies = [
@@ -2222,6 +2232,7 @@ dependencies = [
  "ctlcore",
  "dirs 5.0.1",
  "docxcore",
+ "docxy-integration",
  "embed-resource",
  "flume",
  "gpui",
@@ -2251,6 +2262,7 @@ dependencies = [
  "pdfcraft-render",
  "projcore",
  "projctl",
+ "raw-window-handle",
  "resvg 0.46.0",
  "rfd",
  "ribbonspec",

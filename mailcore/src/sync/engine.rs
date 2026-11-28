@@ -1525,7 +1525,7 @@ pub enum SyncEvent {
     /// `AuthConfig::scope` and `AuthConfig::optional_scope` is refused for
     /// consent, a second follows, asking `AuthConfig::scope` alone, with no
     /// `Error` for the first refusal.
-    SignInStarted { authorize_url: String },
+    SignInStarted { authorize_url: auth::AuthorizeUrl },
     /// The scopes the signed-in token was granted (#1875), as the token
     /// response spelled them, and the scopes of `AuthConfig::scope` and
     /// `AuthConfig::optional_scope` it lacks (#2218;
@@ -2375,11 +2375,72 @@ pub struct EngineOptions {
     /// first. Off, a type comes only with a delta that carried the class,
     /// a search hit or `FetchMeetingMessage`.
     pub meeting_type_fill: bool,
+    /// The application's name on the browser page a sign-in ends on.
+    /// `None` (the default) keeps the terminal client's pages.
+    pub app_name: Option<&'static str>,
+    /// The [`TokenBroker`]; `None` (the default) asks none.
+    pub broker: Option<Broker>,
     /// How long a sign-in waits for the browser's redirect (default
     /// [`SIGNIN_TIMEOUT`]): a test's short wait (#2213).
     #[cfg(test)]
     pub signin_timeout: Duration,
 }
+
+/// A token source outside the engine, such as an operating system's
+/// account broker. The engine asks it, on its own thread:
+/// - when it holds no token: at start with none saved (and once a store
+///   that could not be reached answers with none), and at a `SignIn`,
+///   before the browser sign-in;
+/// - for a token it gave, near its expiry and on a 401, in place of a
+///   refresh;
+/// - when a saved token's refresh is refused (or it has no refresh token),
+///   once the pass or drain that met the refusal has ended as at any
+///   refusal: its token signs in as a sign-in does (the saved token's file
+///   removed, the mailbox check owed and made first), and with none a
+///   sign-in is asked for, as with no broker.
+///
+/// When it gives nothing near a token's expiry, the token is used until it
+/// expires.
+///
+/// A token it gives has no refresh token and is kept in memory only, never
+/// in the token file.
+pub trait TokenBroker {
+    /// A token for `scopes` (space-separated), with no prompt.
+    fn silent(&self, scopes: &str) -> BrokerResult;
+}
+
+/// What a [`TokenBroker`] answers.
+pub enum BrokerResult {
+    Token {
+        access_token: String,
+        expires_at_unix: u64,
+        account: String,
+        /// The scopes the token holds, when the broker knows them.
+        scopes: Option<Vec<String>>,
+    },
+    /// A token only a sign-in the person takes part in can give.
+    InteractionRequired(String),
+    Unavailable(String),
+}
+
+/// The [`TokenBroker`] of [`EngineOptions::broker`]. Two are equal when
+/// they are the same broker.
+#[derive(Clone, Copy)]
+pub struct Broker(pub &'static (dyn TokenBroker + Sync));
+
+impl std::fmt::Debug for Broker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Broker")
+    }
+}
+
+impl PartialEq for Broker {
+    fn eq(&self, other: &Broker) -> bool {
+        std::ptr::addr_eq(self.0, other.0)
+    }
+}
+
+impl Eq for Broker {}
 
 impl Default for EngineOptions {
     fn default() -> Self {
@@ -2391,6 +2452,8 @@ impl Default for EngineOptions {
             calendar_window: CalendarWindow::default(),
             size_fill: true,
             meeting_type_fill: true,
+            app_name: None,
+            broker: None,
             #[cfg(test)]
             signin_timeout: SIGNIN_TIMEOUT,
         }
@@ -2438,6 +2501,39 @@ pub fn spawn_with_options(
         tick,
         options,
     )
+}
+
+/// [`spawn_with_options`] with the sign-in's settings and the options that
+/// `resolve` makes on the engine's own thread before it starts, so a host
+/// whose settings wait on another source (an integration plugin's answer)
+/// spawns from its UI thread without waiting (#2317). Commands sent before
+/// then wait in the queue.
+pub fn spawn_resolving(
+    store_path: PathBuf,
+    token_path: PathBuf,
+    backfill_days: i64,
+    tick: Duration,
+    resolve: impl FnOnce() -> (AuthConfig, EngineOptions) + Send + 'static,
+) -> SyncHandle {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (evt_tx, evt_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let (cfg, options) = resolve();
+        let (graph_base, auth_base) = production_bases(&cfg);
+        let config = EngineConfig {
+            store_path,
+            token_path,
+            cfg,
+            backfill_days,
+            graph_base,
+            auth_base,
+            tick,
+            options,
+            token_store: tokencache::platform_store(),
+        };
+        run(config, cmd_rx, evt_tx)
+    });
+    SyncHandle { cmd_tx, evt_rx }
 }
 
 /// The Graph base and the auth base a host's engine uses (#2225):
@@ -2615,6 +2711,12 @@ struct Engine {
     /// `None` means "not signed in" — the engine has emitted `SignInRequired`
     /// and is waiting for a `SignIn` command.
     token: Option<TokenSet>,
+    /// `token` came from the broker: it is renewed there, never saved.
+    brokered: bool,
+    /// Graph refused a token the broker had just given again (a second 401):
+    /// the broker is not asked again in this run until a browser sign-in
+    /// completes, so a Sign in reaches the browser instead of looping.
+    broker_refused: bool,
     config: EngineConfig,
     evt_tx: Sender<SyncEvent>,
     state: SyncState,
@@ -2838,6 +2940,22 @@ struct Engine {
     /// the token, so it survives a restart; a startup with a cached token
     /// and no owed check probes nothing.
     mailbox_unchecked: bool,
+    /// A refusal [`Engine::signin_after_refusal`] left to the broker (a saved
+    /// token's refused refresh, or `broker_recheck`): the reason
+    /// [`Engine::ask_broker_after_refusal`] asks a sign-in for when the broker
+    /// gives no token.
+    broker_after_refusal: Option<SignInReason>,
+    /// A brokered token's renewal that a 401 asked for, or of an expired
+    /// token, gave a token whose account cannot be compared with the
+    /// session's (one of them names none): the refusal
+    /// that `try_refresh` answered goes to the broker again, through
+    /// [`Engine::ask_broker_after_refusal`] and its mailbox check, not to a
+    /// sign-in.
+    broker_recheck: bool,
+    /// A sign-in through the broker for `broker_recheck` that no pass has yet
+    /// listed the folders on: a renewal that cannot compare accounts then
+    /// sets `broker_refused` in place of asking the broker again.
+    broker_recheck_unconfirmed: bool,
     /// A probe that failed for a reason `react` does not handle (a 5xx, a
     /// 4xx, a parse error, a store error) holds the next one off until this
     /// instant (#1946), so a fast tick does not probe every few seconds.
@@ -2922,6 +3040,8 @@ impl Engine {
         Engine {
             store,
             token: None,
+            brokered: false,
+            broker_refused: false,
             config,
             evt_tx,
             state: SyncState::Idle,
@@ -2965,6 +3085,9 @@ impl Engine {
             type_parked: Vec::new(),
             meeting_class_refused: false,
             mailbox_unchecked,
+            broker_after_refusal: None,
+            broker_recheck: false,
+            broker_recheck_unconfirmed: false,
             check_retry: None,
             check_backoff: BACKOFF_MIN,
         }
@@ -2993,12 +3116,61 @@ impl Engine {
             }
             // No cache yet, or a cache that failed to decrypt/parse, or a
             // reference whose item is gone: either way the user has to
-            // (re-)sign in, told which (#2169).
-            Ok(None) => self.enter_signin(self.no_saved_token_reason()),
-            Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
+            // (re-)sign in, told which (#2169), unless the broker gives a
+            // token.
+            Ok(None) => self.broker_or_signin(self.no_saved_token_reason()),
+            Err(e) => self.broker_or_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
             Ok(Some(Saved::OtherCloud(saved))) => {
-                self.enter_signin(SignInReason::OtherCloud { saved })
+                self.broker_or_signin(SignInReason::OtherCloud { saved })
             }
+        }
+    }
+
+    /// With no saved token (at start, or once its store answers): the
+    /// broker's token, or a sign-in asked for `reason`.
+    fn broker_or_signin(&mut self, reason: SignInReason) {
+        match self.ask_broker() {
+            Some(t) => self.signed_in(t, true),
+            None => self.enter_signin(reason),
+        }
+    }
+
+    /// A token from [`EngineOptions::broker`]: asked for
+    /// [`auth::sign_in_scope`], and once more for `AuthConfig::scope` alone
+    /// when that needs the person, so a tenant that consented only to the
+    /// required scopes still gives one. A token whose scopes the broker does
+    /// not say is taken to hold the scopes it was asked for (a scope it
+    /// lacks still shows as a 403). `None` with no broker, no token, or a
+    /// broker whose token Graph refused in this run (`broker_refused`).
+    fn ask_broker(&self) -> Option<TokenSet> {
+        let broker = self.config.options.broker?;
+        if self.broker_refused {
+            return None;
+        }
+        let cfg = &self.config.cfg;
+        let full = auth::sign_in_scope(cfg);
+        let mut asked = full.clone();
+        let mut answer = broker.0.silent(&full);
+        if matches!(answer, BrokerResult::InteractionRequired(_)) && full != cfg.scope {
+            asked = cfg.scope.clone();
+            answer = broker.0.silent(&asked);
+        }
+        let asked = || asked.split_whitespace().map(str::to_string).collect();
+        match answer {
+            BrokerResult::Token {
+                access_token,
+                expires_at_unix,
+                account,
+                scopes,
+            } => Some(TokenSet {
+                access_token,
+                refresh_token: String::new(),
+                expires_at_unix,
+                account,
+                scopes: scopes.or_else(|| Some(asked())),
+                cloud: cfg.cloud,
+            }),
+            BrokerResult::InteractionRequired(_) | BrokerResult::Unavailable(_) => None,
         }
     }
 
@@ -3066,10 +3238,10 @@ impl Engine {
             Err(e) if e.kind() == std::io::ErrorKind::NotConnected => {
                 self.saved_signin_unavailable(e.to_string(), always);
             }
-            Ok(None) => self.enter_signin(self.no_saved_token_reason()),
-            Err(e) => self.enter_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
+            Ok(None) => self.broker_or_signin(self.no_saved_token_reason()),
+            Err(e) => self.broker_or_signin(SignInReason::SavedSignInUnreadable(e.to_string())),
             Ok(Some(Saved::OtherCloud(saved))) => {
-                self.enter_signin(SignInReason::OtherCloud { saved })
+                self.broker_or_signin(SignInReason::OtherCloud { saved })
             }
         }
     }
@@ -3154,6 +3326,9 @@ impl Engine {
         self.follow_saved_signin_backoff();
         self.next_tick = Instant::now() + self.config.tick;
         loop {
+            if !self.shutting_down {
+                self.ask_broker_after_refusal();
+            }
             if let Some((cmd, taken)) = self.deferred.pop_front() {
                 if self.shutting_down && !persists_at_shutdown(&cmd) {
                     continue;
@@ -3965,6 +4140,7 @@ impl Engine {
         if !self.sync_folders(full) {
             return;
         }
+        self.broker_recheck_unconfirmed = false;
         let folders = match self.store.folders() {
             Ok(f) => f,
             Err(e) => {
@@ -8254,6 +8430,7 @@ impl Engine {
             }
             op => apply_op(client, store, op),
         };
+        self.renew_brokered_near_expiry()?;
         let client = self.client();
         match apply(&client, &self.store) {
             Err(GraphError::Unauthorized) => match self.try_refresh() {
@@ -10368,15 +10545,18 @@ impl Engine {
 
     // --- Auth ------------------------------------------------------------
 
-    /// Runs a Graph call with the current token; on a 401, refreshes the token
-    /// once and retries. A 401 still escaping means refresh didn't help — the
-    /// caller treats that as "sign-in required". A refresh that failed
-    /// transiently (#2167) is a `Transport` error instead
+    /// Runs a Graph call with the current token. A brokered token near its
+    /// expiry is asked of the broker first (`renew_brokered_near_expiry`). On
+    /// a 401 the token is renewed once ([`Engine::try_refresh`]) and the call
+    /// retried; a 401 still escaping means that did not help, and the caller
+    /// treats it as "sign-in required" (`signin_after_401`). A refresh that
+    /// failed transiently (#2167) is a `Transport` error instead
     /// (`refresh_transport`): the caller goes offline and keeps the token.
     fn with_auth<T>(
         &mut self,
         f: impl Fn(&GraphClient) -> Result<T, GraphError>,
     ) -> Result<T, GraphError> {
+        self.renew_brokered_near_expiry()?;
         let first = {
             let client = self.client();
             f(&client)
@@ -10458,7 +10638,7 @@ impl Engine {
         match self.try_refresh() {
             Refresh::Done => true,
             Refresh::SignIn(reason) => {
-                self.enter_signin(reason);
+                self.signin_after_refusal(reason);
                 false
             }
             Refresh::Transient(_) => {
@@ -10466,6 +10646,31 @@ impl Engine {
                 false
             }
         }
+    }
+
+    /// A token the broker gave, within the expiry skew, is asked for again
+    /// before a call. No token from the broker, or one naming no account,
+    /// keeps one still valid, asked for again at the next call, and owes no
+    /// recheck; an expired one is a sign-in (`refused_refresh`).
+    fn renew_brokered_near_expiry(&mut self) -> Result<(), GraphError> {
+        let near = self.brokered
+            && self
+                .token
+                .as_ref()
+                .is_some_and(|t| t.expires_at_unix <= now_unix() + EXPIRY_SKEW_SECS);
+        if near && let Refresh::SignIn(reason) = self.try_refresh_with(false) {
+            if self
+                .token
+                .as_ref()
+                .is_some_and(|t| t.expires_at_unix > now_unix())
+            {
+                self.broker_recheck = false;
+                return Ok(());
+            }
+            self.refused_refresh = Some(reason);
+            return Err(GraphError::Unauthorized);
+        }
+        Ok(())
     }
 
     /// Sends [`SyncEvent::TokenStoredUnencrypted`] the first time this run
@@ -10477,12 +10682,15 @@ impl Engine {
         }
     }
 
-    /// Exchanges the refresh token for a fresh token set and persists it.
-    /// No token or refresh token to refresh, or an endpoint that refused
-    /// the grant (`AuthError::needs_sign_in`), is [`Refresh::SignIn`]; any
-    /// other failure (a dropped connection, a 5xx/429 page, a body that
-    /// does not parse, `temporarily_unavailable`, #2167) is
-    /// [`Refresh::Transient`], with the token kept in memory and on disk.
+    /// Renews the token. A brokered token is asked of the broker again, and
+    /// none from it is [`Refresh::SignIn`]. A saved token
+    /// exchanges its refresh token for a fresh token set and persists it. No
+    /// token, no refresh token to refresh with, or an endpoint that refused
+    /// the grant (`AuthError::needs_sign_in`), is [`Refresh::SignIn`]. Any
+    /// other failure (a dropped
+    /// connection, a 5xx/429 page, a body that does not parse,
+    /// `temporarily_unavailable`, #2167) is [`Refresh::Transient`], with the
+    /// token kept in memory and on disk.
     /// Token values are never logged. While the token's grant is known and
     /// shares a scope with `AuthConfig::scope`, the refresh asks only for the
     /// scopes of `AuthConfig::scope` it was granted (otherwise
@@ -10497,10 +10705,49 @@ impl Engine {
     /// which is not taken: claiming scopes the server never named would hide
     /// a missing one until a 403.
     fn try_refresh(&mut self) -> Refresh {
+        self.try_refresh_with(true)
+    }
+
+    /// [`Engine::try_refresh`]; `forced` is false for a renewal no 401
+    /// asked for. Such a renewal of a still-valid brokered token whose
+    /// answer names no account sets neither `broker_recheck` nor
+    /// `broker_refused`: Graph has refused nothing.
+    fn try_refresh_with(&mut self, forced: bool) -> Refresh {
         self.refused_refresh = None;
         let Some(token) = self.token.as_ref() else {
             return Refresh::SignIn(SignInReason::NotSignedIn);
         };
+        if self.brokered {
+            let held = token.account.clone();
+            let held_valid = token.expires_at_unix > now_unix();
+            let refused = || {
+                Refresh::SignIn(SignInReason::Expired {
+                    code: String::new(),
+                    aadsts: None,
+                })
+            };
+            return match self.ask_broker() {
+                Some(t) => match same_account(&held, &t.account) {
+                    Some(true) => {
+                        self.token = Some(t);
+                        self.announce_scopes();
+                        Refresh::Done
+                    }
+                    // Another account's token is not used.
+                    Some(false) => refused(),
+                    None if !forced && held_valid => refused(),
+                    None => {
+                        if self.broker_recheck_unconfirmed {
+                            self.broker_refused = true;
+                        } else {
+                            self.broker_recheck = true;
+                        }
+                        refused()
+                    }
+                },
+                None => refused(),
+            };
+        }
         if token.refresh_token.is_empty() {
             return Refresh::SignIn(SignInReason::Expired {
                 code: String::new(),
@@ -10550,6 +10797,12 @@ impl Engine {
     /// `Error` already sent) is [`Engine::sign_in_failed`], as a
     /// `SignInStarted` went out and the client must hear the sign-in ended.
     fn sign_in(&mut self) {
+        if self.token.is_none()
+            && let Some(t) = self.ask_broker()
+        {
+            self.signed_in(t, true);
+            return;
+        }
         let full = auth::sign_in_scope(&self.config.cfg);
         // Only a sign-in whose optional scopes add a scope can fall back,
         // and not one whose held token already has every required scope
@@ -10591,7 +10844,12 @@ impl Engine {
                 return;
             }
         };
+        self.signed_in(t, false);
+    }
 
+    /// Takes `t` as the session's after a sign-in, `brokered` when the
+    /// broker gave it, and runs the first pass.
+    fn signed_in(&mut self, t: TokenSet, brokered: bool) {
         // The account may have another mailbox than the one that
         // filled the store (#1946: `prompt=select_account`): its
         // check is owed before anything is drained or synced, and
@@ -10605,12 +10863,17 @@ impl Engine {
             )));
         }
         self.mailbox_unchecked = true;
+        self.broker_recheck = false;
         self.check_retry = None;
         self.check_backoff = BACKOFF_MIN;
-        if let Ok(storage) = self.save_token(&t) {
+        if !brokered && let Ok(storage) = self.save_token(&t) {
             self.note_storage(storage);
         }
+        if !brokered {
+            self.broker_refused = false;
+        }
         self.token = Some(t);
+        self.brokered = brokered;
         // The saved sign-in that waited for its store (#2167) is
         // replaced by this one.
         self.saved_unavailable = None;
@@ -10676,23 +10939,25 @@ impl Engine {
         let redirect_uri = format!("http://localhost:{port}");
         let req = auth::begin_auth_with_scope(&self.config.cfg, &redirect_uri, scope);
         self.emit(SyncEvent::SignInStarted {
-            authorize_url: req.authorize_url.clone(),
+            authorize_url: req.authorize_url.clone().into(),
         });
         // The wait reads the channel on each poll (#2131): a `Shutdown`
         // ends it, and the commands before it go to `deferred`, in order,
         // as `take_waiting` does everywhere.
         let timeout = self.signin_timeout();
+        let pages = SignInPages::for_app(self.config.options.app_name);
         let mut abort = || !self.take_waiting();
-        let code = match listen_for_code(&listener, &req.state, fallback, timeout, &mut abort) {
-            Ok(code) => code,
-            Err(_) if self.shutting_down => return SignInAttempt::Aborted,
-            Err(f) => {
-                return SignInAttempt::Failed {
-                    text: f.message,
-                    consent: f.consent,
-                };
-            }
-        };
+        let code =
+            match listen_for_code(&listener, &req.state, fallback, &pages, timeout, &mut abort) {
+                Ok(code) => code,
+                Err(_) if self.shutting_down => return SignInAttempt::Aborted,
+                Err(f) => {
+                    return SignInAttempt::Failed {
+                        text: f.message,
+                        consent: f.consent,
+                    };
+                }
+            };
         match auth::redeem_code(&self.config.cfg, &self.config.auth_base, &req, &code) {
             Ok(t) => SignInAttempt::Signed(t),
             Err(e) => SignInAttempt::Failed {
@@ -10963,7 +11228,54 @@ impl Engine {
             .refused_refresh
             .take()
             .unwrap_or(SignInReason::Rejected);
-        self.enter_signin(reason);
+        // The broker's token, given again for the first 401, refused too.
+        if self.brokered && reason == SignInReason::Rejected {
+            self.broker_refused = true;
+        }
+        self.signin_after_refusal(reason);
+    }
+
+    /// Where every refusal of the session's token ends (a 401 the renewal
+    /// did not help, `signin_after_401`, from a pass, a drain, a bulk loop, a
+    /// fill or a command; or the start's refresh, `refresh_if_near_expiry`).
+    /// A saved token whose refresh was refused (or that has none), or a
+    /// refusal that set `broker_recheck`, with a broker set and not
+    /// `broker_refused`, drops the session as any refusal does, and leaves the
+    /// broker to the main loop, once the work that met the refusal has
+    /// ended ([`Engine::ask_broker_after_refusal`]); anything else is a
+    /// sign-in asked for `reason` at once.
+    fn signin_after_refusal(&mut self, reason: SignInReason) {
+        let saved_refused = !self.brokered && matches!(reason, SignInReason::Expired { .. });
+        let recheck = std::mem::take(&mut self.broker_recheck);
+        if (saved_refused || recheck)
+            && self.config.options.broker.is_some()
+            && !self.broker_refused
+        {
+            self.broker_recheck_unconfirmed = recheck;
+            self.drop_session();
+            self.broker_after_refusal = Some(reason);
+        } else {
+            self.enter_signin(reason);
+        }
+    }
+
+    /// The broker after a refusal [`Engine::signin_after_refusal`] left to it,
+    /// asked from the main loop between its steps.
+    fn ask_broker_after_refusal(&mut self) {
+        let Some(reason) = self.broker_after_refusal.take() else {
+            return;
+        };
+        match self.ask_broker() {
+            Some(t) => {
+                if let Err(e) = self.clear_token() {
+                    self.emit(SyncEvent::Error(format!(
+                        "cannot remove the saved sign-in: {e}"
+                    )));
+                }
+                self.signed_in(t, true);
+            }
+            None => self.enter_signin(reason),
+        }
     }
 
     /// Drop to signed-out: clear the token and announce `SignInRequired`
@@ -10974,7 +11286,16 @@ impl Engine {
     /// the tick again, and the next session's back-off starts at
     /// `BACKOFF_MIN`.
     fn enter_signin(&mut self, reason: SignInReason) {
+        self.broker_recheck_unconfirmed = false;
+        self.drop_session();
+        self.emit(SyncEvent::SignInRequired { reason });
+        self.set_state(SyncState::SignInRequired);
+    }
+
+    /// What [`Engine::enter_signin`] drops before it asks for a sign-in.
+    fn drop_session(&mut self) {
         self.token = None;
+        self.brokered = false;
         self.refused_refresh = None;
         // No saved sign-in waits for its store any more (#2167).
         self.saved_unavailable = None;
@@ -10989,8 +11310,6 @@ impl Engine {
         self.masters_not_found.clear();
         self.masters_skipped.clear();
         self.user_ids.clear();
-        self.emit(SyncEvent::SignInRequired { reason });
-        self.set_state(SyncState::SignInRequired);
     }
 
     /// Suspend syncing until `after` from now (throttle `Retry-After`), without
@@ -11106,6 +11425,61 @@ const SIGNIN_ERROR_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-
 /// a new tab carries it on.
 const SIGNIN_RETRY_HTML: &str = "<!doctype html><html><head><meta charset=\"utf-8\"><title>lookxy</title></head><body><h3>lookxy: signing in again without the optional permissions</h3><p>Continue in the new browser tab; you can close this one.</p></body></html>";
 
+/// The three pages a sign-in's browser tab can end on: the constants above,
+/// or the same pages naming an application ([`EngineOptions::app_name`]).
+struct SignInPages {
+    success: String,
+    error: String,
+    retry: String,
+}
+
+impl SignInPages {
+    fn for_app(app: Option<&str>) -> SignInPages {
+        let Some(app) = app else {
+            return SignInPages {
+                success: SIGNIN_SUCCESS_HTML.to_string(),
+                error: SIGNIN_ERROR_HTML.to_string(),
+                retry: SIGNIN_RETRY_HTML.to_string(),
+            };
+        };
+        let app = html_text(app);
+        let page = |heading: &str, body: &str| {
+            format!(
+                "<!doctype html><html><head><meta charset=\"utf-8\"><title>{app}</title></head><body><h3>{app}: {heading}</h3><p>{body}</p></body></html>"
+            )
+        };
+        SignInPages {
+            success: page(
+                "sign-in complete",
+                &format!("You can close this tab and return to {app}."),
+            ),
+            error: page(
+                "sign-in failed",
+                &format!("You can close this tab and try again in {app}."),
+            ),
+            retry: page(
+                "signing in again without the optional permissions",
+                "Continue in the new browser tab; you can close this one.",
+            ),
+        }
+    }
+}
+
+/// `s` as HTML text.
+fn html_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Blocks (up to `timeout`, [`SIGNIN_TIMEOUT`] outside tests) for the
 /// browser to land on the loopback redirect `listener` is already bound
 /// to, accepts exactly one connection, and extracts the authorization
@@ -11127,6 +11501,7 @@ fn listen_for_code(
     listener: &TcpListener,
     expected_state: &str,
     fallback: bool,
+    pages: &SignInPages,
     timeout: Duration,
     abort: &mut dyn FnMut() -> bool,
 ) -> Result<String, RedirectFailure> {
@@ -11136,7 +11511,9 @@ fn listen_for_code(
     let deadline = Instant::now() + timeout;
     loop {
         match listener.accept() {
-            Ok((stream, _addr)) => return handle_redirect(stream, expected_state, fallback),
+            Ok((stream, _addr)) => {
+                return handle_redirect_with(stream, expected_state, fallback, pages);
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if abort() {
                     return Err(RedirectFailure::other("sign-in stopped by a shutdown"));
@@ -11267,16 +11644,32 @@ fn read_request_line(
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// Reads the HTTP request line off one accepted loopback connection, pulls
-/// `code`/`state` (or `error`) out of its query string, writes back a small
-/// HTML page, and returns the code (or an error — see [`listen_for_code`]).
-/// `fallback` (#2218): a refusal for consent will be followed by a sign-in
-/// without the optional scopes, so such a redirect gets
-/// [`SIGNIN_RETRY_HTML`] rather than the error page.
+/// [`handle_redirect_with`] serving the terminal client's pages.
+#[cfg(test)]
 fn handle_redirect(
     stream: TcpStream,
     expected_state: &str,
     fallback: bool,
+) -> Result<String, RedirectFailure> {
+    handle_redirect_with(
+        stream,
+        expected_state,
+        fallback,
+        &SignInPages::for_app(None),
+    )
+}
+
+/// Reads the HTTP request line off one accepted loopback connection, pulls
+/// `code`/`state` (or `error`) out of its query string, writes back one of
+/// `pages`, and returns the code (or an error, see [`listen_for_code`]).
+/// `fallback` (#2218): a refusal for consent will be followed by a sign-in
+/// without the optional scopes, so such a redirect gets `pages.retry`
+/// rather than the error page.
+fn handle_redirect_with(
+    stream: TcpStream,
+    expected_state: &str,
+    fallback: bool,
+    pages: &SignInPages,
 ) -> Result<String, RedirectFailure> {
     let request_line = read_request_line(
         &stream,
@@ -11301,7 +11694,7 @@ fn handle_redirect(
         // bare code) is shown only from the redirect that carries our
         // `state` (Entra echoes it on an error, RFC 6749 §4.1.2.1).
         if !state_matches {
-            write_html_response(stream, SIGNIN_ERROR_HTML);
+            write_html_response(stream, &pages.error);
             return Err(RedirectFailure::other(if is_oauth_error_code(err) {
                 format!("authorization denied: {err}")
             } else {
@@ -11314,9 +11707,9 @@ fn handle_redirect(
         write_html_response(
             stream,
             if consent && fallback {
-                SIGNIN_RETRY_HTML
+                &pages.retry
             } else {
-                SIGNIN_ERROR_HTML
+                &pages.error
             },
         );
         let err = one_line(err);
@@ -11332,7 +11725,7 @@ fn handle_redirect(
         return Err(RedirectFailure { message, consent });
     }
     if !state_matches {
-        write_html_response(stream, SIGNIN_ERROR_HTML);
+        write_html_response(stream, &pages.error);
         return Err(RedirectFailure::other("redirect state did not match"));
     }
     let Some(code) = params
@@ -11340,10 +11733,10 @@ fn handle_redirect(
         .find(|(k, _)| k == "code")
         .map(|(_, v)| v.clone())
     else {
-        write_html_response(stream, SIGNIN_ERROR_HTML);
+        write_html_response(stream, &pages.error);
         return Err(RedirectFailure::other("redirect had no authorization code"));
     };
-    write_html_response(stream, SIGNIN_SUCCESS_HTML);
+    write_html_response(stream, &pages.success);
     Ok(code)
 }
 
@@ -11613,7 +12006,7 @@ fn numbered_sibling(path: &std::path::Path, n: u32) -> Option<PathBuf> {
 
 /// How a token refresh ended (#2167).
 enum Refresh {
-    /// A fresh token is in place (and saved).
+    /// A fresh token is in place (saved unless brokered).
     Done,
     /// Nothing to refresh, or the endpoint refused the grant: sign in
     /// again, for this reason (#2169).
@@ -11621,6 +12014,13 @@ enum Refresh {
     /// The endpoint could not be reached or did not answer usefully; the
     /// token is kept. The error's text, which never holds a token.
     Transient(String),
+}
+
+/// Whether two tokens' accounts are the same, ignoring ASCII case; `None`
+/// when either names none.
+fn same_account(held: &str, renewed: &str) -> Option<bool> {
+    let (held, renewed) = (held.trim(), renewed.trim());
+    (!held.is_empty() && !renewed.is_empty()).then(|| held.eq_ignore_ascii_case(renewed))
 }
 
 /// A refresh the token endpoint refused (`AuthError::needs_sign_in`) as a
@@ -11701,6 +12101,7 @@ mod tests {
             scope: "Mail.ReadWrite offline_access".into(),
             optional_scope: String::new(),
             cloud: Cloud::Global,
+            login_hint: None,
         }
     }
 
@@ -17475,6 +17876,34 @@ mod tests {
     fn finish(handle: SyncHandle, dir: PathBuf) {
         let _ = handle.cmd_tx.send(SyncCommand::Shutdown);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A resolving spawn returns while its settings are still being made,
+    /// makes them on another thread, and then runs on them.
+    #[test]
+    fn a_resolving_spawn_returns_before_its_settings_are_made() {
+        let dir = unique_dir("spawn-resolving");
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (thread_tx, thread_rx) = mpsc::channel();
+        let handle = spawn_resolving(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            30,
+            Duration::from_secs(3600),
+            move || {
+                let _ = thread_tx.send(thread::current().id());
+                let _ = go_rx.recv();
+                (test_cfg(), EngineOptions::without_prefetch())
+            },
+        );
+        let resolver = thread_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_ne!(resolver, thread::current().id());
+        assert!(handle.evt_rx.try_recv().is_err());
+        go_tx.send(()).unwrap();
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        finish(handle, dir);
     }
 
     #[test]
@@ -27125,6 +27554,47 @@ mod tests {
         assert!(
             wait > Duration::from_secs(8) && wait <= Duration::from_secs(10),
             "{wait:?}"
+        );
+        drop(cmd_tx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store that could not be reached at start and then answers with
+    /// the item gone: the broker is asked before a sign-in, as at start.
+    #[test]
+    fn a_store_that_answers_with_no_sign_in_asks_the_broker() {
+        let dir = unique_dir("store-retry-broker");
+        let token_path = dir.join("token.bin");
+        let (state, store) = saved_in_keyring(&token_path, Keyring::Unavailable);
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path,
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: HOUR,
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: Some(store),
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.saved_unavailable = Some("secret store unavailable: no keyring yet".into());
+        state.items.lock().unwrap().clear();
+        state.set(Keyring::Works);
+        engine.retry_saved_signin(false);
+        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert!(engine.brokered);
+        assert_eq!(
+            engine.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("BROKERED")
         );
         drop(cmd_tx);
         let _ = std::fs::remove_dir_all(&dir);
@@ -52087,6 +52557,233 @@ mod tests {
                 .count()
         }
 
+        /// The bearer of `r`, empty without one.
+        fn bearer_of(r: &crate::testserver::RecordedRequest) -> String {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        }
+
+        /// A spawned engine over `ROOT_A`'s store (its mailbox checked, a
+        /// mark-read of `MA1` queued) and a saved token `AT`, on `srv`, asking
+        /// `broker` (none when `None`).
+        fn spawn_refused(
+            srv: &FakeServer,
+            tag: &str,
+            broker: Option<&'static FakeBroker>,
+        ) -> (SyncHandle, PathBuf, PathBuf) {
+            let dir = unique_dir(tag);
+            let store_path = dir.join("mail.db");
+            {
+                let s = Store::open(&store_path).unwrap();
+                mailbox_a(&s, Some("ROOT_A"));
+                s.set_mailbox_root("ROOT_A").unwrap();
+                s.enqueue_op(&OutboxOp::MarkRead {
+                    id: "MA1".into(),
+                    read: true,
+                })
+                .unwrap();
+            }
+            let token_path = dir.join("token.bin");
+            seed_token(&token_path);
+            let options = EngineOptions {
+                broker: broker.map(|b| Broker(b)),
+                ..EngineOptions::without_prefetch()
+            };
+            let handle = spawn_with_bases_and_options(
+                store_path,
+                token_path.clone(),
+                test_cfg(),
+                3650,
+                srv.base_url.clone(),
+                srv.base_url.clone(),
+                HOUR,
+                options,
+            );
+            (handle, token_path, dir)
+        }
+
+        /// The saved token's mark-read answered 401 and its refresh refused,
+        /// ahead of `ROOT_A`'s listing; the probe answers `probe_root`.
+        fn refused_routes(probe_root: &str) -> Vec<(Route, Option<usize>)> {
+            let mut all = vec![
+                (any_route("PATCH", "/me/messages/", 401, "{}"), None),
+                (
+                    Route {
+                        method: "POST".into(),
+                        path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                        status: 400,
+                        headers: vec![],
+                        body:
+                            r#"{"error":"invalid_grant","error_description":"AADSTS70000: gone"}"#
+                                .into(),
+                    },
+                    None,
+                ),
+            ];
+            all.extend(routes(&[(200, probe_root)], "FA", "ROOT_A"));
+            all
+        }
+
+        /// #2317: a saved token whose refresh is refused mid-drain, with a
+        /// broker whose token holds another mailbox. The drain ends as at a
+        /// refusal; the broker's token then signs in as a sign-in does, so
+        /// the next call is the mailbox probe, which empties the store: no op
+        /// and no PATCH goes out on the new token, and no sign-in is asked.
+        #[test]
+        fn a_refused_refresh_mid_drain_signs_in_with_the_broker_and_checks_first() {
+            let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+            let srv = FakeServer::start_limited(refused_routes("ROOT_B"));
+            let (handle, token_path, dir) = spawn_refused(&srv, "refused-broker", Some(broker));
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::MailboxChanged { .. })
+            });
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+                "{events:?}"
+            );
+            let all = srv.requests();
+            let patches = all.iter().filter(|r| r.method == "PATCH").count();
+            assert_eq!(patches, 1, "the drain ended at the refusal: {all:?}");
+            let on_new: Vec<String> = all
+                .iter()
+                .filter(|r| bearer_of(r) == "Bearer BROKERED")
+                .map(|r| format!("{} {}", r.method, r.path))
+                .collect();
+            // The probe as the engine sends it (`PROBE` and its `$select`).
+            assert!(
+                on_new
+                    .first()
+                    .is_some_and(|r| r.starts_with(&format!("GET {PROBE}"))),
+                "{on_new:?}"
+            );
+            assert!(!on_new.iter().any(|r| r.starts_with("PATCH")), "{on_new:?}");
+            assert_eq!(broker_calls(broker).len(), 1);
+            assert!(!token_path.exists(), "the stale saved sign-in goes");
+            finish(handle, dir);
+        }
+
+        /// With no broker set, a refused refresh asks for a sign-in (#2317):
+        /// nothing goes out after it, and the saved sign-in's file stays.
+        #[test]
+        fn a_refused_refresh_with_no_broker_asks_for_a_sign_in() {
+            let srv = FakeServer::start_limited(refused_routes("ROOT_A"));
+            let (handle, token_path, dir) = spawn_refused(&srv, "refused-none", None);
+            let events = wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
+            assert!(
+                events.iter().any(|e| matches!(
+                    e,
+                    SyncEvent::SignInRequired {
+                        reason: SignInReason::Expired { .. }
+                    }
+                )),
+                "{events:?}"
+            );
+            let all = srv.requests();
+            assert_eq!(all.iter().filter(|r| r.method == "PATCH").count(), 1);
+            assert!(token_path.exists());
+            finish(handle, dir);
+        }
+
+        /// A refused refresh whose broker gives no token (it needs the person,
+        /// or it cannot answer) asks for a sign-in for the refusal's reason
+        /// (#2317): the broker was asked, the drain ended at the refusal, the
+        /// saved sign-in's file stays, and the state is not left syncing.
+        #[test]
+        fn a_refused_refresh_whose_broker_gives_no_token_asks_for_a_sign_in() {
+            for (tag, interaction) in [
+                ("dv-none-interaction", true),
+                ("dv-none-unavailable", false),
+            ] {
+                let broker = fake_broker(move |_, _| {
+                    if interaction {
+                        BrokerResult::InteractionRequired("needs the person".into())
+                    } else {
+                        BrokerResult::Unavailable("no answer".into())
+                    }
+                });
+                let srv = FakeServer::start_limited(refused_routes("ROOT_A"));
+                let (handle, token_path, dir) = spawn_refused(&srv, tag, Some(broker));
+                let events = wait_for(&handle.evt_rx, |e| {
+                    matches!(e, SyncEvent::State(SyncState::SignInRequired))
+                });
+                assert!(
+                    events.iter().any(|e| matches!(
+                        e,
+                        SyncEvent::SignInRequired {
+                            reason: SignInReason::Expired { .. }
+                        }
+                    )),
+                    "{tag}: {events:?}"
+                );
+                assert!(
+                    !broker_calls(broker).is_empty(),
+                    "{tag}: the broker was asked"
+                );
+                let patches = srv
+                    .requests()
+                    .iter()
+                    .filter(|r| r.method == "PATCH")
+                    .count();
+                assert_eq!(patches, 1, "{tag}");
+                assert!(token_path.exists(), "{tag}");
+                finish(handle, dir);
+            }
+        }
+
+        /// With the mailbox check owed and the engine offline, a command that
+        /// cannot reach Graph keeps the Offline state and its back-off
+        /// (#2317).
+        #[test]
+        fn a_command_while_offline_with_the_check_owed_stays_offline() {
+            use crate::graph::model::{AutomaticReplies, ExternalAudience, OofStatus};
+            let (_cmd_tx, cmd_rx) = mpsc::channel();
+            let (evt_tx, _evt_rx) = mpsc::channel();
+            let config = EngineConfig {
+                store_path: PathBuf::from("unused.db"),
+                token_path: PathBuf::from("unused-token.json"),
+                cfg: test_cfg(),
+                backfill_days: 30,
+                graph_base: "http://127.0.0.1:9".into(),
+                auth_base: "http://127.0.0.1:9".into(),
+                tick: HOUR,
+                options: EngineOptions::without_prefetch(),
+                token_store: None,
+            };
+            let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+            engine.token = Some(TokenSet {
+                access_token: "AT".into(),
+                refresh_token: "RT".into(),
+                expires_at_unix: u64::MAX / 2,
+                account: String::new(),
+                scopes: None,
+                cloud: Cloud::Global,
+            });
+            engine.mailbox_unchecked = true;
+            engine.go_offline();
+            engine.handle_command(SyncCommand::SetAutomaticReplies {
+                replies: AutomaticReplies {
+                    status: OofStatus::Disabled,
+                    external_audience: ExternalAudience::All,
+                    internal_message: "x".into(),
+                    external_message: "y".into(),
+                    scheduled_start_utc: "".into(),
+                    scheduled_end_utc: "".into(),
+                },
+            });
+            assert_eq!(engine.state, SyncState::Offline);
+            assert!(
+                engine.next_retry.is_some_and(|t| t > Instant::now()),
+                "the back-off stands"
+            );
+        }
+
         fn folder_ids(s: &Store) -> Vec<String> {
             s.folders().unwrap().into_iter().map(|f| f.id).collect()
         }
@@ -52820,5 +53517,768 @@ mod tests {
             assert!(store.mailbox_check_owed().unwrap());
             finish(handle, dir);
         }
+    }
+
+    // --- A token broker ([`TokenBroker`]) ---------------------------------
+
+    /// A broker whose answer `answer` chooses from the call's scopes and
+    /// its index, and that records the scopes of each call.
+    type Answer = Box<dyn Fn(&str, usize) -> BrokerResult + Send + Sync>;
+
+    struct FakeBroker {
+        answer: Answer,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TokenBroker for FakeBroker {
+        fn silent(&self, scopes: &str) -> BrokerResult {
+            let mut calls = self.calls.lock().unwrap();
+            calls.push(scopes.to_string());
+            (self.answer)(scopes, calls.len() - 1)
+        }
+    }
+
+    fn fake_broker(
+        answer: impl Fn(&str, usize) -> BrokerResult + Send + Sync + 'static,
+    ) -> &'static FakeBroker {
+        Box::leak(Box::new(FakeBroker {
+            answer: Box::new(answer),
+            calls: std::sync::Mutex::new(Vec::new()),
+        }))
+    }
+
+    fn broker_calls(broker: &FakeBroker) -> Vec<String> {
+        broker.calls.lock().unwrap().clone()
+    }
+
+    fn brokered(access_token: &str, expires_in: u64) -> BrokerResult {
+        BrokerResult::Token {
+            access_token: access_token.into(),
+            expires_at_unix: now_unix() + expires_in,
+            account: "person@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+        }
+    }
+
+    /// An engine with `broker` on `routes` (behind the mailbox check's
+    /// probe), its token file seeded by `seed`.
+    fn broker_engine(
+        tag: &str,
+        routes: Vec<(Route, Option<usize>)>,
+        cfg: AuthConfig,
+        broker: &'static FakeBroker,
+        seed: impl FnOnce(&std::path::Path),
+    ) -> (SyncHandle, PathBuf, PathBuf, FakeServer) {
+        let srv = FakeServer::start_limited(with_probe_limited(routes, "ROOT"));
+        let base = srv.base_url.clone();
+        let dir = unique_dir(tag);
+        let token_path = dir.join("token.bin");
+        seed(&token_path);
+        let options = EngineOptions {
+            broker: Some(Broker(broker)),
+            ..EngineOptions::without_prefetch()
+        };
+        let handle = spawn_with_bases_and_options(
+            dir.join("mail.db"),
+            token_path.clone(),
+            cfg,
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+            options,
+        );
+        (handle, dir, token_path, srv)
+    }
+
+    /// The `Authorization` header of each request to `path_prefix`, the
+    /// mailbox check's probe left out.
+    fn bearers(srv: &FakeServer, path_prefix: &str) -> Vec<String> {
+        srv.requests()
+            .iter()
+            .filter(|r| {
+                r.path.starts_with(path_prefix)
+                    && !r.path.starts_with("/me/mailFolders/msgfolderroot")
+            })
+            .filter_map(|r| {
+                r.headers
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                    .map(|(_, v)| v.clone())
+            })
+            .collect()
+    }
+
+    fn is_sign_in_event(e: &SyncEvent) -> bool {
+        matches!(
+            e,
+            SyncEvent::SignInRequired { .. } | SyncEvent::SignInStarted { .. }
+        )
+    }
+
+    #[test]
+    fn a_brokered_token_signs_in_with_no_browser_and_is_never_saved() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-start",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker), [test_cfg().scope]);
+        assert!(!token_path.exists());
+        assert!(tokencache::load(&token_path).unwrap().is_none());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(
+            !used.is_empty() && used.iter().all(|b| b == "Bearer BROKERED"),
+            "{used:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_saved_token_comes_before_the_broker() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-saved",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(broker_calls(broker).is_empty());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(used.iter().all(|b| b == "Bearer AT"), "{used:?}");
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn the_required_scopes_alone_are_asked_when_the_full_set_needs_the_person() {
+        let cfg = AuthConfig {
+            optional_scope: "User.ReadBasic.All".into(),
+            ..test_cfg()
+        };
+        let full = auth::sign_in_scope(&cfg);
+        let broker = fake_broker(|scopes, _| {
+            if scopes.contains("User.ReadBasic.All") {
+                BrokerResult::InteractionRequired("consent".into())
+            } else {
+                brokered("REQUIRED-ONLY", 3600)
+            }
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-required",
+            vec![(empty_folders_route(200), None)],
+            cfg.clone(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker), [full, cfg.scope]);
+        assert!(
+            bearers(&srv, "/me/mailFolders")
+                .iter()
+                .all(|b| b == "Bearer REQUIRED-ONLY")
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_broker_without_a_token_leads_to_the_browser() {
+        for (tag, answer) in [("broker-interaction", true), ("broker-unavailable", false)] {
+            let broker = fake_broker(move |_, _| {
+                if answer {
+                    BrokerResult::InteractionRequired("needs the person".into())
+                } else {
+                    BrokerResult::Unavailable("no broker here".into())
+                }
+            });
+            let (handle, dir, _token_path, _srv) = broker_engine(
+                tag,
+                vec![(empty_folders_route(200), None)],
+                test_cfg(),
+                broker,
+                |_| {},
+            );
+            wait_for(&handle.evt_rx, |e| {
+                matches!(e, SyncEvent::SignInRequired { .. })
+            });
+            assert_eq!(broker_calls(broker).len(), 1);
+            handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+            next_sign_in_started(&handle);
+            assert_eq!(broker_calls(broker).len(), 2, "{tag}");
+            finish(handle, dir);
+        }
+    }
+
+    #[test]
+    fn a_brokered_token_near_its_expiry_is_asked_for_again() {
+        let broker = fake_broker(|_, n| {
+            if n == 0 {
+                brokered("FIRST", 10)
+            } else {
+                brokered("SECOND", 3600)
+            }
+        });
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-expiry",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 2);
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(used.iter().all(|b| b == "Bearer SECOND"), "{used:?}");
+        assert!(!token_path.exists());
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_401_asks_the_broker_once_and_a_second_one_asks_for_a_sign_in() {
+        let broker = fake_broker(|_, n| brokered(&format!("T{n}"), 3600));
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-401",
+            vec![(empty_folders_route(401), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInStarted { .. })),
+            "{events:?}"
+        );
+        assert_eq!(broker_calls(broker).len(), 2);
+        let used = bearers(&srv, "/me/mailFolders");
+        assert_eq!(used, ["Bearer T0", "Bearer T1"], "{used:?}");
+        finish(handle, dir);
+    }
+
+    /// The token endpoint refusing every refresh: the grant is gone.
+    fn refused_refresh_route() -> Route {
+        Route {
+            method: "POST".into(),
+            path_prefix: "/organizations/oauth2/v2.0/token".into(),
+            status: 400,
+            headers: vec![],
+            body:
+                r#"{"error":"invalid_grant","error_description":"AADSTS70000: the grant is gone"}"#
+                    .into(),
+        }
+    }
+
+    /// A saved token whose refresh is refused (issued to another client, say)
+    /// is replaced by the broker's: no sign-in asked, and the stale file goes
+    /// so the next start asks the broker too.
+    #[test]
+    fn a_saved_token_whose_refresh_is_refused_gives_way_to_the_broker() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-refused-refresh",
+            vec![
+                (refused_refresh_route(), None),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            broker,
+            |p| seed_token_with_scopes(p, 10, SEEDED),
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert!(!token_path.exists());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(
+            !used.is_empty() && used.iter().all(|b| b == "Bearer BROKERED"),
+            "{used:?}"
+        );
+        finish(handle, dir);
+    }
+
+    /// A 401 on a saved token whose refresh is then refused asks the broker
+    /// before a sign-in, and the call runs again on its token.
+    #[test]
+    fn a_401_on_a_saved_token_whose_refresh_is_refused_asks_the_broker() {
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (handle, dir, token_path, srv) = broker_engine(
+            "broker-refused-401",
+            vec![
+                (refused_refresh_route(), None),
+                (empty_folders_route(401), Some(1)),
+                (empty_folders_route(200), None),
+            ],
+            test_cfg(),
+            broker,
+            |p| seed_token_with_scopes(p, 3600, SEEDED),
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert!(!token_path.exists());
+        let used = bearers(&srv, "/me/mailFolders");
+        assert_eq!(
+            used.first().map(String::as_str),
+            Some("Bearer AT"),
+            "{used:?}"
+        );
+        assert!(used[1..].iter().all(|b| b == "Bearer BROKERED"), "{used:?}");
+        finish(handle, dir);
+    }
+
+    /// A completed browser sign-in lifts `broker_refused`: the broker the
+    /// second 401 stopped is asked again afterwards (a later refused refresh
+    /// or a sign-out's Sign in reaches it).
+    #[test]
+    fn a_browser_sign_in_lets_the_broker_be_asked_again() {
+        let dir = unique_dir("broker-refused-cleared");
+        let broker = fake_broker(|_, _| brokered("BROKERED", 3600));
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, _evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: dir.join("token.bin"),
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: HOUR,
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: None,
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.broker_refused = true;
+        assert!(engine.ask_broker().is_none());
+        assert!(broker_calls(broker).is_empty());
+        let browser = TokenSet {
+            access_token: "AT".into(),
+            refresh_token: "RT".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: "person@example.com".into(),
+            scopes: None,
+            cloud: Cloud::Global,
+        };
+        engine.signed_in(browser, false);
+        assert!(!engine.broker_refused);
+        assert!(engine.ask_broker().is_some());
+        assert_eq!(broker_calls(broker).len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// After a second 401 has signed a brokered session out, a Sign in goes
+    /// to the browser: the broker whose token Graph refused is not asked
+    /// again in this run.
+    #[test]
+    fn after_a_second_401_a_sign_in_reaches_the_browser() {
+        let broker = fake_broker(|_, n| brokered(&format!("T{n}"), 3600));
+        let (handle, dir, _token_path, _srv) = broker_engine(
+            "broker-401-browser",
+            vec![(empty_folders_route(401), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert_eq!(broker_calls(broker).len(), 2);
+        handle.cmd_tx.send(SyncCommand::SignIn).unwrap();
+        next_sign_in_started(&handle);
+        assert_eq!(broker_calls(broker).len(), 2);
+        finish(handle, dir);
+    }
+
+    /// A brokered token whose scopes the broker does not say holds the
+    /// scopes it was asked for: its grant is announced, nothing missing.
+    #[test]
+    fn a_brokered_token_with_no_scopes_holds_the_scopes_asked_for() {
+        let broker = fake_broker(|_, _| BrokerResult::Token {
+            access_token: "BROKERED".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: "person@example.com".into(),
+            scopes: None,
+        });
+        let (handle, dir, _token_path, _srv) = broker_engine(
+            "broker-no-scopes",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        let scopes = events.iter().find_map(|e| match e {
+            SyncEvent::Scopes { granted, missing } => Some((granted.clone(), missing.clone())),
+            _ => None,
+        });
+        assert_eq!(
+            scopes,
+            Some((strings(&["Mail.ReadWrite", "offline_access"]), Vec::new())),
+            "{events:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn a_sign_in_started_debug_print_hides_the_login_hint() {
+        let event = SyncEvent::SignInStarted {
+            authorize_url: "https://h/a?login_hint=person%40example.test&state=s".into(),
+        };
+        let printed = format!("{event:?}");
+        assert!(!printed.contains("person"), "{printed}");
+    }
+
+    /// A renewal whose token names another account than the session's is not
+    /// used: the session ends and a sign-in is asked, and no call carries it.
+    #[test]
+    fn a_renewed_brokered_token_of_another_account_is_not_used() {
+        let broker = fake_broker(|_, n| {
+            if n == 0 {
+                brokered("FIRST", 0)
+            } else {
+                BrokerResult::Token {
+                    access_token: "OTHER".into(),
+                    expires_at_unix: now_unix() + 3600,
+                    account: "someone.else@example.com".into(),
+                    scopes: Some(strings(SEEDED)),
+                }
+            }
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-other-account",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInStarted { .. })),
+            "{events:?}"
+        );
+        assert!(broker_calls(broker).len() >= 2);
+        let other = srv.requests().iter().any(|r| {
+            r.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer OTHER")
+        });
+        assert!(!other, "a request carried the other account's token");
+        finish(handle, dir);
+    }
+
+    /// A renewal whose token names no account signs in again through the
+    /// broker, so the mailbox check runs on the new token before any other
+    /// call; the renewal's own token is never sent.
+    #[test]
+    fn a_renewed_brokered_token_naming_no_account_checks_the_mailbox_first() {
+        let unnamed = |token: &str, expires_in: u64| BrokerResult::Token {
+            access_token: token.into(),
+            expires_at_unix: now_unix() + expires_in,
+            account: String::new(),
+            scopes: Some(strings(SEEDED)),
+        };
+        let broker = fake_broker(move |_, n| match n {
+            0 => unnamed("FIRST", 0),
+            1 => unnamed("SECOND", 3600),
+            _ => unnamed("THIRD", 3600),
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-unnamed-account",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert_eq!(broker_calls(broker).len(), 3);
+        let bearer = |r: &crate::testserver::RecordedRequest| {
+            r.headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("authorization"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
+        };
+        let sent: Vec<(String, String)> = srv
+            .requests()
+            .iter()
+            .map(|r| (r.path.clone(), bearer(r)))
+            .collect();
+        assert!(sent.iter().all(|(_, b)| b != "Bearer SECOND"), "{sent:?}");
+        let first_third = sent.iter().position(|(_, b)| b == "Bearer THIRD").unwrap();
+        assert!(
+            sent[first_third]
+                .0
+                .starts_with("/me/mailFolders/msgfolderroot"),
+            "{sent:?}"
+        );
+        finish(handle, dir);
+    }
+
+    /// A broker whose tokens name no account, and which Graph refuses: the
+    /// renewal signs in again through the broker once, and the next refusal
+    /// stops the broker and asks for a sign-in.
+    #[test]
+    fn an_unnamed_broker_whose_tokens_graph_refuses_ends_in_a_sign_in() {
+        let broker = fake_broker(|_, n| BrokerResult::Token {
+            access_token: format!("U{n}"),
+            expires_at_unix: now_unix() + 3600,
+            account: String::new(),
+            scopes: Some(strings(SEEDED)),
+        });
+        let (handle, dir, _token_path, _srv) = broker_engine(
+            "broker-unnamed-refused",
+            vec![(empty_folders_route(401), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInStarted { .. })),
+            "{events:?}"
+        );
+        let asked = broker_calls(broker).len();
+        assert!((2..=4).contains(&asked), "{asked} broker asks");
+        finish(handle, dir);
+    }
+
+    /// A renewal for another account that a caller swallows (the categories'
+    /// read) keeps the token, so the next pass's refusal still asks for a
+    /// sign-in.
+    #[test]
+    fn a_refused_renewal_a_caller_swallows_still_ends_in_a_sign_in() {
+        let broker = fake_broker(|_, _| BrokerResult::Token {
+            access_token: "OTHER".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: "someone.else@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+        });
+        let srv = FakeServer::start(Vec::new());
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: PathBuf::from("unused-token.json"),
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: srv.base_url.clone(),
+            auth_base: srv.base_url.clone(),
+            tick: Duration::from_secs(3600),
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: None,
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.token = Some(TokenSet {
+            access_token: "FIRST".into(),
+            refresh_token: String::new(),
+            expires_at_unix: now_unix().saturating_sub(1),
+            account: "person@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+            cloud: crate::auth::Cloud::Global,
+        });
+        engine.brokered = true;
+        engine.mailbox_unchecked = false;
+        engine.refresh_master_categories();
+        assert!(
+            engine.token.is_some(),
+            "a swallowed refusal keeps the token"
+        );
+        engine.sync_pass(true);
+        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+            "{events:?}"
+        );
+        assert!(
+            !srv.requests().iter().any(|r| r
+                .headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("authorization") && v == "Bearer OTHER")),
+            "a request carried the other account's token"
+        );
+    }
+
+    /// Near its expiry, a renewal no 401 asked for whose token names no
+    /// account keeps the still-valid token: no recheck is owed (a stale one
+    /// is cleared), the broker is not stopped, and a later refusal for
+    /// another account is a sign-in, not the broker's.
+    #[test]
+    fn a_near_expiry_unnamed_renewal_keeps_a_still_valid_token() {
+        let broker = fake_broker(|_, _| BrokerResult::Token {
+            access_token: "UNNAMED".into(),
+            expires_at_unix: now_unix() + 3600,
+            account: String::new(),
+            scopes: Some(strings(SEEDED)),
+        });
+        let (_cmd_tx, cmd_rx) = mpsc::channel();
+        let (evt_tx, evt_rx) = mpsc::channel();
+        let config = EngineConfig {
+            store_path: PathBuf::from("unused.db"),
+            token_path: PathBuf::from("unused-token.json"),
+            cfg: test_cfg(),
+            backfill_days: 30,
+            graph_base: "http://127.0.0.1:9".into(),
+            auth_base: "http://127.0.0.1:9".into(),
+            tick: Duration::from_secs(3600),
+            options: EngineOptions {
+                broker: Some(Broker(broker)),
+                ..EngineOptions::without_prefetch()
+            },
+            token_store: None,
+        };
+        let mut engine = Engine::new(config, Store::open_in_memory().unwrap(), cmd_rx, evt_tx);
+        engine.token = Some(TokenSet {
+            access_token: "HELD".into(),
+            refresh_token: String::new(),
+            expires_at_unix: now_unix() + 60,
+            account: "person@example.com".into(),
+            scopes: Some(strings(SEEDED)),
+            cloud: crate::auth::Cloud::Global,
+        });
+        engine.brokered = true;
+        engine.broker_recheck = true;
+        engine.broker_recheck_unconfirmed = true;
+        assert!(engine.renew_brokered_near_expiry().is_ok());
+        assert_eq!(broker_calls(broker).len(), 1);
+        assert_eq!(
+            engine.token.as_ref().map(|t| t.access_token.as_str()),
+            Some("HELD")
+        );
+        assert!(!engine.broker_refused);
+        assert!(!engine.broker_recheck);
+        assert!(evt_rx.try_iter().all(|e| !is_sign_in_event(&e)));
+        engine.signin_after_refusal(SignInReason::Expired {
+            code: String::new(),
+            aadsts: None,
+        });
+        assert_eq!(engine.broker_after_refusal, None);
+        let events: Vec<SyncEvent> = evt_rx.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SyncEvent::SignInRequired { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// Near its expiry, a broker that gives nothing keeps a brokered token
+    /// still valid: no sign-in, and Graph is called with it.
+    #[test]
+    fn a_still_valid_brokered_token_stays_when_the_broker_gives_nothing() {
+        let broker = fake_broker(|_, n| {
+            if n == 0 {
+                brokered("FIRST", 120)
+            } else {
+                BrokerResult::Unavailable("the broker did not answer".into())
+            }
+        });
+        let (handle, dir, _token_path, srv) = broker_engine(
+            "broker-near-expiry-kept",
+            vec![(empty_folders_route(200), None)],
+            test_cfg(),
+            broker,
+            |_| {},
+        );
+        let events = wait_for(&handle.evt_rx, |e| matches!(e, SyncEvent::FoldersUpdated));
+        assert!(!events.iter().any(is_sign_in_event), "{events:?}");
+        assert!(broker_calls(broker).len() >= 2);
+        let used = bearers(&srv, "/me/mailFolders");
+        assert!(
+            !used.is_empty() && used.iter().all(|b| b == "Bearer FIRST"),
+            "{used:?}"
+        );
+        finish(handle, dir);
+    }
+
+    #[test]
+    fn the_sign_in_pages_name_the_app_when_told() {
+        let default = SignInPages::for_app(None);
+        assert_eq!(default.success, SIGNIN_SUCCESS_HTML);
+        assert_eq!(default.error, SIGNIN_ERROR_HTML);
+        assert_eq!(default.retry, SIGNIN_RETRY_HTML);
+        let named = SignInPages::for_app(Some("Mail <&> \"X\""));
+        let app = "Mail &lt;&amp;&gt; &quot;X&quot;";
+        assert!(
+            named
+                .success
+                .contains(&format!("<h3>{app}: sign-in complete</h3>"))
+                && named.success.contains(&format!("return to {app}.")),
+            "{}",
+            named.success
+        );
+        assert!(
+            named
+                .error
+                .contains(&format!("<h3>{app}: sign-in failed</h3>"))
+        );
+        assert!(named.retry.contains(&format!("<title>{app}</title>")));
+        assert!(!format!("{}{}{}", named.success, named.error, named.retry).contains("lookxy"));
+    }
+
+    #[test]
+    fn a_sign_in_ends_on_the_named_app_page() {
+        let routes = vec![
+            Route {
+                method: "POST".into(),
+                path_prefix: "/organizations/oauth2/v2.0/token".into(),
+                status: 200,
+                headers: vec![],
+                body: r#"{"access_token":"AT","refresh_token":"RT","expires_in":3600}"#.into(),
+            },
+            empty_folders_route(200),
+        ];
+        let srv = FakeServer::start(with_probe(routes, "ROOT"));
+        let base = srv.base_url.clone();
+        let dir = unique_dir("signin-named-page");
+        let options = EngineOptions {
+            app_name: Some("Fixture Mail"),
+            ..EngineOptions::without_prefetch()
+        };
+        let handle = spawn_with_bases_and_options(
+            dir.join("mail.db"),
+            dir.join("token.bin"),
+            test_cfg(),
+            3650,
+            base.clone(),
+            base,
+            Duration::from_secs(3600),
+            options,
+        );
+        wait_for(&handle.evt_rx, |e| {
+            matches!(e, SyncEvent::SignInRequired { .. })
+        });
+        let (_, response) = sign_in_through_loopback(&handle);
+        assert!(
+            response.contains("<h3>Fixture Mail: sign-in complete</h3>"),
+            "{response}"
+        );
+        finish(handle, dir);
     }
 }

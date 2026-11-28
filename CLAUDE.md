@@ -123,7 +123,8 @@ issue number to find its notes.
   lives (#1473), Open File's native picker off the App borrow on Windows
   (#2192), every other native dialog the same way, a save's `AfterSave` and
   the workbook save's steps (#2194), the real Open picker in the Windows
-  sweep, a harness's Open refused off Windows (#2195).
+  sweep, a harness's Open refused off Windows (#2195), the integration plugin's
+  names, icon and context in titles and About, its accent colours (#2317).
 - `docs/claude/suite-extensions.md`: before changing the suite as a library
   (`run(ext::Extensions)`), extension surfaces (Mail tabs), tab tear-off or the embedded
   `ext::DocView` (#1873), its editing mode (#1947), host insert, copy and cut (#1977),
@@ -148,6 +149,10 @@ issue number to find its notes.
   manual bundles (#1022), the Help tab and F1 (#1855), the manual revision in
   About and the Help footer (#1857), F1 on a hovered ribbon command (#1869),
   F1 on a focused pane, `pane:<id>` (#2077).
+- `docs/claude/integration.md`: before changing the `integration/` crate (the integration
+  plugin's host side, #2317): the contract `docs/integration-plugins.md`, `start`, `global` and
+  `shutdown`, the asks at start and in the background (`ask_at_start`), the kept reads, the
+  hosts, the tests.
 - `docs/claude/ui-plugins.md`: before changing the UI plugin ABI, the plan's formatting
   model (`projcore::formatting`, `formatting.xml`) or the plugin dialogs and their layout:
   UI plugins (#1532, #1553, #1572, #1609), dialog values that follow (#1670), overlay text
@@ -307,7 +312,8 @@ issue number to find its notes.
   or SendDraft following its draft's move (#2265), a save kept at a
   shutdown never replacing a file made at its path (#2267), each
   message's last verb (replied, replied all, forwarded) on its row, and
-  an answer sent here marking its original with one PATCH (#2301).
+  an answer sent here marking its original with one PATCH (#2301), a token
+  broker asked before the browser sign-in and a login hint (#2317).
 
 ## Build and test
 
@@ -316,7 +322,8 @@ What CI runs (`.github/workflows/ci.yml`):
 - The root workspace (`Cargo.toml` members: opccore, docxcore, pdffont, gridcore,
   ctlcore, ribboncore, ribbonspec, backstagecore, docxy, xlsxy, projcore, projctl, yppxy,
   mppread, docxwasm, gridwasm, htmlbundle, mailcore, lookxy, editcore, comshimcore,
-  xlcomshim, wordcomshim, uiharness, buildinfo, helpdocs, projcore/tests/plugin_fixture):
+  xlcomshim, wordcomshim, uiharness, buildinfo, helpdocs, projcore/tests/plugin_fixture,
+  integration, integration/tests/integration_fixture, integration/tests/dependency_fixture):
   `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
   `cargo clippy -p docxy --all-targets --features html-export -- -D warnings`,
   `cargo test --workspace --locked --features docxy/html-export`.

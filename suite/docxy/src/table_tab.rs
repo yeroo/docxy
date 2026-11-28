@@ -1177,7 +1177,7 @@ impl Docxy {
         let hover = self.table_grid_hover;
         let lit_bg = Hsla {
             a: 0.25,
-            ..hsla_u(BRAND)
+            ..hsla_u(crate::accent::chrome().fill)
         };
         let grid = v_flex()
             .id("table-grid")
@@ -1194,7 +1194,11 @@ impl Docxy {
                         .id(("table-grid-cell", r * 100 + c))
                         .size(px(15.))
                         .border_1()
-                        .border_color(if lit { hsla_u(BRAND) } else { pal.border })
+                        .border_color(if lit {
+                            hsla_u(crate::accent::chrome().mark)
+                        } else {
+                            pal.border
+                        })
                         .bg(if lit { lit_bg } else { hsla_u(0xFFFFFF) })
                         .on_hover(cx.listener(move |this, over: &bool, _, cx| {
                             if *over {
@@ -1285,7 +1289,7 @@ impl Docxy {
                     .rounded(px(3.))
                     .border_2()
                     .border_color(if selected {
-                        hsla_u(BRAND)
+                        hsla_u(crate::accent::chrome().mark)
                     } else {
                         gpui::transparent_black()
                     })

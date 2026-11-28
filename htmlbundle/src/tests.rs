@@ -455,6 +455,32 @@ fn sibling_warning_fires_only_when_the_original_changed() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A host's own name replaces the product in the texts, and only there: a
+/// file whose name holds the product keeps it.
+#[test]
+fn a_hosts_name_takes_the_product_phrase_and_a_file_name_stays() {
+    let dir = temp_dir("named");
+    let plain = dir.join("docxy-notes.html");
+    std::fs::write(&plain, "<html><body>mine</body></html>").unwrap();
+    assert_eq!(
+        check_html_target_for(&plain, "Product").unwrap_err(),
+        "not overwriting docxy-notes.html: it is not a Product editable HTML file"
+    );
+    assert_eq!(
+        check_html_target(&plain).unwrap_err(),
+        "not overwriting docxy-notes.html: it is not a docxy editable HTML file"
+    );
+    assert_eq!(
+        Error::Malformed("why".into()).text_for("Product"),
+        "damaged Product HTML payload: why"
+    );
+    assert_eq!(
+        Error::NotABundle.to_string(),
+        Error::NotABundle.text_for(PRODUCT)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn only_missing_files_and_word_bundles_may_be_overwritten() {
     let dir = temp_dir("target");

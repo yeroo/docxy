@@ -221,7 +221,7 @@ pub(crate) fn pdf_save_as_target(path: std::path::PathBuf) -> Result<std::path::
 pub(crate) fn signed_dialog(question: &str) -> crate::dialog::Dialog {
     crate::dialog::Dialog::message(
         crate::dialog::catalog::PDF_SIGNED_SAVE,
-        "docxy",
+        crate::brand::short(),
         question.into(),
         &[
             ("Save", crate::dialog::ButtonRole::Accept),

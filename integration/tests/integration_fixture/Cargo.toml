@@ -1,0 +1,30 @@
+[package]
+name = "integration_fixture"
+description = "Test fixture: an integration plugin whose behaviour a mode file beside it chooses, loaded by docxy-integration's tests."
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+# The host takes `dxi_*` libraries; the tests copy the built file into a
+# plugin folder under that name (cargo adds `lib` on Unix).
+[lib]
+name = "dxi_fixture"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[features]
+# Leaves `dxi_call` out: a mode file cannot remove an export.
+missing-call = []
+# Windows: imports `fixture_needed.dll` by name, for the load-flags test.
+needs-dependency = []
+
+# Dependency-free on purpose: it implements the C ABI by hand, as a plugin in
+# any language would, rather than through docxy-integration's Rust types.
+[dependencies]

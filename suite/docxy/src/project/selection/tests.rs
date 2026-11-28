@@ -190,7 +190,7 @@ fn the_entry_row_fills_its_cursor_cell() {
 fn the_colours_are_washes_of_the_accent() {
     let (f, h) = (cell_fill_color(), header_tint_color());
     assert!(f.a > h.a && h.a > 0.);
-    let c: Hsla = gpui::rgb(crate::accent::brand()).into();
+    let c: Hsla = gpui::rgb(crate::accent::fill()).into();
     assert_eq!((f.h, f.s, f.l), (c.h, c.s, c.l));
 }
 

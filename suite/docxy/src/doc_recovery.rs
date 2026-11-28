@@ -81,10 +81,12 @@ pub(crate) fn dialog(items: &[Candidate]) -> Dialog {
     let mut d = Dialog::message(
         catalog::DOCUMENT_RECOVERY,
         "Document Recovery",
-        "docxy closed unexpectedly, and these documents were reopened from their \
-         AutoRecover copies. Checked documents keep their recovered changes; unchecked \
-         ones open as last saved, and their recovered changes are discarded."
-            .into(),
+        format!(
+            "{} closed unexpectedly, and these documents were reopened from their \
+             AutoRecover copies. Checked documents keep their recovered changes; unchecked \
+             ones open as last saved, and their recovered changes are discarded.",
+            crate::brand::short()
+        ),
         &[],
         DialogOwner::DocumentRecovery,
     );

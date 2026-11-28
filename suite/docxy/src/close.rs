@@ -687,7 +687,7 @@ fn doc_prompt(name: &PromptName, quit: bool) -> Dialog {
 fn message_prompt(id: DialogId, title: &str, quit: bool) -> Dialog {
     Dialog::message(
         id,
-        "docxy",
+        crate::brand::short(),
         format!("Save changes to {title} before closing?"),
         &[
             ("Save", ButtonRole::Accept),
@@ -1058,7 +1058,7 @@ impl Docxy {
                 DraftErrorTo::Dialog => {
                     // The tab is gone: the message only informs.
                     let dialog = rfd::MessageDialog::new()
-                        .set_title("docxy")
+                        .set_title(crate::brand::short())
                         .set_level(rfd::MessageLevel::Warning)
                         .set_description(e)
                         .set_buttons(rfd::MessageButtons::Ok);

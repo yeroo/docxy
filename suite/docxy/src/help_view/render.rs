@@ -131,7 +131,7 @@ impl Docxy {
                 .when(v.sel, |d| d.bg(pal.sel))
                 .child(before)
                 .when(focused && !v.sel, |d| {
-                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(accent::brand())))
+                    d.child(div().w(px(1.)).h(px(14.)).bg(rgb(accent::fill())))
                 })
                 .child(after)
                 .into_any_element()
@@ -147,7 +147,7 @@ impl Docxy {
             .rounded_sm()
             .border_1()
             .border_color(if focused {
-                rgb(accent::brand()).into()
+                rgb(accent::fill()).into()
             } else {
                 pal.border
             })
@@ -184,7 +184,7 @@ impl Docxy {
                     .hover(|d| d.bg(pal.hover))
                     .when(current, |d| {
                         d.bg(pal.sel)
-                            .text_color(rgb(accent::brand()))
+                            .text_color(rgb(accent::text()))
                             .font_weight(FontWeight::BOLD)
                     })
                     .child(title)

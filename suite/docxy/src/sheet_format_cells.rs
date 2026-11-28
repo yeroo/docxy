@@ -734,7 +734,10 @@ fn setter(d: &Dialog) -> Result<Option<FormatFn>, String> {
         };
         if differs {
             if !code.is_empty() && gridcore::numfmt::parse_format(&code).is_none() {
-                return Err(format!("docxy cannot use this number format: {code}"));
+                return Err(format!(
+                    "{} cannot use this number format: {code}",
+                    crate::brand::short()
+                ));
             }
             parts.push(crate::numfmt_setter(&code));
         }
