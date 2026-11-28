@@ -768,7 +768,10 @@ fn spawn_worker(
                     return;
                 }
             };
-            let _ = ready_tx.send(Start::Found(file_name(&library)));
+            // `load_from` gave up waiting: the plugin is refused, so it is not touched.
+            if ready_tx.send(Start::Found(file_name(&library))).is_err() {
+                return;
+            }
             if let Some(marker) = &marker
                 && let Some(why) = marker.take_stale()
             {

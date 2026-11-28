@@ -509,6 +509,29 @@ fn a_plugin_that_refuses_the_host_is_not_used() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A load the deadline ended before the library was found goes no further:
+/// the worker takes no stale marker and loads nothing.
+#[test]
+fn a_load_ended_before_the_library_is_found_touches_nothing() {
+    let dir = plugin_folder("load-ended", None);
+    let markers = dir.join("markers");
+    std::fs::create_dir_all(&markers).unwrap();
+    let stale = markers.join(format!("dxi-mail-{}.marker", ended_process_id()));
+    std::fs::write(&stale, "branding").unwrap();
+    let mut config = marker_config(&markers);
+    config.deadlines.init = Duration::ZERO;
+    let plugin = load_from(&dir, &config);
+    assert!(
+        matches!(plugin.status(), Status::Refused { .. }),
+        "{:?}",
+        plugin.status()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(inits(&dir), 0);
+    assert!(stale.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn a_plugin_that_starts_too_slowly_is_refused() {
     let dir = plugin_folder("slow-init", Some("slow-init 2000"));
@@ -534,12 +557,13 @@ fn a_call_past_its_deadline_stops_the_plugin_for_the_run() {
     assert_eq!(file, fixture_file());
     assert_eq!(why, "it did not answer branding within 0.2 s");
     // A read that leaves the notice, then the one that takes it.
-    assert_eq!(plugin.notice(), plugin.notice());
-    let notice = plugin.take_notice().unwrap();
+    let notice = plugin.notice().unwrap();
     assert!(
         notice.contains("stopped") && notice.contains(&why),
         "{notice}"
     );
+    assert_eq!(plugin.notice().as_deref(), Some(notice.as_str()));
+    assert_eq!(plugin.take_notice().as_deref(), Some(notice.as_str()));
     assert_eq!(plugin.take_notice(), None);
     assert_eq!(plugin.sign_in(App::Mail), None);
     assert!(matches!(
