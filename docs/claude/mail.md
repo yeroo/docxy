@@ -6435,12 +6435,10 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
 
 ## A token broker and a login hint (#2317)
 
-- `EngineOptions::broker` (`TokenBroker`, `Broker`) is a token source outside the engine, asked on
-  the engine's thread; the trait's doc says when. A brokered token (`Engine::brokered`) is never
-  saved, and `try_refresh` and `renew_brokered_near_expiry` ask the broker for it in place of the
-  refresh-token grant. An explicit `SignIn` asks the broker only with no token held, so a re-consent
-  with a token held (#2213) still goes to the browser. `ask_broker` repeats #2218's fallback: the
-  full sign-in scope, then `AuthConfig::scope` alone when the first answer needs the person.
+- `EngineOptions::broker` (`TokenBroker`, `Broker`) is a token source outside the engine; the
+  trait's doc says when it is asked, and `ask_broker`'s for which scopes (#2218's fallback). An
+  explicit `SignIn` asks the broker only with no token held, so a re-consent with a token held
+  (#2213) still goes to the browser.
 - A refusal of the session's token with a broker set: `signin_after_refusal` and
   `ask_broker_after_refusal` say when the broker is asked and what its answer leads to, and
   `broker_refused` when it is not asked again.
@@ -6449,10 +6447,8 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   `broker_recheck_unconfirmed` fields say what a renewal of another account, or of none, leads to.
 - `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL. `AuthConfig`'s
   `Debug` and `SyncEvent::SignInStarted`'s (`auth::AuthorizeUrl`) hide it.
-- `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
-  terminal client's.
-- `spawn_resolving` makes the `AuthConfig` and `EngineOptions` on the engine's thread, so a host
-  whose sign-in settings come from its integration plugin spawns from its UI thread without waiting
+- `EngineOptions::app_name` names the browser tab's pages (`SignInPages`).
+- `spawn_resolving` makes the `AuthConfig` and `EngineOptions` on the engine's thread
   (`a_resolving_spawn_returns_before_its_settings_are_made`).
 - Tests: `auth::tests::a_login_hint_replaces_the_account_picker`; engine `tests::a_brokered_token_*`,
   `a_saved_token_comes_before_the_broker`, `the_required_scopes_alone_*`,

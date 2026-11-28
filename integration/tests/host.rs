@@ -509,9 +509,9 @@ fn a_plugin_that_refuses_the_host_is_not_used() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// A load whose deadline ends during `dxi_abi` (1.5 s against 0.2 s) goes
-/// no further: the worker never calls `dxi_init`. The sleep only lets the
-/// worker finish its `dxi_abi`.
+/// A load whose deadline ends during `dxi_abi` goes no further: the worker
+/// never calls `dxi_init`. The sleep only lets the worker finish its
+/// `dxi_abi`.
 #[test]
 fn a_load_the_deadline_ended_never_calls_dxi_init() {
     let dir = plugin_folder("load-ended", Some("slow-abi 1500"));

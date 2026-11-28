@@ -204,11 +204,9 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   button, washes, a checked box, the focus ring), `on_fill` (its text), `mark` (the active tab's
   underline, a selected tile's and a hover border) and `text` (accent text). `accent::drawn` gives
   them the plugin's `primary`, its text, `highlight` and `link` that `brand::accents` takes for the
-  theme (`docxy_integration::accent::check`); sheet's and project's own accents stay.
-  The chrome outside the ribbon, backstage and title bar (dialogs, panes, bars, fields) draws
-  `accent::chrome()`, the brand's roles whichever tab is selected; `BRAND` itself stays only at
-  the sites `accent::tests::BRAND_KEPT` lists (carets, comments, document and grid content, the
-  Gantt bars), each with its reason.
+  theme (`docxy_integration::accent::check`).
+  The rest of the chrome draws `accent::chrome()`; `BRAND` itself stays only at the sites
+  `accent::tests::BRAND_KEPT` lists.
   `brand::apply_accents_to_theme`, after every `Theme::change`, sets gpui-component's `primary`,
   `ring`, `selection` and `link` tokens.
 - Every other text that names the suite takes `brand::short()` too: the macOS menu bar
@@ -219,8 +217,6 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   variables, `app_id`, temp names), stderr and crash-log lines, `--version` and the title-bar
   label per tab type. `brand::tests::the_product_name_is_written_only_here` fails on any other
   product-name literal in non-test source outside `brand.rs` that `NAME_LITERALS_KEPT` and
-  `NAME_HEADERS_KEPT` do not name; each named literal there has its reason. It scans
-  `suite/docxy/src` only: a shared crate's texts the suite shows are outside it, so they take the
-  name as a parameter. htmlbundle's refusals and errors do (`check_html_target_for`,
-  `Error::text_for`, filled with `brand::short()` in `html_bundle`); a file name in them stays as
-  typed.
+  `NAME_HEADERS_KEPT` do not name; its doc says what it does not see. htmlbundle's refusals and
+  errors take the name as a parameter (`check_html_target_for`, `Error::text_for`, filled with
+  `brand::short()` in `html_bundle`).

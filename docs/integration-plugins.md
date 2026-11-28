@@ -21,8 +21,7 @@ side. `integration/include/docxy_integration.h` declares the same ABI for C.
 - **Elsewhere:** the environment variable `DOCXY_INTEGRATION_DIR`.
 
 The folder must be an absolute path; the host refuses a relative one and says why. The folder and
-its files must be writable by administrators only: the host loads what is there, and the libraries
-the plugin needs are looked for in that folder first.
+its files must be writable by administrators only: the host loads what is there.
 
 There is no per-user default folder, as format plugins have: this plugin gets tokens and the person's
 identity. With no value, or an empty one, the host loads nothing, opens no file and shows nothing.

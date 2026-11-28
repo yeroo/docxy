@@ -752,9 +752,9 @@ enum Start {
 type Ready = mpsc::Receiver<Start>;
 
 /// The worker: it finds the one library in `dir`, skips it for a stale
-/// marker, loads it and calls `dxi_init`, then runs the jobs. Once
-/// `gave_up` is set (`load_from` refused the plugin) it starts no further
-/// step.
+/// marker, loads it and calls `dxi_init`, then runs the jobs. Before the
+/// stale markers, the load and `dxi_init` it stops if `gave_up` is set
+/// (`load_from` refused the plugin).
 fn spawn_worker(
     dir: PathBuf,
     info: HostInfo,
