@@ -229,8 +229,7 @@ pub(crate) fn accents(dark: bool) -> Accents {
 }
 
 /// A line about the plugin to stderr and to the crash log's startup
-/// entries: the Windows release has no console, and the plugin runs on
-/// Windows.
+/// entries: the Windows release has no console.
 fn report(line: &str) {
     report_in(&crate::config_root(), line);
 }
@@ -274,8 +273,9 @@ pub(crate) fn apply_accents_to_theme(cx: &mut gpui::App) {
 static STARTUP_NOTICE: OnceLock<Option<String>> = OnceLock::new();
 
 /// Start the integration plugin for this process (before anything reads its
-/// branding), ask its branding and context once, and return what it has to
-/// say, for stderr and the crash log. A harness instance loads none.
+/// branding), ask its branding, the Mail and Chat tabs' sign-in settings and
+/// its context once, and return what it has to say, for stderr and the crash
+/// log. A harness instance loads none.
 pub(crate) fn start(config_root: &std::path::Path, harness: bool) -> Option<String> {
     if !harness {
         let config = docxy_integration::host::HostConfig::new(

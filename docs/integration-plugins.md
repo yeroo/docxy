@@ -8,7 +8,7 @@ docxy's crates. It can give the host:
 - a silent token source;
 - the person's organization and desktop.
 
-With no plugin configured, a host behaves exactly as it does without this feature. The crate is
+The crate is
 `docxy-integration` (`integration/`). A plugin written in Rust depends on it with
 `default-features = false` for the types in `abi` and `protocol`; the `host` feature is the host
 side. `integration/include/docxy_integration.h` declares the same ABI for C.
@@ -63,8 +63,8 @@ Return codes: 0 ok, 1 unknown method, 2 malformed request, 3 not configured, 4 i
 
 ## Versions
 
-A host accepts the interface versions from its `MIN_ABI_VERSION` to its `ABI_VERSION` (`abi.rs`;
-both are 1 now). It refuses a library outside that range, a library without one of the five
+A host accepts the interface versions from its `MIN_ABI_VERSION` to its `ABI_VERSION` (`abi.rs`).
+It refuses a library outside that range, a library without one of the five
 symbols, or one whose `dxi_init` refuses, and calls it no further. The message names the file and
 the reason. A later host can add version 2 and keep loading version-1 plugins until it raises its
 minimum.

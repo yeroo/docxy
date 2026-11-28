@@ -192,8 +192,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   titles use `brand::short()`. With no plugin, both name the suite ("About docxy suite", "docxy").
 - `brand::start` also asks the Mail and Chat apps' branding and sign-in, and the context
   (`ask_ahead_by`), before the first window, so the extension tabs' factories, on gpui's thread,
-  read kept values and never call the plugin. Loading and all of these calls share the load's 5 s
-  deadline, not one deadline each.
+  read kept values and never call the plugin.
 - The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
   failed, the first window's status line (`brand::startup_notice`). An accent refusal (once per
   theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds
@@ -212,7 +211,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   the sites `accent::tests::BRAND_KEPT` lists (carets, comments, document and grid content, the
   Gantt bars), each with its reason.
   `brand::apply_accents_to_theme`, after every `Theme::change`, sets gpui-component's `primary`,
-  `ring`, `selection` and `link` tokens. A refusal goes to stderr once per theme.
+  `ring`, `selection` and `link` tokens.
 - Every other text that names the suite takes `brand::short()` too: the macOS menu bar
   (`macos_menu::shown` fills `{app}`), messages, the Document Recovery dialog, a kind's
   placeholder, and the default author of comments and the AUTHOR field. The PDF worker, a child

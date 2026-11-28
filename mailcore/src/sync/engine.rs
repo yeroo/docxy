@@ -1524,7 +1524,7 @@ pub enum SyncEvent {
     /// One `SignIn` may send two (#2218): when the sign-in asking
     /// `AuthConfig::scope` and `AuthConfig::optional_scope` is refused for
     /// consent, a second follows, asking `AuthConfig::scope` alone, with no
-    /// `Error` for the first refusal. Its `Debug` hides the login hint.
+    /// `Error` for the first refusal.
     SignInStarted { authorize_url: auth::AuthorizeUrl },
     /// The scopes the signed-in token was granted (#1875), as the token
     /// response spelled them, and the scopes of `AuthConfig::scope` and
@@ -2909,10 +2909,10 @@ struct Engine {
     /// the token, so it survives a restart; a startup with a cached token
     /// and no owed check probes nothing.
     mailbox_unchecked: bool,
-    /// A saved token's refresh was refused with a broker set: the session
-    /// was dropped as at a refusal, and the main loop asks the broker next
-    /// ([`Engine::ask_broker_after_refusal`]), signing in with its token or
-    /// asking for a sign-in for this reason.
+    /// A refusal [`Engine::signin_after_refusal`] left to the broker (a saved
+    /// token's refused refresh, or `broker_recheck`): the reason
+    /// [`Engine::ask_broker_after_refusal`] asks a sign-in for when the broker
+    /// gives no token.
     broker_after_refusal: Option<SignInReason>,
     /// A brokered token's renewal gave a token whose account cannot be
     /// compared with the session's (one of them names none): the refusal
@@ -10513,9 +10513,7 @@ impl Engine {
     /// expiry is asked of the broker first (`renew_brokered_near_expiry`). On
     /// a 401 the token is renewed once ([`Engine::try_refresh`]) and the call
     /// retried; a 401 still escaping means that did not help, and the caller
-    /// treats it as "sign-in required" (`signin_after_401`), which with a
-    /// broker set may sign in with the broker's token once the pass or
-    /// drain has ended ([`Engine::signin_after_refusal`]). A refresh that
+    /// treats it as "sign-in required" (`signin_after_401`). A refresh that
     /// failed transiently (#2167) is a `Transport` error instead
     /// (`refresh_transport`): the caller goes offline and keeps the token.
     fn with_auth<T>(
@@ -10651,10 +10649,8 @@ impl Engine {
     /// (never saved), and none from it is [`Refresh::SignIn`]. A saved token
     /// exchanges its refresh token for a fresh token set and persists it. No
     /// token, no refresh token to refresh with, or an endpoint that refused
-    /// the grant (`AuthError::needs_sign_in`), is [`Refresh::SignIn`]: its
-    /// caller ends the pass or drain as at any refusal, and the refusal of a
-    /// saved token then asks the broker, when one is set, before a sign-in
-    /// ([`Engine::signin_after_refusal`]). Any other failure (a dropped
+    /// the grant (`AuthError::needs_sign_in`), is [`Refresh::SignIn`]. Any
+    /// other failure (a dropped
     /// connection, a 5xx/429 page, a body that does not parse,
     /// `temporarily_unavailable`, #2167) is [`Refresh::Transient`], with the
     /// token kept in memory and on disk.
@@ -11215,11 +11211,8 @@ impl Engine {
         }
     }
 
-    /// The broker after a refused refresh ([`Engine::signin_after_refusal`]),
-    /// asked from the main loop between its steps: its token signs in as a
-    /// sign-in does (`signed_in`, brokered: the stale token file removed,
-    /// the mailbox check owed, the first pass checking first); with none, a
-    /// sign-in is asked for the refusal's reason.
+    /// The broker after a refusal [`Engine::signin_after_refusal`] left to it,
+    /// asked from the main loop between its steps.
     fn ask_broker_after_refusal(&mut self) {
         let Some(reason) = self.broker_after_refusal.take() else {
             return;
@@ -11974,12 +11967,6 @@ enum Refresh {
     Transient(String),
 }
 
-/// A refresh the token endpoint refused (`AuthError::needs_sign_in`) as a
-/// [`SignInReason::Expired`] (#2169): the OAuth code
-/// (`AuthError::refusal_code`) and the AADSTS number; never the
-/// description text. `needs_sign_in` admits only `Denied`, so the code is
-/// always there; the empty `code` of a token with no refresh token comes
-/// from `try_refresh`, not from here.
 /// Whether two tokens' accounts are the same, ignoring ASCII case; `None`
 /// when either names none.
 fn same_account(held: &str, renewed: &str) -> Option<bool> {
@@ -11987,6 +11974,12 @@ fn same_account(held: &str, renewed: &str) -> Option<bool> {
     (!held.is_empty() && !renewed.is_empty()).then(|| held.eq_ignore_ascii_case(renewed))
 }
 
+/// A refresh the token endpoint refused (`AuthError::needs_sign_in`) as a
+/// [`SignInReason::Expired`] (#2169): the OAuth code
+/// (`AuthError::refusal_code`) and the AADSTS number; never the
+/// description text. `needs_sign_in` admits only `Denied`, so the code is
+/// always there; the empty `code` of a token with no refresh token comes
+/// from `try_refresh`, not from here.
 fn expired(e: &auth::AuthError) -> SignInReason {
     SignInReason::Expired {
         code: e.refusal_code().unwrap_or_default(),

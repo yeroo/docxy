@@ -332,8 +332,7 @@ pub(crate) enum LinkGo {
         fit_width: bool,
     },
     /// What the view does not do (a script, a launch, a layer change, another
-    /// file), as the status line names it. [`APP_NAME`] in it is the host's
-    /// name to put there.
+    /// file), as the status line names it.
     Other { what: String },
 }
 

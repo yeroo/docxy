@@ -23,8 +23,7 @@ pub(crate) fn info() -> &'static BuildInfo {
     buildinfo::get(env!("CARGO_PKG_VERSION"))
 }
 
-/// What `--version` prints: the suite's own name, plugin or not. Copy's
-/// first part names the plugin's product ([`copy_text`]).
+/// What `--version` prints: the suite's own name, plugin or not.
 pub(crate) fn version_text(info: &BuildInfo) -> String {
     info.version_block(PRODUCT)
 }

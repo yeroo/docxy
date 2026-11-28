@@ -247,8 +247,8 @@ fn link_tip_of(v: &PdfView, i: usize) -> String {
     form::link_tip(&v.links[0][i].go, &v.meta.pages)
 }
 
-/// An action the view does not take names the app as it did before the
-/// plugin: the worker leaves the name to the host, which has no plugin here.
+/// An action the view does not take names the app: the worker leaves the
+/// name to the host, which has no plugin here.
 #[test]
 fn an_action_not_taken_names_the_app_through_the_host() {
     let go = LinkGo::Other {
