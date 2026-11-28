@@ -6441,25 +6441,12 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
   refresh-token grant. An explicit `SignIn` asks the broker only with no token held, so a re-consent
   with a token held (#2213) still goes to the browser. `ask_broker` repeats #2218's fallback: the
   full sign-in scope, then `AuthConfig::scope` alone when the first answer needs the person.
-- A saved token whose refresh is refused (or that has no refresh token) with a broker set takes the
-  sign-in path. Every refusal ends at `signin_after_refusal`: from `signin_after_401`, which `react`
-  (the pass, a fill, a command) and the drain and the bulk loop call on a 401 the renewal did not
-  help, and from `refresh_if_near_expiry` at a start. There the session is dropped as at any refusal, so the work
-  that met it ends with its op kept, and `broker_after_refusal` holds the reason. The main loop's
-  next step asks the broker (`ask_broker_after_refusal`): a token signs in through `signed_in(t,
-  true)` as a sign-in does (the stale token file removed, the mailbox check owed and made by the
-  first pass), and none is `enter_signin` for the refusal's reason. With no broker set, a refusal
-  asks for a sign-in at once. A second 401 on a brokered token sets `broker_refused` until a browser
-  sign-in completes.
-- A brokered token's renewal is used only when its account is the session's (`same_account`,
-  ASCII case ignored); `try_refresh` keeps the held token either way, so only the refusal path
-  drops it. Another account's is a refusal. When either token names no account, a renewal no 401
-  asked for (`renew_brokered_near_expiry`) keeps a still-valid token and owes nothing
-  (`try_refresh_with`), so `broker_refused` counts only 401s; otherwise the refusal sets
-  `broker_recheck`, so `signin_after_refusal` asks the broker again through
-  `ask_broker_after_refusal`, whose `signed_in` makes the mailbox check before any other call; until
-  a pass has listed the folders on that sign-in (`broker_recheck_unconfirmed`), the next such
-  renewal sets `broker_refused`, so a broker Graph keeps refusing ends in a sign-in.
+- A refusal of the session's token with a broker set: `signin_after_refusal` and
+  `ask_broker_after_refusal` say when the broker is asked and what its answer leads to, and
+  `broker_refused` when it is not asked again.
+- A brokered token's renewal is used only when its account is the session's (`same_account`);
+  `try_refresh_with`, `renew_brokered_near_expiry` and the `broker_recheck` and
+  `broker_recheck_unconfirmed` fields say what a renewal of another account, or of none, leads to.
 - `AuthConfig::login_hint` replaces `prompt=select_account` in the authorize URL. `AuthConfig`'s
   `Debug` and `SyncEvent::SignInStarted`'s (`auth::AuthorizeUrl`) hide it.
 - `EngineOptions::app_name` names the browser tab's pages (`SignInPages`); `None` keeps the
@@ -6467,8 +6454,6 @@ failure of that sign-in signed the session out (`sign_in_failed` → `enter_sign
 - `spawn_resolving` makes the `AuthConfig` and `EngineOptions` on the engine's thread, so a host
   whose sign-in settings come from its integration plugin spawns from its UI thread without waiting
   (`a_resolving_spawn_returns_before_its_settings_are_made`).
-- mailcore does not depend on `docxy-integration`: a host wraps its plugin's `token` method as the
-  broker.
 - Tests: `auth::tests::a_login_hint_replaces_the_account_picker`; engine `tests::a_brokered_token_*`,
   `a_saved_token_comes_before_the_broker`, `the_required_scopes_alone_*`,
   `a_broker_without_a_token_leads_to_the_browser`, `a_401_asks_the_broker_once_*`,

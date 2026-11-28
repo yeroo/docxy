@@ -55114,11 +55114,9 @@ fn open_docxy_window(
                     this.window_should_close(ask, window, cx)
                 })
             });
-            // A stop of the integration plugin after the start (a call past
-            // its deadline, on the asks' thread or in a tab) goes to the
-            // status line (#2317). No loop runs with no plugin loaded, and
-            // it ends once the plugin is stopped and said. `update_in` only,
-            // as for AutoRecover below.
+            // A stop of the integration plugin after the start goes to the
+            // status line (#2317); the loop ends once the plugin is stopped
+            // and said. `update_in` only, as for AutoRecover below.
             if brand::may_stop() {
                 let watcher = view.downgrade();
                 window

@@ -190,9 +190,6 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   its id, so `SHEET_RIBBON` stays a `const` table) and the About dialog's title use
   `brand::about_label()` ("About" and the plugin's `product`). The window title (`doc_name::window_title`) and the message-dialog
   titles use `brand::short()`. With no plugin, both name the suite ("About docxy suite", "docxy").
-- `brand::start` waits for the suite's branding before the first window and asks
-  `brand::asks_after_start` in the background (`ask_at_start`). About and `app-info` read the
-  kept context.
 - The plugin's refusal or stop at start goes to stderr, `crash.log` and, when no format plugin
   failed, the first window's status line (`brand::startup_notice`). A later stop goes there too:
   each window polls `brand::take_stop_notice` every `brand::STOP_POLL` while the plugin is loaded

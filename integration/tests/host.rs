@@ -317,7 +317,7 @@ fn a_background_call_past_its_deadline_stops_the_plugin_with_a_notice() {
 }
 
 /// With no plugin, or for a method the plugin does not offer, a kept read
-/// is answered, none, and starts no thread.
+/// is answered, none; with no plugin, `ask_in_background` starts no thread.
 #[test]
 fn a_kept_read_with_nothing_to_ask_is_answered_none() {
     let none = leaked(Integration::not_configured());

@@ -586,7 +586,6 @@ impl Integration {
             );
             return;
         }
-        // Waiting for the turn is bounded by the holder's own deadline.
         let _turn = lock(&worker.turn);
         if self.known(ask) {
             return;

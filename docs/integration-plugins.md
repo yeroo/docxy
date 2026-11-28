@@ -142,8 +142,3 @@ keeps the answers. It asks `token` each time it needs a token. An `ok` answer wi
   folder, and why). A plugin that stopped answering is refused from then on.
 - **The notice:** the message about a refusal or a stop, given once, for the host to show.
 - **Not to be logged or shown:** the access token and the login hint.
-
-## Tests
-
-`integration/tests/integration_fixture` is the test plugin; its `src/lib.rs` header lists its
-modes. `integration/tests/host.rs` loads it.

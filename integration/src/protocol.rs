@@ -235,7 +235,6 @@ pub struct Accents {
 }
 
 impl Accents {
-    /// The set for the dark theme when `dark`, else the light one.
     pub fn for_theme(&self, dark: bool) -> Option<AccentSet> {
         if dark { self.dark } else { self.light }
     }
