@@ -197,8 +197,7 @@ Notes moved from `CLAUDE.md` (#1903). Read them before changing the suite's wind
   theme) and a failed icon (once) go to stderr and `crash.log` too (`brand::report`). About adds
   the integration's rows (`brand::about_rows`) only when a plugin is configured, and its Copy
   names `brand::product()` and ends with those rows. `app-info` carries `integration`. The quit
-  hook calls `docxy_integration::host::shutdown()`, so a normal quit leaves no crash marker
-  unless a call was abandoned.
+  hook calls `docxy_integration::host::shutdown()`.
 - Each window gets the plugin's icon in `open_docxy_window` (`brand::set_window_icon`, Windows).
 - Accents: the brand's colour (every tab kind but sheet and project, which keep their own, and an
   extension tab with no accent of its own) has four roles, the fields of `accent::Drawn`

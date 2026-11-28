@@ -55300,9 +55300,7 @@ pub fn run(extensions: ext::Extensions) {
         .with_quit_mode(quit_mode());
     app.run(move |cx: &mut App| {
         gpui_component::init(cx);
-        // The last copy's RTF/HTML to the X11 clipboard manager (#1950), and
-        // the integration plugin's shutdown, which removes its crash marker
-        // unless a call was abandoned (#2317).
+        // The last copy's RTF/HTML to the X11 clipboard manager (#1950).
         cx.on_app_quit(|_| {
             rich_clip::hand_over();
             docxy_integration::host::shutdown();
