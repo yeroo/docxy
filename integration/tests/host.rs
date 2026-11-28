@@ -232,7 +232,17 @@ fn os_thread_id() -> u64 {
         // SAFETY: no arguments.
         u64::from(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() })
     }
-    #[cfg(unix)]
+    // Linux's thread id: `pthread_self` can name a later thread the same, as a freed thread's
+    // stack is reused.
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn gettid() -> i32;
+        }
+        // SAFETY: no arguments.
+        u64::from(unsafe { gettid() }.unsigned_abs())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         unsafe extern "C" {
             fn pthread_self() -> usize;
