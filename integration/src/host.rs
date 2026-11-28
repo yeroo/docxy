@@ -1136,7 +1136,7 @@ mod tests {
                 client_id: None,
                 tenant: None,
             }),
-            TokenAnswer::Unavailable { .. }
+            TokenAnswer::Unavailable { why } if why == "no integration plugin"
         ));
     }
 }
